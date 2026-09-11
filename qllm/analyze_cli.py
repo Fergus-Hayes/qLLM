@@ -56,6 +56,12 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="Noise draws averaged per layer.")
     parser.add_argument("--sensitivity-seed", type=int, default=0)
 
+    parser.add_argument("--rmt-samples", type=int, default=5,
+                        help="Random Gaussian matrices per shape used for the "
+                             "empirical condition-number baseline (works for "
+                             "square matrices; 0 disables condition_number_rmt_ratio).")
+    parser.add_argument("--rmt-seed", type=int, default=0)
+
     parser.add_argument("--results-dir", default="results/llms")
     parser.add_argument("--csv-name", default="layer_analysis.csv")
     parser.add_argument("--no-plots", action="store_true",
@@ -83,6 +89,8 @@ def main(argv=None) -> int:
         epsilon=args.epsilon,
         sensitivity_samples=args.sensitivity_samples,
         sensitivity_seed=args.sensitivity_seed,
+        rmt_samples=args.rmt_samples,
+        rmt_seed=args.rmt_seed,
         results_dir=args.results_dir,
         csv_name=args.csv_name,
         make_plots=not args.no_plots,

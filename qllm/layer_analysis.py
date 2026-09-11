@@ -59,6 +59,13 @@ class LayerAnalysisConfig:
     sensitivity_samples: int = 1
     sensitivity_seed: int = 0
 
+    # Random-matrix (Marchenko-Pastur) condition-number baseline. The empirical
+    # baseline is the median condition number of this many iid Gaussian matrices
+    # of the same shape (cached per shape); it works for square matrices too,
+    # where the analytic MP-edge ratio diverges. Set 0 to disable.
+    rmt_samples: int = 5
+    rmt_seed: int = 0
+
     # Output.
     results_dir: str = "results/llms"
     csv_name: str = "layer_analysis.csv"
@@ -95,6 +102,7 @@ class LayerResult:
     relative_spectral_gap: float
     log_condition_number: float
     condition_number_mp_ratio: float
+    condition_number_rmt_ratio: float
     # perplexity sensitivity (already relative -> comparable)
     perplexity_sensitivity: float
     ppl_baseline: float
@@ -131,6 +139,32 @@ def iter_weight_matrices(model):
     for name, param in model.named_parameters():
         if param.ndim == 2:
             yield name, param
+
+
+@torch.no_grad()
+def expected_condition_number(m: int, n: int, samples: int, seed: int) -> float:
+    """Median condition number of iid Gaussian matrices of shape (m, n).
+
+    This is the random-matrix baseline used to normalize a layer's condition
+    number. Unlike the analytic Marchenko-Pastur edge ratio (which diverges for
+    square matrices), it is finite and well-defined for every shape, and the
+    median is robust to the heavy tail of the condition-number distribution near
+    square. The condition number is scale-invariant, so the entry variance is
+    irrelevant. The seed is derived from the shape so the baseline is
+    reproducible regardless of the order layers are processed in.
+    """
+    if samples <= 0:
+        return float("nan")
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed + m * 1_000_003 + n)
+    conds = []
+    for _ in range(samples):
+        g = torch.randn(m, n, generator=generator, dtype=torch.float32)
+        s = torch.linalg.svdvals(g)
+        s_min = float(s[-1])
+        conds.append(float(s[0]) / s_min if s_min > 0 else float("inf"))
+    conds.sort()
+    return conds[len(conds) // 2]        # median
 
 
 # --------------------------------------------------------------------------- #
@@ -310,23 +344,38 @@ def _is_finite_field(row: dict, field_name: str) -> bool:
         return False
 
 
-def has_spectral(row: dict) -> bool:
+def _present(row: dict, field_name: str) -> bool:
+    """True if the column exists and is non-empty (a computed value, incl. inf/nan)."""
+    value = row.get(field_name, None)
+    return value is not None and value != ""
+
+
+def has_spectral(row: dict, need_rmt: bool = False) -> bool:
     """True if the row already carries the (normalized) spectral metrics.
 
-    ``stable_rank_ratio`` is checked as well as ``shannon_entropy`` so that rows
-    written before the shape-normalized columns existed are recomputed (cheaply)
-    to add them, without discarding an already-computed sensitivity value.
+    Presence (a written cell) is used rather than finiteness, because some
+    spectral values can legitimately be inf/nan (e.g. condition number of a
+    rank-deficient matrix). ``stable_rank_ratio`` and (when requested) the RMT
+    condition-number ratio are checked as well, so rows written before those
+    columns existed are cheaply recomputed to add them without discarding an
+    already-computed sensitivity value.
     """
-    return _is_finite_field(row, "shannon_entropy") and _is_finite_field(row, "stable_rank_ratio")
+    if not (_present(row, "shannon_entropy") and _present(row, "stable_rank_ratio")):
+        return False
+    if need_rmt and not _present(row, "condition_number_rmt_ratio"):
+        return False
+    return True
 
 
 def has_sensitivity(row: dict) -> bool:
+    # Sensitivity NaN means "not computed" (e.g. a spectral-only run), so this
+    # requires a finite value rather than mere presence.
     return _is_finite_field(row, "perplexity_sensitivity")
 
 
-def row_is_complete(row: dict, need_sensitivity: bool) -> bool:
+def row_is_complete(row: dict, need_sensitivity: bool, need_rmt: bool = False) -> bool:
     """A checkpointed row is complete only if the requested metrics are present."""
-    if not has_spectral(row):
+    if not has_spectral(row, need_rmt):
         return False
     if need_sensitivity and not has_sensitivity(row):
         return False
@@ -362,7 +411,7 @@ METRICS_FOR_DEPTH = [
     "shannon_entropy_normalized", "renyi2_entropy_normalized",
     "effective_rank_ratio", "stable_rank_ratio",
     "relative_spectral_gap", "log_condition_number",
-    "condition_number_mp_ratio", "perplexity_sensitivity",
+    "condition_number_rmt_ratio", "perplexity_sensitivity",
 ]
 
 
@@ -480,6 +529,7 @@ def run_layer_analysis(config: LayerAnalysisConfig) -> Path:
     matrices = list(iter_weight_matrices(model))
     total = len(matrices)
     need_sensitivity = config.run_sensitivity
+    need_rmt = config.rmt_samples > 0
 
     # Per-metric, per-layer checkpoint plan. A layer is (re)processed if its
     # spectral metrics are missing (need_spec) or sensitivity is requested but
@@ -491,7 +541,7 @@ def run_layer_analysis(config: LayerAnalysisConfig) -> Path:
         if config.force_recompute or row is None:
             need_spec, need_sen = True, need_sensitivity
         else:
-            need_spec = not has_spectral(row)
+            need_spec = not has_spectral(row, need_rmt)
             need_sen = need_sensitivity and not has_sensitivity(row)
         if need_spec or need_sen:
             plan.append((name, param, need_spec, need_sen))
@@ -518,6 +568,23 @@ def run_layer_analysis(config: LayerAnalysisConfig) -> Path:
     def _round(x, nd):
         return round(x, nd) if isinstance(x, float) and math.isfinite(x) else x
 
+    # Random-matrix condition-number baselines, cached per (rows, cols) shape so
+    # each distinct shape's Monte-Carlo estimate is computed at most once.
+    rmt_cache: dict[tuple[int, int], float] = {}
+
+    def rmt_condition_ratio(cond, m, n):
+        if not need_rmt or not math.isfinite(cond):
+            return float("nan")
+        key = (m, n)
+        if key not in rmt_cache:
+            t0 = time.perf_counter()
+            rmt_cache[key] = expected_condition_number(m, n, config.rmt_samples, config.rmt_seed)
+            print(f"    RMT baseline for {m}x{n}: "
+                  f"E[kappa]~{rmt_cache[key]:.4g} "
+                  f"({config.rmt_samples} samples, {time.perf_counter() - t0:.1f}s)")
+        base = rmt_cache[key]
+        return cond / base if base and math.isfinite(base) else float("nan")
+
     # Baseline perplexity for the sensitivity probe (only if a layer needs it).
     eval_ids = None
     baseline_ppl = float("nan")
@@ -543,8 +610,10 @@ def run_layer_analysis(config: LayerAnalysisConfig) -> Path:
               f"(type={layer_type}, depth={depth}, shape={rows_}x{cols_})")
 
         sm = spectral_metrics(param)
+        cond_rmt_ratio = rmt_condition_ratio(sm["condition_number"], rows_, cols_)
         print(f"    spectral: gap*={sm['relative_spectral_gap']:.4g} "
               f"logcond={sm['log_condition_number']:.4g} "
+              f"cond/RMT={cond_rmt_ratio:.4g} "
               f"H/logk={sm['shannon_entropy_normalized']:.4f} "
               f"H2/logk={sm['renyi2_entropy_normalized']:.4f} "
               f"eff_rank/k={sm['effective_rank_ratio']:.4f} "
@@ -597,6 +666,7 @@ def run_layer_analysis(config: LayerAnalysisConfig) -> Path:
             relative_spectral_gap=round(sm["relative_spectral_gap"], 6),
             log_condition_number=_round(sm["log_condition_number"], 4),
             condition_number_mp_ratio=_round(sm["condition_number_mp_ratio"], 4),
+            condition_number_rmt_ratio=_round(cond_rmt_ratio, 4),
             perplexity_sensitivity=_round(sensitivity, 6),
             ppl_baseline=_round(base_used, 4),
             ppl_perturbed=_round(ppl_pert, 4),

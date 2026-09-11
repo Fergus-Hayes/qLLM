@@ -135,13 +135,16 @@ raw ones, and the depth summary/plots use the normalized set:
 | effective rank `exp(H)` | `effective_rank_ratio = exp(H)/k` ∈ (0,1] | fraction of directions "active" |
 | — | `stable_rank = ‖W‖_F²/σ₁²`, `stable_rank_ratio = /k` | scale-free, robust (no σ_min blow-up) |
 | spectral gap `σ₁−σ₂` | `relative_spectral_gap = (σ₁−σ₂)/σ₁` ∈ [0,1] | dividing by σ₁ removes the weight scale |
-| condition number `σ₁/σ_min` | `log_condition_number = log₁₀κ`; `condition_number_mp_ratio = κ / κ_MP` | κ grows with size; the Marchenko–Pastur bulk value `κ_MP = (1+√γ)/(1−√γ)`, `γ = k/max(rows,cols)`, is the random-matrix baseline for that shape (rectangular only; NaN for square, where `log κ` / `stable_rank_ratio` are the comparable choices) |
+| condition number `σ₁/σ_min` | `log_condition_number = log₁₀κ`; `condition_number_rmt_ratio = κ / E[κ_random(shape)]`; `condition_number_mp_ratio = κ / κ_MP` | κ grows with size, so it is divided by a random-matrix baseline for the *same shape*. `condition_number_rmt_ratio` uses the **empirical** median κ of iid Gaussian matrices of that shape — defined for **every** shape including square. `condition_number_mp_ratio` uses the analytic Marchenko–Pastur bulk value `κ_MP = (1+√γ)/(1−√γ)`, `γ = k/max(rows,cols)`, which is finite only for rectangular matrices (NaN for square, where γ=1 makes it diverge — random square matrices are genuinely asymptotically ill-conditioned, `κ ~ n`). |
 | perplexity sensitivity | already `(ΔPPL/PPL)/ε` with `‖ΔW‖/‖W‖ = ε` | relative response to a relative perturbation — scale-free and shape-comparable by construction |
 
 The guiding rule: express every quantity as a **ratio** (dividing out the weight
 scale, e.g. by σ₁ or ‖W‖_F) and against its **shape ceiling or random-matrix
-expectation** (dividing out `k`/aspect ratio, e.g. by `log k` or `κ_MP`). Raw
-columns are kept in the CSV for reference. For cross-*model* comparison as well,
+expectation** (dividing out `k`/aspect ratio, e.g. by `log k`, `κ_MP`, or the
+empirical `E[κ_random(shape)]`). The empirical condition-number baseline is a
+small Monte-Carlo (`--rmt-samples`, default 5, cached per shape) — the one
+normalization that is well-defined for square projections (`q_proj`, `o_proj`)
+too. Raw columns are kept in the CSV for reference. For cross-*model* comparison,
 z-scoring each normalized metric within `(model, layer_type)` groups removes any
 residual family-specific offset.
 
