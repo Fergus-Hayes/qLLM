@@ -114,6 +114,37 @@ python analyze_layers.py gpt2 --skip-sensitivity          # spectral metrics onl
 python analyze_layers.py --sensitivity-eval-tokens 2048 --epsilon 0.02
 ```
 
+### Comparing across layers of different shapes
+
+Weight matrices differ in shape (`q_proj` 576×576, `k/v_proj` 192×576,
+`mlp` 1536×576, `embed_tokens` 49152×576, …), and raw spectral metrics are
+confounded by two things that have nothing to do with the layer's "character":
+
+1. **Scale** — the overall magnitude of the weights (hence of the singular
+   values) varies by initialization, learning rate, and normalization.
+2. **Size/shape** — even statistically identical random matrices give larger
+   entropy, wider spectral gaps, and larger condition numbers as the number of
+   singular values `k = min(rows, cols)` (and the aspect ratio) grows.
+
+So the analysis reports **shape-normalized, scale-free** variants alongside the
+raw ones, and the depth summary/plots use the normalized set:
+
+| raw metric | normalized / comparable form | why it's comparable |
+| --- | --- | --- |
+| Shannon / Rényi-2 entropy | `÷ log k` → `shannon_entropy_normalized`, `renyi2_entropy_normalized` ∈ [0,1] | `log k` is the max possible entropy for `k` singular values |
+| effective rank `exp(H)` | `effective_rank_ratio = exp(H)/k` ∈ (0,1] | fraction of directions "active" |
+| — | `stable_rank = ‖W‖_F²/σ₁²`, `stable_rank_ratio = /k` | scale-free, robust (no σ_min blow-up) |
+| spectral gap `σ₁−σ₂` | `relative_spectral_gap = (σ₁−σ₂)/σ₁` ∈ [0,1] | dividing by σ₁ removes the weight scale |
+| condition number `σ₁/σ_min` | `log_condition_number = log₁₀κ`; `condition_number_mp_ratio = κ / κ_MP` | κ grows with size; the Marchenko–Pastur bulk value `κ_MP = (1+√γ)/(1−√γ)`, `γ = k/max(rows,cols)`, is the random-matrix baseline for that shape (rectangular only; NaN for square, where `log κ` / `stable_rank_ratio` are the comparable choices) |
+| perplexity sensitivity | already `(ΔPPL/PPL)/ε` with `‖ΔW‖/‖W‖ = ε` | relative response to a relative perturbation — scale-free and shape-comparable by construction |
+
+The guiding rule: express every quantity as a **ratio** (dividing out the weight
+scale, e.g. by σ₁ or ‖W‖_F) and against its **shape ceiling or random-matrix
+expectation** (dividing out `k`/aspect ratio, e.g. by `log k` or `κ_MP`). Raw
+columns are kept in the CSV for reference. For cross-*model* comparison as well,
+z-scoring each normalized metric within `(model, layer_type)` groups removes any
+residual family-specific offset.
+
 **Printouts & checkpointing.** Progress is printed as each layer is processed
 (spectral line, sensitivity line, running count + ETA). Results are written to
 `results/llms/<model-name>/layer_analysis.csv`, which **is** the checkpoint:

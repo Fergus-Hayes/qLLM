@@ -76,15 +76,26 @@ class LayerResult:
     rows: int
     cols: int
     num_params: int
+    aspect_ratio: float
+    # raw (scale-/shape-dependent) spectral metrics
     sigma_1: float
     sigma_2: float
     sigma_min: float
     spectral_gap: float
     condition_number: float
     shannon_entropy: float
-    shannon_entropy_normalized: float
     renyi2_entropy: float
     effective_rank: float
+    stable_rank: float
+    # shape-normalized / scale-free variants (comparable across layer shapes)
+    shannon_entropy_normalized: float
+    renyi2_entropy_normalized: float
+    effective_rank_ratio: float
+    stable_rank_ratio: float
+    relative_spectral_gap: float
+    log_condition_number: float
+    condition_number_mp_ratio: float
+    # perplexity sensitivity (already relative -> comparable)
     perplexity_sensitivity: float
     ppl_baseline: float
     ppl_perturbed: float
@@ -126,40 +137,84 @@ def iter_weight_matrices(model):
 # Spectral metrics
 # --------------------------------------------------------------------------- #
 def spectral_metrics(weight: torch.Tensor) -> dict:
-    """Compute singular-value-based metrics for a 2-D weight matrix."""
+    """Compute singular-value-based metrics for a 2-D weight matrix.
+
+    Alongside the raw metrics this returns *shape-normalized* variants that are
+    comparable across matrices of different dimensions (see module/README notes):
+
+    * entropies divided by ``log k`` (k = number of singular values) -> [0, 1];
+    * effective / stable rank divided by ``k`` -> (0, 1];
+    * relative spectral gap ``(sigma_1 - sigma_2) / sigma_1`` (scale-free);
+    * ``log10`` condition number, and the condition number divided by the
+      Marchenko-Pastur bulk expectation for a random matrix of the same aspect
+      ratio (removes the size/shape bias for rectangular matrices).
+    """
     w = weight.detach().to(torch.float32).cpu()
-    s = torch.linalg.svdvals(w)                    # descending singular values
-    s = s[s > 0] if (s > 0).any() else s           # guard all-zero matrices
+    m, ncol = int(w.shape[0]), int(w.shape[1])
+    k = min(m, ncol)                               # number of singular values
+    aspect = k / max(m, ncol)                      # gamma in (0, 1]
+
+    s = torch.linalg.svdvals(w)                    # length k, descending, >= 0
+    sigma_1 = float(s[0]) if k > 0 else 0.0
+    sigma_2 = float(s[1]) if k > 1 else 0.0
+    sigma_min = float(s[-1]) if k > 0 else 0.0
+    fro_sq = float((s * s).sum())
     total = float(s.sum())
 
-    if total <= 0 or s.numel() == 0:
-        return dict(sigma_1=0.0, sigma_2=0.0, sigma_min=0.0, spectral_gap=0.0,
-                    condition_number=float("inf"), shannon_entropy=0.0,
-                    shannon_entropy_normalized=0.0, renyi2_entropy=0.0,
-                    effective_rank=0.0)
+    zero = dict(sigma_1=sigma_1, sigma_2=sigma_2, sigma_min=sigma_min,
+                spectral_gap=0.0, relative_spectral_gap=0.0,
+                condition_number=float("inf"), log_condition_number=float("inf"),
+                condition_number_mp_ratio=float("nan"),
+                shannon_entropy=0.0, shannon_entropy_normalized=0.0,
+                renyi2_entropy=0.0, renyi2_entropy_normalized=0.0,
+                effective_rank=0.0, effective_rank_ratio=0.0,
+                stable_rank=0.0, stable_rank_ratio=0.0, aspect_ratio=aspect)
+    if total <= 0 or sigma_1 <= 0:
+        return zero
 
-    p = s / total
-    logp = torch.log(p)
-    shannon = float(-(p * logp).sum())
+    pos = s[s > 0]
+    p = pos / total
+    shannon = float(-(p * torch.log(p)).sum())
     renyi2 = float(-torch.log((p * p).sum()))
-    n = s.numel()
-    shannon_norm = shannon / math.log(n) if n > 1 else 0.0
+    log_k = math.log(k) if k > 1 else 1.0
+    shannon_norm = shannon / log_k if k > 1 else 0.0
+    renyi2_norm = renyi2 / log_k if k > 1 else 0.0
 
-    sigma_1 = float(s[0])
-    sigma_2 = float(s[1]) if n > 1 else 0.0
-    sigma_min = float(s[-1])
+    effective_rank = math.exp(shannon)
+    stable_rank = fro_sq / (sigma_1 * sigma_1)     # ||W||_F^2 / sigma_1^2 in [1, k]
+
     condition = sigma_1 / sigma_min if sigma_min > 0 else float("inf")
+    log_condition = math.log10(condition) if math.isfinite(condition) else float("inf")
+
+    # Marchenko-Pastur bulk condition number for an iid matrix of this shape:
+    # (1 + sqrt(gamma)) / (1 - sqrt(gamma)). Finite only for rectangular matrices
+    # (gamma < 1); it diverges for square ones, so leave that ratio undefined and
+    # rely on log_condition_number / stable_rank_ratio there instead.
+    if aspect < 1.0 and math.isfinite(condition):
+        root = math.sqrt(aspect)
+        kappa_mp = (1.0 + root) / (1.0 - root)
+        cond_mp_ratio = condition / kappa_mp
+    else:
+        cond_mp_ratio = float("nan")
 
     return dict(
         sigma_1=sigma_1,
         sigma_2=sigma_2,
         sigma_min=sigma_min,
         spectral_gap=sigma_1 - sigma_2,
+        relative_spectral_gap=(sigma_1 - sigma_2) / sigma_1,
         condition_number=condition,
+        log_condition_number=log_condition,
+        condition_number_mp_ratio=cond_mp_ratio,
         shannon_entropy=shannon,
         shannon_entropy_normalized=shannon_norm,
         renyi2_entropy=renyi2,
-        effective_rank=math.exp(shannon),
+        renyi2_entropy_normalized=renyi2_norm,
+        effective_rank=effective_rank,
+        effective_rank_ratio=effective_rank / k,
+        stable_rank=stable_rank,
+        stable_rank_ratio=stable_rank / k,
+        aspect_ratio=aspect,
     )
 
 
@@ -255,17 +310,25 @@ def _is_finite_field(row: dict, field_name: str) -> bool:
         return False
 
 
-def row_is_complete(row: dict, need_sensitivity: bool) -> bool:
-    """A checkpointed row is complete only if the requested metrics are present.
+def has_spectral(row: dict) -> bool:
+    """True if the row already carries the (normalized) spectral metrics.
 
-    Spectral metrics are always expected; the perplexity-sensitivity column must
-    additionally be a finite number when sensitivity is requested. This prevents
-    a spectral-only (``--skip-sensitivity``) run from masking a later run that
-    does want sensitivity.
+    ``stable_rank_ratio`` is checked as well as ``shannon_entropy`` so that rows
+    written before the shape-normalized columns existed are recomputed (cheaply)
+    to add them, without discarding an already-computed sensitivity value.
     """
-    if not _is_finite_field(row, "shannon_entropy"):
+    return _is_finite_field(row, "shannon_entropy") and _is_finite_field(row, "stable_rank_ratio")
+
+
+def has_sensitivity(row: dict) -> bool:
+    return _is_finite_field(row, "perplexity_sensitivity")
+
+
+def row_is_complete(row: dict, need_sensitivity: bool) -> bool:
+    """A checkpointed row is complete only if the requested metrics are present."""
+    if not has_spectral(row):
         return False
-    if need_sensitivity and not _is_finite_field(row, "perplexity_sensitivity"):
+    if need_sensitivity and not has_sensitivity(row):
         return False
     return True
 
@@ -293,9 +356,13 @@ def read_all_rows(csv_path: Path) -> list[dict]:
 # --------------------------------------------------------------------------- #
 # Reporting: depth vs. layer type
 # --------------------------------------------------------------------------- #
+# Shape-normalized / scale-free metrics, so depth trends are comparable across
+# layer types of different dimensions (raw columns remain in the CSV).
 METRICS_FOR_DEPTH = [
-    "shannon_entropy", "renyi2_entropy", "effective_rank",
-    "spectral_gap", "condition_number", "perplexity_sensitivity",
+    "shannon_entropy_normalized", "renyi2_entropy_normalized",
+    "effective_rank_ratio", "stable_rank_ratio",
+    "relative_spectral_gap", "log_condition_number",
+    "condition_number_mp_ratio", "perplexity_sensitivity",
 ]
 
 
@@ -414,23 +481,26 @@ def run_layer_analysis(config: LayerAnalysisConfig) -> Path:
     total = len(matrices)
     need_sensitivity = config.run_sensitivity
 
-    # Per-metric checkpoint: recompute a layer if it is missing OR if sensitivity
-    # is now requested but its stored value is not a finite number.
-    remaining = [
-        (n, p) for n, p in matrices
-        if config.force_recompute
-        or n not in existing
-        or not row_is_complete(existing[n], need_sensitivity)
-    ]
-    skipped = total - len(remaining)
-    augment = sum(
-        1 for n, _ in matrices
-        if n in existing and not config.force_recompute
-        and _is_finite_field(existing[n], "shannon_entropy")
-        and not row_is_complete(existing[n], need_sensitivity)
-    )
+    # Per-metric, per-layer checkpoint plan. A layer is (re)processed if its
+    # spectral metrics are missing (need_spec) or sensitivity is requested but
+    # absent (need_sen). Spectral is cheap to recompute; sensitivity is not, so a
+    # stored sensitivity value is reused whenever we are only refreshing spectral.
+    plan = []
+    for name, param in matrices:
+        row = existing.get(name)
+        if config.force_recompute or row is None:
+            need_spec, need_sen = True, need_sensitivity
+        else:
+            need_spec = not has_spectral(row)
+            need_sen = need_sensitivity and not has_sensitivity(row)
+        if need_spec or need_sen:
+            plan.append((name, param, need_spec, need_sen))
+
+    skipped = total - len(plan)
+    n_spec = sum(1 for _, _, need_spec, _ in plan if need_spec)
+    n_sens = sum(1 for _, _, _, need_sen in plan if need_sen)
     print(f"\nFound {total} weight matrices; {skipped} complete in checkpoint, "
-          f"{len(remaining)} to compute ({augment} need sensitivity added).")
+          f"{len(plan)} to compute (spectral: {n_spec}, sensitivity: {n_sens}).")
     print(f"Checkpoint / results CSV: {csv_path}")
 
     # Results keyed by name, seeded from the checkpoint so skipped rows survive
@@ -439,11 +509,20 @@ def run_layer_analysis(config: LayerAnalysisConfig) -> Path:
     order += [n for n in existing if n not in set(order)]
     results: dict[str, dict] = dict(existing)
 
-    # Baseline perplexity for the sensitivity probe (only if any layer needs it).
+    def _getf(row, key):
+        try:
+            return float(row.get(key, ""))
+        except (TypeError, ValueError):
+            return float("nan")
+
+    def _round(x, nd):
+        return round(x, nd) if isinstance(x, float) and math.isfinite(x) else x
+
+    # Baseline perplexity for the sensitivity probe (only if a layer needs it).
     eval_ids = None
     baseline_ppl = float("nan")
     generator = torch.Generator(device="cpu")
-    if need_sensitivity and remaining:
+    if n_sens > 0:
         eval_ids = _load_eval_ids(tokenizer, config)
         window = min(config.sensitivity_window, eval_ids.size(1))
         print("Computing baseline perplexity for sensitivity probe ...")
@@ -456,28 +535,41 @@ def run_layer_analysis(config: LayerAnalysisConfig) -> Path:
                   "--dtype float16 on CPU — try --dtype float32 or --device cuda.")
 
     start = time.perf_counter()
-    for i, (name, param) in enumerate(remaining, start=1):
+    for i, (name, param, need_spec, need_sen) in enumerate(plan, start=1):
+        row = existing.get(name)
         layer_type, depth = parse_layer_info(name)
-        rows_, cols_ = param.shape[0], param.shape[1]
-        print(f"\n[{i}/{len(remaining)}] {name}  "
+        rows_, cols_ = int(param.shape[0]), int(param.shape[1])
+        print(f"\n[{i}/{len(plan)}] {name}  "
               f"(type={layer_type}, depth={depth}, shape={rows_}x{cols_})")
 
         sm = spectral_metrics(param)
-        print(f"    spectral: sigma1={sm['sigma_1']:.4g} gap={sm['spectral_gap']:.4g} "
-              f"cond={sm['condition_number']:.4g} "
-              f"H={sm['shannon_entropy']:.4f} H2={sm['renyi2_entropy']:.4f} "
-              f"eff_rank={sm['effective_rank']:.2f}")
+        print(f"    spectral: gap*={sm['relative_spectral_gap']:.4g} "
+              f"logcond={sm['log_condition_number']:.4g} "
+              f"H/logk={sm['shannon_entropy_normalized']:.4f} "
+              f"H2/logk={sm['renyi2_entropy_normalized']:.4f} "
+              f"eff_rank/k={sm['effective_rank_ratio']:.4f} "
+              f"srank/k={sm['stable_rank_ratio']:.4f}")
 
-        sensitivity, ppl_pert = float("nan"), float("nan")
-        if config.run_sensitivity and eval_ids is not None:
+        # Sensitivity: compute if needed, otherwise reuse the checkpointed value.
+        if need_sen:
             generator.manual_seed(config.sensitivity_seed + i)
             window = min(config.sensitivity_window, eval_ids.size(1))
             sensitivity, ppl_pert = perplexity_sensitivity(
                 model, param, eval_ids, device, window,
                 baseline_ppl, config.epsilon, config.sensitivity_samples, generator,
             )
+            base_used, eps_used, samples_used = baseline_ppl, config.epsilon, config.sensitivity_samples
             print(f"    sensitivity: dPPL/PPL per eps={config.epsilon} -> "
                   f"{sensitivity:.4g}  (PPL' = {ppl_pert:.4f})")
+        elif row is not None and has_sensitivity(row):
+            sensitivity, ppl_pert = _getf(row, "perplexity_sensitivity"), _getf(row, "ppl_perturbed")
+            base_used, eps_used = _getf(row, "ppl_baseline"), _getf(row, "epsilon")
+            samples_used = int(_getf(row, "sensitivity_samples")) if math.isfinite(_getf(row, "sensitivity_samples")) else config.sensitivity_samples
+            print("    sensitivity: reused from checkpoint "
+                  f"({sensitivity:.4g})")
+        else:
+            sensitivity, ppl_pert = float("nan"), float("nan")
+            base_used, eps_used, samples_used = baseline_ppl, config.epsilon, config.sensitivity_samples
 
         result = LayerResult(
             timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -488,22 +580,28 @@ def run_layer_analysis(config: LayerAnalysisConfig) -> Path:
             rows=rows_,
             cols=cols_,
             num_params=rows_ * cols_,
+            aspect_ratio=round(sm["aspect_ratio"], 6),
             sigma_1=round(sm["sigma_1"], 6),
             sigma_2=round(sm["sigma_2"], 6),
             sigma_min=round(sm["sigma_min"], 8),
             spectral_gap=round(sm["spectral_gap"], 6),
-            condition_number=round(sm["condition_number"], 4)
-                if math.isfinite(sm["condition_number"]) else sm["condition_number"],
+            condition_number=_round(sm["condition_number"], 4),
             shannon_entropy=round(sm["shannon_entropy"], 6),
-            shannon_entropy_normalized=round(sm["shannon_entropy_normalized"], 6),
             renyi2_entropy=round(sm["renyi2_entropy"], 6),
             effective_rank=round(sm["effective_rank"], 4),
-            perplexity_sensitivity=round(sensitivity, 6)
-                if math.isfinite(sensitivity) else sensitivity,
-            ppl_baseline=round(baseline_ppl, 4) if math.isfinite(baseline_ppl) else baseline_ppl,
-            ppl_perturbed=round(ppl_pert, 4) if math.isfinite(ppl_pert) else ppl_pert,
-            epsilon=config.epsilon,
-            sensitivity_samples=config.sensitivity_samples,
+            stable_rank=round(sm["stable_rank"], 4),
+            shannon_entropy_normalized=round(sm["shannon_entropy_normalized"], 6),
+            renyi2_entropy_normalized=round(sm["renyi2_entropy_normalized"], 6),
+            effective_rank_ratio=round(sm["effective_rank_ratio"], 6),
+            stable_rank_ratio=round(sm["stable_rank_ratio"], 6),
+            relative_spectral_gap=round(sm["relative_spectral_gap"], 6),
+            log_condition_number=_round(sm["log_condition_number"], 4),
+            condition_number_mp_ratio=_round(sm["condition_number_mp_ratio"], 4),
+            perplexity_sensitivity=_round(sensitivity, 6),
+            ppl_baseline=_round(base_used, 4),
+            ppl_perturbed=_round(ppl_pert, 4),
+            epsilon=eps_used,
+            sensitivity_samples=samples_used,
         )
         # Update in place and rewrite the whole CSV: this checkpoints after every
         # layer and updates existing rows (e.g. adding sensitivity) without ever
@@ -512,7 +610,7 @@ def run_layer_analysis(config: LayerAnalysisConfig) -> Path:
         write_all_rows(csv_path, [results[n] for n in order if n in results])
         done_now = skipped + i
         elapsed = time.perf_counter() - start
-        eta = elapsed / i * (len(remaining) - i)
+        eta = elapsed / i * (len(plan) - i)
         print(f"    checkpointed ({done_now}/{total})  "
               f"elapsed={elapsed:.0f}s  eta={eta:.0f}s")
 
