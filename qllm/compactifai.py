@@ -100,6 +100,18 @@ def mpo_param_count(out_dims: list[int], in_dims: list[int], chi: int) -> int:
     return sum(bonds[k] * site[k] * bonds[k + 1] for k in range(n))
 
 
+def full_rank_chi(out_dims: list[int], in_dims: list[int]) -> int:
+    """Smallest chi at which no bond is truncated (the MPO is then exact).
+
+    Above this value every bond is already at full rank, so a larger chi gives a
+    bit-identical reconstruction -- useful for skipping redundant evaluations in
+    a sweep.
+    """
+    huge = math.prod(out_dims) * math.prod(in_dims)
+    bonds = mpo_bond_dims(out_dims, in_dims, huge)
+    return max(bonds) if bonds else 1
+
+
 def max_useful_chi(out_dims: list[int], in_dims: list[int]) -> int:
     """Largest chi that still stores fewer parameters than the dense matrix."""
     dense = math.prod(out_dims) * math.prod(in_dims)

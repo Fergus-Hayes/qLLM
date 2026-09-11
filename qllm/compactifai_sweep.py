@@ -41,6 +41,7 @@ from .benchmark import (
 from .compactifai import (
     build_plan,
     compress_weight,
+    full_rank_chi,
     log_spaced_ints,
     mpo_bond_dims,
     mpo_param_count,
@@ -579,9 +580,22 @@ def run_per_layer_sweep(config: CompactifaiConfig) -> Path:
     baseline, eval_tokens, _ = evaluate()
     print(f"Baseline perplexity = {baseline:.4f}")
 
-    todo = [(n, p, c) for (n, p) in layers for c in chis if (n, str(c)) not in done]
-    print(f"\n{len(layers)} layers x {len(chis)} chi = {len(layers) * len(chis)} points; "
-          f"{len(todo)} to evaluate ({len(layers) * len(chis) - len(todo)} checkpointed).")
+    # Per-layer chi list: a chi above a layer's full rank leaves every bond
+    # untruncated, so the reconstruction is identical to the exact one. Clamping
+    # per layer drops those duplicate points instead of re-evaluating them.
+    layer_chis = {}
+    for name, _ in layers:
+        exact = full_rank_chi(plans[name].out_dims, plans[name].in_dims)
+        layer_chis[name] = sorted({min(int(c), exact) for c in chis})
+
+    total_points = sum(len(layer_chis[n]) for n, _ in layers)
+    todo = [(n, p, c) for (n, p) in layers
+            for c in layer_chis[n] if (n, str(c)) not in done]
+    print(f"\n{len(layers)} layers x up to {len(chis)} chi = {total_points} points "
+          f"(chi clamped per layer to its exact-reconstruction rank); "
+          f"{len(todo)} to evaluate, {total_points - len(todo)} checkpointed.")
+    print(f"Each point = one perplexity evaluation over {budget} tokens with only "
+          f"that layer compressed.")
     print(f"Checkpoint / results CSV: {path}")
 
     start = time.perf_counter()
@@ -615,6 +629,10 @@ def run_per_layer_sweep(config: CompactifaiConfig) -> Path:
 
         elapsed = time.perf_counter() - start
         eta = elapsed / i * (len(todo) - i)
+        if i == 1 and len(todo) > 1:
+            print(f"    (first point took {elapsed:.1f}s -> estimated total "
+                  f"{elapsed * len(todo) / 60:.0f} min for {len(todo)} points; "
+                  f"reduce with --profile-depths / --num-chi / --per-layer-eval-tokens)")
         print(f"  [{i}/{len(todo)}] {layer_type} d{depth} chi={chi:<4} "
               f"ratio={params_mpo / plan.dense_params:.3f} rel.err={err:.4f} "
               f"ppl={ppl:.4f} (x{ppl / baseline:.3f})  "

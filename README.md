@@ -227,6 +227,15 @@ Embedding and head layers are excluded, as in the paper. The truncated MPO is
 contracted back into the layer so perplexity reflects the compressed operator
 exactly, while the *reported* parameter count is that of the stored MPO tensors.
 
+**Two modes** (`--mode`):
+
+| mode | what is compressed | result |
+| --- | --- | --- |
+| `global` (default) | **all** eligible layers together at each χ | one perplexity per χ — the whole-model compression curve |
+| `per-layer` | **one layer at a time**, every other layer left dense | a perplexity-vs-χ curve *per layer* — isolates each layer's tolerance to truncation |
+
+Use `--mode both` to run each in turn.
+
 > The paper's subsequent **"healing"** (brief retraining) stage is *not*
 > performed here, so these are pre-healing perplexities — the raw cost of
 > truncation. The paper notes healing recovers most of the gap.
