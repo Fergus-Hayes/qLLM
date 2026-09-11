@@ -195,8 +195,10 @@ def parse_args() -> argparse.Namespace:
                         help="Model weight/compute dtype.")
 
     # Perplexity options.
-    parser.add_argument("--dataset", default="wikitext",
-                        help="Dataset name for perplexity evaluation.")
+    parser.add_argument("--dataset", default="Salesforce/wikitext",
+                        help="Dataset name for perplexity evaluation. Use a "
+                             "namespaced id (e.g. 'Salesforce/wikitext'); recent "
+                             "huggingface_hub versions reject bare ids like 'wikitext'.")
     parser.add_argument("--dataset-config", default="wikitext-2-raw-v1",
                         help="Dataset configuration/subset.")
     parser.add_argument("--split", default="test", help="Dataset split.")

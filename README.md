@@ -42,7 +42,7 @@ the perplexity or the timing stage).
 ============================================================
 Model:               HuggingFaceTB/SmolLM2-135M
 Device / dtype:      cpu / float32
-Perplexity:          16.1234 (270000 tokens on wikitext/wikitext-2-raw-v1:test)
+Perplexity:          16.1234 (270000 tokens on Salesforce/wikitext/wikitext-2-raw-v1:test)
 Perplexity eval:     42.10 s
 Prefill latency:     35.42 ms (7 prompt tokens)
 Generation speed:    28.71 tokens/s (64 new tokens)
