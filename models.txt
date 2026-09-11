@@ -1,0 +1,9 @@
+# Models to benchmark, one Hugging Face id (or local path) per line.
+# Lines starting with '#' and blank lines are ignored.
+# Run with:  python benchmark_llm.py --models-file models.txt
+
+HuggingFaceTB/SmolLM2-135M
+# HuggingFaceTB/SmolLM2-360M
+# HuggingFaceTB/SmolLM2-1.7B
+# Qwen/Qwen2.5-0.5B
+# gpt2
