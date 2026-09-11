@@ -38,6 +38,18 @@ from .compactifai_sweep import (
 
 DEFAULT_MODEL = "HuggingFaceTB/SmolLM2-135M"
 
+# Presets for per-layer profiling: a representative subset of blocks, a
+# log-spaced chi range, and a token budget per evaluation. Cost is roughly
+# (num_depths x layer_types x num_chi) evaluations, each over the token budget.
+PRESETS = {
+    #          blocks  chi points  tokens/eval   ~evaluations (7 layer types)
+    "quick":    dict(num_depths=4,  num_chi=6,  per_layer_eval_tokens=4096),
+    "standard": dict(num_depths=6,  num_chi=8,  per_layer_eval_tokens=8192),
+    "thorough": dict(num_depths=10, num_chi=10, per_layer_eval_tokens=16384),
+}
+# Values used when neither a preset nor an explicit flag supplies them.
+FALLBACKS = dict(num_depths=None, num_chi=12, per_layer_eval_tokens=8192)
+
 
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -66,8 +78,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--chi-max", type=int, default=None,
                         help="Largest bond dimension (default: largest chi that "
                              "still compresses, computed from the layer shapes).")
-    parser.add_argument("--num-chi", type=int, default=12,
-                        help="Number of logarithmically spaced bond dimensions.")
+    parser.add_argument("--num-chi", type=int, default=None,
+                        help="Number of logarithmically spaced bond dimensions "
+                             "(default 12, or the --preset value).")
     parser.add_argument("--chi", type=int, nargs="+", default=None,
                         help="Explicit bond dimensions (overrides the log spacing).")
     parser.add_argument("--include", default=DEFAULT_INCLUDE,
@@ -111,12 +124,28 @@ def parse_args(argv=None) -> argparse.Namespace:
                              "'per-layer': compress ONE layer at a time to get a "
                              "perplexity-vs-chi curve per layer (n_layers x n_chi "
                              "evaluations). 'both' runs each in turn.")
+    parser.add_argument("--preset", choices=sorted(PRESETS),
+                        help="Sensible per-layer profiling configuration: "
+                             "quick (4 blocks x 6 chi @ 4k tokens), "
+                             "standard (6 blocks x 8 chi @ 8k tokens), "
+                             "thorough (10 blocks x 10 chi @ 16k tokens). "
+                             "Explicit flags override the preset.")
+    parser.add_argument("--num-depths", type=int, default=None,
+                        help="Profile this many evenly spaced decoder blocks, "
+                             "chosen automatically from the model's actual depth "
+                             "(always includes the first and last block).")
     parser.add_argument("--profile-depths", type=int, nargs="+", default=None,
-                        help="Restrict per-layer profiling to these block indices "
-                             "(the paper profiles a handful, e.g. 0 5 15 31).")
-    parser.add_argument("--per-layer-eval-tokens", type=int, default=4096,
+                        help="Explicit block indices to profile (overrides "
+                             "--num-depths).")
+    parser.add_argument("--layer-types", nargs="+", default=None,
+                        help="Restrict profiling to layer types containing these "
+                             "strings, e.g. q_proj down_proj (default: all).")
+    parser.add_argument("--per-layer-eval-tokens", type=int, default=None,
                         help="Token budget per evaluation in per-layer mode "
-                             "(many more evaluations, so keep it small).")
+                             "(default 8192, or the --preset value).")
+    parser.add_argument("--per-layer-stride", type=int, default=None,
+                        help="Probe stride (default: non-overlapping windows, "
+                             "i.e. equal to --max-length).")
     parser.add_argument("--plot-only", action="store_true",
                         help="Regenerate plots from existing CSVs without "
                              "loading the model or recomputing anything.")
@@ -134,8 +163,21 @@ def parse_args(argv=None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
+    """Fill unset preset-controlled options; explicit flags always win."""
+    preset = PRESETS.get(args.preset, {}) if args.preset else {}
+    for key, fallback in FALLBACKS.items():
+        if getattr(args, key, None) is None:
+            setattr(args, key, preset.get(key, fallback))
+    if args.preset:
+        print(f"Preset '{args.preset}': {args.num_depths} blocks, "
+              f"{args.num_chi} bond dimensions, "
+              f"{args.per_layer_eval_tokens} tokens per evaluation.")
+    return args
+
+
 def main(argv=None) -> int:
-    args = parse_args(argv)
+    args = apply_preset(parse_args(argv))
     if args.threads:
         import torch
         torch.set_num_threads(args.threads)
@@ -167,7 +209,10 @@ def main(argv=None) -> int:
         max_eval_tokens=args.max_eval_tokens or None,
         ppl_batch_size=args.ppl_batch_size,
         profile_depths=args.profile_depths,
+        num_depths=args.num_depths,
+        layer_types=args.layer_types,
         per_layer_eval_tokens=args.per_layer_eval_tokens or None,
+        per_layer_stride=args.per_layer_stride,
         results_dir=args.results_dir,
         csv_name=args.csv_name,
         layer_csv_name=args.layer_csv_name,

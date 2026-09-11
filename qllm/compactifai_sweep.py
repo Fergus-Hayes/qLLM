@@ -93,8 +93,11 @@ class CompactifaiConfig:
     ppl_batch_size: int = 8
 
     # Per-layer profiling (one layer compressed at a time -> a curve per layer).
-    profile_depths: list[int] | None = None   # restrict to these block indices
-    per_layer_eval_tokens: int | None = 4096  # smaller budget: many evaluations
+    profile_depths: list[int] | None = None   # explicit block indices
+    num_depths: int | None = None             # or: auto-pick N evenly spaced depths
+    layer_types: list[str] | None = None      # restrict to these layer types
+    per_layer_eval_tokens: int | None = 8192  # budget per evaluation
+    per_layer_stride: int | None = None       # default: non-overlapping windows
 
     # Output.
     results_dir: str = "results/llms"
@@ -229,6 +232,17 @@ def layer_csv_path(config: CompactifaiConfig) -> Path:
 
 def per_layer_csv_path(config: CompactifaiConfig) -> Path:
     return compactifai_dir(config) / config.per_layer_csv_name
+
+
+def evenly_spaced(values: list[int], count: int) -> list[int]:
+    """Pick ``count`` evenly spaced entries from ``values``, keeping both ends."""
+    values = sorted(values)
+    if count <= 0 or count >= len(values):
+        return values
+    if count == 1:
+        return [values[0]]
+    idx = {round(i * (len(values) - 1) / (count - 1)) for i in range(count)}
+    return [values[i] for i in sorted(idx)]
 
 
 # --------------------------------------------------------------------------- #
@@ -535,18 +549,32 @@ def run_per_layer_sweep(config: CompactifaiConfig) -> Path:
     model, tokenizer = load_model_and_tokenizer(load_cfg, device)
 
     layers = select_layers(model, config)
+    available = sorted({parse_layer_info(n)[1] for n, _ in layers})
+
     if config.profile_depths is not None:
-        keep = set(config.profile_depths)
-        layers = [(n, p) for n, p in layers if parse_layer_info(n)[1] in keep]
+        keep = sorted(set(config.profile_depths) & set(available))
+    elif config.num_depths:
+        keep = evenly_spaced(available, config.num_depths)
+    else:
+        keep = available
+    layers = [(n, p) for n, p in layers if parse_layer_info(n)[1] in set(keep)]
+
+    if config.layer_types:
+        wanted = tuple(config.layer_types)
+        layers = [(n, p) for n, p in layers
+                  if any(w in parse_layer_info(n)[0] for w in wanted)]
     if not layers:
         raise RuntimeError("No layers selected for per-layer profiling.")
 
+    types_present = sorted({parse_layer_info(n)[0] for n, _ in layers})
+    print(f"\nProfiling plan: {len(keep)} of {len(available)} decoder blocks "
+          f"{keep}")
+    print(f"                {len(types_present)} layer types {types_present}")
+
     originals = {name: p.detach().to("cpu", copy=True) for name, p in layers}
 
-    print(f"\nPer-layer profiling over {len(layers)} layers"
-          + (f" (blocks {sorted(set(config.profile_depths))})"
-             if config.profile_depths else ""))
-    print("Building MPO plans (cached SVDs) ...")
+    print(f"                {len(layers)} layers to profile")
+    print("\nBuilding MPO plans (cached SVDs) ...")
     t0 = time.perf_counter()
     plans = {}
     for i, (name, _) in enumerate(layers, start=1):
@@ -564,10 +592,13 @@ def run_per_layer_sweep(config: CompactifaiConfig) -> Path:
 
     input_ids = tokenize_corpus(tokenizer, load_cfg)
     budget = config.per_layer_eval_tokens
+    # Non-overlapping windows by default: the probe compares conditions on the
+    # SAME tokens, so overlap buys little while costing ~2x the forward passes.
+    probe_stride = config.per_layer_stride or config.max_length
 
     def evaluate():
         return perplexity_over_ids(
-            model, input_ids, device, config.max_length, config.stride,
+            model, input_ids, device, config.max_length, probe_stride,
             batch_size=config.ppl_batch_size, max_eval_tokens=budget, progress=False,
         )
 
@@ -594,8 +625,10 @@ def run_per_layer_sweep(config: CompactifaiConfig) -> Path:
     print(f"\n{len(layers)} layers x up to {len(chis)} chi = {total_points} points "
           f"(chi clamped per layer to its exact-reconstruction rank); "
           f"{len(todo)} to evaluate, {total_points - len(todo)} checkpointed.")
-    print(f"Each point = one perplexity evaluation over {budget} tokens with only "
-          f"that layer compressed.")
+    windows = max(1, math.ceil((budget or input_ids.size(1)) / probe_stride))
+    print(f"Each point = one perplexity evaluation over {budget} tokens "
+          f"({windows} windows of {config.max_length}, stride {probe_stride}) "
+          f"with only that layer compressed.")
     print(f"Checkpoint / results CSV: {path}")
 
     start = time.perf_counter()

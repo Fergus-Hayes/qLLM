@@ -278,8 +278,39 @@ paper's layer-sensitivity profiling. This costs `n_layers x n_chi` evaluations,
 so it uses its own smaller token budget (`--per-layer-eval-tokens`, default 4096)
 and is checkpointed per (layer, χ) pair.
 
+**Recommended invocation** — a representative subset of layers across the full
+depth range, at a token budget that is meaningful without being prohibitive:
+
 ```bash
-# Profile a handful of blocks, as the paper does (it uses blocks 0, 5, 15, 31)
+python compactify.py --mode per-layer --preset standard --ppl-batch-size 16 --threads 8
+```
+
+`--preset` picks the subset and budget for you; `--num-depths` chooses that many
+**evenly spaced decoder blocks automatically from the model's actual depth**
+(always including the first and last), so it works for any model without you
+knowing its block count. All 7 layer types are profiled at each depth.
+
+| preset | blocks | χ points | tokens/eval | evaluations (7 types) |
+| --- | --- | --- | --- | --- |
+| `quick` | 4 | 6 | 4 096 | ~168 |
+| `standard` | 6 | 8 | 8 192 | ~336 |
+| `thorough` | 10 | 10 | 16 384 | ~700 |
+
+For SmolLM2-135M (30 blocks), `standard` profiles blocks
+`[0, 6, 12, 17, 23, 29]` — early, middle and late — which is where the paper's
+sensitivity gradient shows up. Any explicit flag overrides the preset
+(`--preset standard --num-depths 4`), and `--layer-types q_proj down_proj`
+narrows the set further.
+
+Two things keep the budget affordable: the probe uses **non-overlapping**
+windows (`--per-layer-stride` defaults to the window size, halving the forward
+passes versus the overlapping default), and each layer's χ list is clamped to its
+exact-reconstruction rank so redundant lossless points are skipped. Because every
+condition is scored on the *same* tokens, corpus-sampling error largely cancels in
+`ppl_ratio`, so a moderate budget still resolves differences between layers well.
+
+```bash
+# Paper-style explicit blocks (it uses 0, 5, 15, 31 for a 32-block model)
 python compactify.py --mode per-layer --profile-depths 0 5 15 29
 
 # Every eligible layer (slow: ~n_layers x n_chi evaluations)
