@@ -48,6 +48,42 @@ Run `python benchmark_llm.py --help` for the full list of options (dataset,
 window size, stride, prompt, warm-up runs, `--trust-remote-code`, `--revision`,
 and flags to skip either the perplexity or the timing stage).
 
+### Speeding up the perplexity evaluation
+
+The perplexity loop scores overlapping sliding windows; those windows are
+independent, so the biggest win is **running several per forward pass** instead
+of one at a time. This is controlled by `--ppl-batch-size` (default 8) and is
+numerically identical to the one-at-a-time result (verified across batch sizes)
+— it just keeps the matmul units saturated.
+
+```bash
+# GPU: large batch + half precision is by far the fastest
+python benchmark_llm.py --device cuda --dtype float16 --ppl-batch-size 32
+
+# CPU: batch a few windows and use all cores
+python benchmark_llm.py --ppl-batch-size 8 --threads 8
+
+# Fewer FLOPs (accuracy trade-off): non-overlapping windows halve the work
+python benchmark_llm.py --stride 1024            # stride == window
+```
+
+Levers, roughly in order of impact:
+
+1. **`--device cuda --dtype float16`/`bfloat16`** — a GPU is 10–100× a CPU here;
+   half precision adds ~2× and halves memory.
+2. **`--ppl-batch-size N`** — near-linear speedup until memory-bound (raise it on
+   GPU; keep it modest for large models or low-RAM CPUs; `1` restores the old
+   behavior).
+3. **`--threads N`** — CPU intra-op parallelism (BLAS already threads, but this
+   pins the count).
+4. **`--stride` (↑) / `--max-eval-tokens` (↓)** — do less work: a larger stride
+   reduces window overlap, `--max-eval-tokens` caps the corpus for a quick run.
+5. **Across models**, the sweep is embarrassingly parallel — run separate
+   processes (with `--resume`) or, on multi-GPU, one model per device.
+
+The same `--ppl-batch-size` / `--threads` flags apply to `analyze_layers.py`,
+where they accelerate the per-layer perplexity-sensitivity probe.
+
 ### Results / CSV output
 
 Each run is appended (with a header on first creation) to a **per-model** CSV at

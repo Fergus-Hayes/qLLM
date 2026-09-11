@@ -62,6 +62,12 @@ def parse_args(argv=None) -> argparse.Namespace:
                              "square matrices; 0 disables condition_number_rmt_ratio).")
     parser.add_argument("--rmt-seed", type=int, default=0)
 
+    parser.add_argument("--ppl-batch-size", type=int, default=8,
+                        help="Windows scored per forward pass in the sensitivity "
+                             "probe. Higher is faster (parallelism) until memory-bound.")
+    parser.add_argument("--threads", type=int, default=None,
+                        help="CPU threads for torch intra-op parallelism.")
+
     parser.add_argument("--results-dir", default="results/llms")
     parser.add_argument("--csv-name", default="layer_analysis.csv")
     parser.add_argument("--no-plots", action="store_true",
@@ -73,6 +79,9 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    if args.threads:
+        import torch
+        torch.set_num_threads(args.threads)
     config = LayerAnalysisConfig(
         model_id=args.model,
         device=args.device,
@@ -91,6 +100,7 @@ def main(argv=None) -> int:
         sensitivity_seed=args.sensitivity_seed,
         rmt_samples=args.rmt_samples,
         rmt_seed=args.rmt_seed,
+        ppl_batch_size=args.ppl_batch_size,
         results_dir=args.results_dir,
         csv_name=args.csv_name,
         make_plots=not args.no_plots,

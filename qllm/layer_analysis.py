@@ -58,6 +58,7 @@ class LayerAnalysisConfig:
     epsilon: float = 0.01
     sensitivity_samples: int = 1
     sensitivity_seed: int = 0
+    ppl_batch_size: int = 8       # windows scored per forward pass (parallelism)
 
     # Random-matrix (Marchenko-Pastur) condition-number baseline. The empirical
     # baseline is the median condition number of this many iid Gaussian matrices
@@ -256,16 +257,35 @@ def spectral_metrics(weight: torch.Tensor) -> dict:
 # Perplexity sensitivity
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
-def quick_perplexity(model, input_ids: torch.Tensor, device: str, window: int) -> float:
-    """Perplexity over a fixed token block using non-overlapping windows."""
+def quick_perplexity(model, input_ids: torch.Tensor, device: str, window: int,
+                     batch_size: int = 8) -> float:
+    """Perplexity over a fixed token block using non-overlapping windows.
+
+    Full-length windows are stacked into batches of up to ``batch_size`` and
+    scored in a single forward pass (data parallelism across windows), which is
+    numerically equivalent to scoring them one by one but much faster. A final
+    short window (< window, only scored if it has >= 2 tokens) is handled on its
+    own so every batch stays rectangular.
+    """
     seq_len = input_ids.size(1)
+    windows = [(b, min(b + window, seq_len)) for b in range(0, seq_len, window)]
+    windows = [(b, e) for (b, e) in windows if e - b >= 2]
+    if not windows:
+        return float("nan")
+
+    batch_size = max(1, batch_size)
     nll_sum, n_tokens = 0.0, 0
-    for begin in range(0, seq_len, window):
-        ids = input_ids[:, begin:begin + window].to(device)
-        if ids.size(1) < 2:
-            break
+    i = 0
+    while i < len(windows):
+        window_len = windows[i][1] - windows[i][0]
+        batch = []
+        while (i < len(windows) and len(batch) < batch_size
+               and (windows[i][1] - windows[i][0]) == window_len):
+            batch.append(windows[i])
+            i += 1
+        ids = torch.stack([input_ids[0, b:e] for (b, e) in batch]).to(device)
         loss = model(ids, labels=ids).loss
-        n = ids.size(1) - 1
+        n = ids.shape[0] * (window_len - 1)   # valid scored positions in batch
         nll_sum += float(loss) * n
         n_tokens += n
     if n_tokens == 0:
@@ -284,6 +304,7 @@ def perplexity_sensitivity(
     epsilon: float,
     n_samples: int,
     generator: torch.Generator,
+    batch_size: int = 8,
 ) -> tuple[float, float]:
     """Relative PPL change per unit relative weight perturbation.
 
@@ -303,7 +324,7 @@ def perplexity_sensitivity(
                             dtype=weight.dtype, device=weight.device)
         scale = epsilon * w_norm / (noise.norm() + 1e-12)
         weight.add_(scale * noise)
-        ppl = quick_perplexity(model, input_ids, device, window)
+        ppl = quick_perplexity(model, input_ids, device, window, batch_size)
         weight.copy_(original)                     # restore before next sample
         ppl_values.append(ppl)
         if baseline_ppl > 0 and math.isfinite(ppl):
@@ -594,7 +615,7 @@ def run_layer_analysis(config: LayerAnalysisConfig) -> Path:
         window = min(config.sensitivity_window, eval_ids.size(1))
         print("Computing baseline perplexity for sensitivity probe ...")
         t0 = time.perf_counter()
-        baseline_ppl = quick_perplexity(model, eval_ids, device, window)
+        baseline_ppl = quick_perplexity(model, eval_ids, device, window, config.ppl_batch_size)
         print(f"Baseline PPL = {baseline_ppl:.4f} ({time.perf_counter() - t0:.1f}s)")
         if not math.isfinite(baseline_ppl) or baseline_ppl <= 0:
             print("    WARNING: baseline perplexity is not a finite positive "
@@ -626,6 +647,7 @@ def run_layer_analysis(config: LayerAnalysisConfig) -> Path:
             sensitivity, ppl_pert = perplexity_sensitivity(
                 model, param, eval_ids, device, window,
                 baseline_ppl, config.epsilon, config.sensitivity_samples, generator,
+                config.ppl_batch_size,
             )
             base_used, eps_used, samples_used = baseline_ppl, config.epsilon, config.sensitivity_samples
             print(f"    sensitivity: dPPL/PPL per eps={config.epsilon} -> "

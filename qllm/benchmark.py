@@ -53,6 +53,7 @@ class BenchmarkConfig:
     max_length: int = 1024        # sliding-window size (clamped to model max)
     stride: int = 512
     max_eval_tokens: int | None = None
+    ppl_batch_size: int = 8       # windows scored per forward pass (parallelism)
     run_perplexity: bool = True
 
     # Inference timing.
@@ -206,46 +207,65 @@ def compute_perplexity(
     seq_len = input_ids_full.size(1)
     if config.max_eval_tokens is not None:
         seq_len = min(seq_len, config.max_eval_tokens)
-    total_windows = max(1, (seq_len + config.stride - 1) // config.stride)
-    progress_every = max(1, total_windows // 20)   # ~20 progress lines
-    print(f"Evaluating perplexity over {seq_len} tokens "
-          f"(window={max_length}, stride={config.stride}, {total_windows} windows) ...")
-
-    nll_sum = torch.tensor(0.0)
-    n_tokens = 0
+    # Enumerate the sliding windows as (begin, end, target_len) specs; target_len
+    # is the count of newly revealed tokens scored in that window.
+    specs = []
     prev_end = 0
-    start_time = time.perf_counter()
-
-    for step, begin in enumerate(range(0, seq_len, config.stride), start=1):
+    for begin in range(0, seq_len, config.stride):
         end = min(begin + max_length, seq_len)
-        target_len = end - prev_end  # tokens newly scored in this window
-        input_ids = input_ids_full[:, begin:end].to(device)
-
-        target_ids = input_ids.clone()
-        target_ids[:, :-target_len] = -100  # ignore already-scored context
-
-        outputs = model(input_ids, labels=target_ids)
-
-        # outputs.loss is the mean NLL over scored tokens. The model shifts
-        # labels internally (predicting token i from tokens < i), so the exact
-        # number of scored positions is the count of non-ignored labels after
-        # dropping the first one. Weighting each window's mean loss by this
-        # count yields a correctly token-averaged perplexity.
-        num_valid = int((target_ids[:, 1:] != -100).sum().item())
-        nll_sum += outputs.loss.detach().cpu().float() * num_valid
-        n_tokens += num_valid
-
-        if step % progress_every == 0 or end == seq_len:
-            elapsed = time.perf_counter() - start_time
-            running_ppl = float(torch.exp(nll_sum / max(1, n_tokens)))
-            eta = elapsed / step * (total_windows - step)
-            print(f"    window {step}/{total_windows}  "
-                  f"running_ppl={running_ppl:.4f}  "
-                  f"elapsed={elapsed:.0f}s  eta={eta:.0f}s")
-
+        specs.append((begin, end, end - prev_end))
         prev_end = end
         if end == seq_len:
             break
+
+    batch_size = max(1, getattr(config, "ppl_batch_size", 1))
+    total_windows = len(specs)
+    print(f"Evaluating perplexity over {seq_len} tokens "
+          f"(window={max_length}, stride={config.stride}, {total_windows} windows, "
+          f"batch={batch_size}) ...")
+
+    nll_sum = torch.tensor(0.0)
+    n_tokens = 0
+    processed = 0
+    last_print = 0
+    start_time = time.perf_counter()
+
+    # Batch windows of identical length into one forward pass (data parallelism
+    # across windows). Only the final window can be shorter, so a length change
+    # forces a flush. The batched mean-NLL times the batch's valid-token count is
+    # exactly the summed NLL, so this is numerically equivalent to the per-window
+    # loop (up to floating-point associativity), just far better at saturating
+    # the CPU/GPU matmul units.
+    i = 0
+    while i < total_windows:
+        window_len = specs[i][1] - specs[i][0]
+        batch = []
+        while (i < total_windows and len(batch) < batch_size
+               and (specs[i][1] - specs[i][0]) == window_len):
+            batch.append(specs[i])
+            i += 1
+
+        input_ids = torch.stack(
+            [input_ids_full[0, b:e] for (b, e, _) in batch]
+        ).to(device)                                   # [B, L]
+        target_ids = input_ids.clone()
+        for r, (_, _, target_len) in enumerate(batch):
+            target_ids[r, :window_len - target_len] = -100
+
+        outputs = model(input_ids, labels=target_ids)
+        num_valid = int((target_ids[:, 1:] != -100).sum().item())
+        nll_sum += outputs.loss.detach().cpu().float() * num_valid
+        n_tokens += num_valid
+        processed += len(batch)
+
+        if processed - last_print >= max(batch_size, total_windows // 20) or processed == total_windows:
+            last_print = processed
+            elapsed = time.perf_counter() - start_time
+            running_ppl = float(torch.exp(nll_sum / max(1, n_tokens)))
+            eta = elapsed / processed * (total_windows - processed)
+            print(f"    window {processed}/{total_windows}  "
+                  f"running_ppl={running_ppl:.4f}  "
+                  f"elapsed={elapsed:.0f}s  eta={eta:.0f}s")
 
     elapsed = time.perf_counter() - start_time
     if n_tokens == 0:

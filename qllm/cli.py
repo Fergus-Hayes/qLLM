@@ -87,6 +87,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--max-eval-tokens", type=int, default=None,
                         help="Cap on tokens used for perplexity "
                              "(default: whole split; set e.g. 20000 for a quick run).")
+    parser.add_argument("--ppl-batch-size", type=int, default=8,
+                        help="Sliding windows scored per forward pass. Higher is "
+                             "faster (parallelism) until memory-bound; 1 = one at a time.")
+    parser.add_argument("--threads", type=int, default=None,
+                        help="CPU threads for torch intra-op parallelism "
+                             "(default: torch's own choice).")
 
     # Inference-timing options.
     parser.add_argument("--prompt",
@@ -133,6 +139,7 @@ def config_from_args(model_id: str, args: argparse.Namespace) -> BenchmarkConfig
         max_length=args.max_length,
         stride=args.stride,
         max_eval_tokens=args.max_eval_tokens,
+        ppl_batch_size=args.ppl_batch_size,
         run_perplexity=not args.skip_perplexity,
         prompt=args.prompt,
         gen_tokens=args.gen_tokens,
@@ -157,6 +164,9 @@ def already_benchmarked(model_id: str, args: argparse.Namespace) -> bool:
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    if args.threads:
+        import torch
+        torch.set_num_threads(args.threads)
 
     models = list(args.models)
     if args.models_file:
