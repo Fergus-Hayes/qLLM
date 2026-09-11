@@ -26,7 +26,14 @@ from .compactifai_sweep import (
     DEFAULT_EXCLUDE,
     DEFAULT_INCLUDE,
     CompactifaiConfig,
+    _read_rows,
+    compactifai_dir,
+    per_layer_csv_path,
+    plot_global_sweep,
+    plot_per_layer,
+    run_per_layer_sweep,
     run_sweep,
+    sweep_csv_path,
 )
 
 DEFAULT_MODEL = "HuggingFaceTB/SmolLM2-135M"
@@ -97,6 +104,25 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--ppl-batch-size", type=int, default=8,
                         help="Sliding windows scored per forward pass.")
 
+    # What to run.
+    parser.add_argument("--mode", default="global",
+                        choices=["global", "per-layer", "both"],
+                        help="'global': compress all layers together at each chi. "
+                             "'per-layer': compress ONE layer at a time to get a "
+                             "perplexity-vs-chi curve per layer (n_layers x n_chi "
+                             "evaluations). 'both' runs each in turn.")
+    parser.add_argument("--profile-depths", type=int, nargs="+", default=None,
+                        help="Restrict per-layer profiling to these block indices "
+                             "(the paper profiles a handful, e.g. 0 5 15 31).")
+    parser.add_argument("--per-layer-eval-tokens", type=int, default=4096,
+                        help="Token budget per evaluation in per-layer mode "
+                             "(many more evaluations, so keep it small).")
+    parser.add_argument("--plot-only", action="store_true",
+                        help="Regenerate plots from existing CSVs without "
+                             "loading the model or recomputing anything.")
+    parser.add_argument("--no-plots", action="store_true",
+                        help="Do not write plots.")
+
     # Output.
     parser.add_argument("--results-dir", default="results/llms")
     parser.add_argument("--csv-name", default="compactifai_sweep.csv")
@@ -140,13 +166,27 @@ def main(argv=None) -> int:
         stride=args.stride,
         max_eval_tokens=args.max_eval_tokens or None,
         ppl_batch_size=args.ppl_batch_size,
+        profile_depths=args.profile_depths,
+        per_layer_eval_tokens=args.per_layer_eval_tokens or None,
         results_dir=args.results_dir,
         csv_name=args.csv_name,
         layer_csv_name=args.layer_csv_name,
         write_layer_csv=not args.no_layer_csv,
+        make_plots=not args.no_plots,
         force_recompute=args.recompute,
     )
-    run_sweep(config)
+
+    if args.plot_only:
+        out = compactifai_dir(config)
+        print(f"Regenerating plots in {out} ...")
+        plot_global_sweep(_read_rows(sweep_csv_path(config)), out)
+        plot_per_layer(_read_rows(per_layer_csv_path(config)), out)
+        return 0
+
+    if args.mode in ("global", "both"):
+        run_sweep(config)
+    if args.mode in ("per-layer", "both"):
+        run_per_layer_sweep(config)
     return 0
 
 

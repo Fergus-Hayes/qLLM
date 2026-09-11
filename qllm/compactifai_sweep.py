@@ -91,11 +91,17 @@ class CompactifaiConfig:
     max_eval_tokens: int | None = 20000
     ppl_batch_size: int = 8
 
+    # Per-layer profiling (one layer compressed at a time -> a curve per layer).
+    profile_depths: list[int] | None = None   # restrict to these block indices
+    per_layer_eval_tokens: int | None = 4096  # smaller budget: many evaluations
+
     # Output.
     results_dir: str = "results/llms"
     csv_name: str = "compactifai_sweep.csv"
     layer_csv_name: str = "compactifai_layers.csv"
+    per_layer_csv_name: str = "compactifai_per_layer.csv"
     write_layer_csv: bool = True
+    make_plots: bool = True
     force_recompute: bool = False
 
 
@@ -146,6 +152,28 @@ class LayerRow:
     relative_error: float
 
 
+@dataclass
+class PerLayerRow:
+    """One (layer, chi) point: only that layer is compressed, all others dense."""
+    timestamp: str
+    model_id: str
+    param_name: str
+    layer_type: str
+    depth: int
+    chi: int
+    rows: int
+    cols: int
+    params_original: int
+    params_mpo: int
+    compression_ratio: float
+    relative_error: float
+    perplexity: float
+    ppl_baseline: float
+    ppl_ratio: float
+    eval_tokens: int
+    eval_seconds: float
+
+
 # --------------------------------------------------------------------------- #
 # CSV helpers (atomic rewrite + per-chi checkpoint)
 # --------------------------------------------------------------------------- #
@@ -168,14 +196,38 @@ def _read_rows(path: Path) -> list[dict]:
         return list(csv.DictReader(f))
 
 
+def compactifai_dir(config: CompactifaiConfig) -> Path:
+    """<results-dir>/<model>/compactifai/ -- all CompactifAI outputs live here."""
+    name = config.model_id.rstrip("/").split("/")[-1]
+    return Path(config.results_dir) / name / "compactifai"
+
+
+def _migrate_legacy(old_path: Path, new_path: Path) -> None:
+    """Move a file written by the older flat layout, preserving checkpoints."""
+    if old_path.exists() and not new_path.exists():
+        new_path.parent.mkdir(parents=True, exist_ok=True)
+        old_path.replace(new_path)
+        print(f"Migrated {old_path} -> {new_path}")
+
+
 def sweep_csv_path(config: CompactifaiConfig) -> Path:
     name = config.model_id.rstrip("/").split("/")[-1]
-    return Path(config.results_dir) / name / config.csv_name
+    base = Path(config.results_dir) / name
+    new_path = compactifai_dir(config) / config.csv_name
+    _migrate_legacy(base / config.csv_name, new_path)
+    return new_path
 
 
 def layer_csv_path(config: CompactifaiConfig) -> Path:
     name = config.model_id.rstrip("/").split("/")[-1]
-    return Path(config.results_dir) / name / config.layer_csv_name
+    base = Path(config.results_dir) / name
+    new_path = compactifai_dir(config) / config.layer_csv_name
+    _migrate_legacy(base / config.layer_csv_name, new_path)
+    return new_path
+
+
+def per_layer_csv_path(config: CompactifaiConfig) -> Path:
+    return compactifai_dir(config) / config.per_layer_csv_name
 
 
 # --------------------------------------------------------------------------- #
@@ -428,6 +480,8 @@ def run_sweep(config: CompactifaiConfig) -> Path:
     print("\nOriginal weights restored.")
 
     print_summary(_read_rows(path))
+    if config.make_plots:
+        plot_global_sweep(_read_rows(path), compactifai_dir(config))
     print(f"\nSweep complete. Results in {path}")
     if config.write_layer_csv:
         print(f"Per-layer detail in {layer_csv_path(config)}")
@@ -456,3 +510,276 @@ def print_summary(rows: list[dict]) -> None:
         print(f"\nBaseline (uncompressed) perplexity: {float(rows[0]['ppl_baseline']):.4f}")
     except (KeyError, ValueError, TypeError):
         pass
+
+
+# --------------------------------------------------------------------------- #
+# Per-layer profiling: perplexity vs. bond dimension, one layer at a time
+# --------------------------------------------------------------------------- #
+def run_per_layer_sweep(config: CompactifaiConfig) -> Path:
+    """Compress ONE layer at a time and measure perplexity vs. bond dimension.
+
+    This is the paper's layer-sensitivity profiling: with every other layer left
+    dense, the curve for a layer isolates how much truncation *that* layer
+    tolerates. Cost is ``n_layers x n_chi`` evaluations, so it uses its own
+    (smaller) token budget, ``--per-layer-eval-tokens``, and is checkpointed per
+    (layer, chi) pair.
+    """
+    device = resolve_device(config.device)
+    load_cfg = BenchmarkConfig(
+        model_id=config.model_id, device=config.device, dtype=config.dtype,
+        trust_remote_code=config.trust_remote_code, revision=config.revision,
+        dataset=config.dataset, dataset_config=config.dataset_config,
+        split=config.split, text_column=config.text_column,
+    )
+    model, tokenizer = load_model_and_tokenizer(load_cfg, device)
+
+    layers = select_layers(model, config)
+    if config.profile_depths is not None:
+        keep = set(config.profile_depths)
+        layers = [(n, p) for n, p in layers if parse_layer_info(n)[1] in keep]
+    if not layers:
+        raise RuntimeError("No layers selected for per-layer profiling.")
+
+    originals = {name: p.detach().to("cpu", copy=True) for name, p in layers}
+
+    print(f"\nPer-layer profiling over {len(layers)} layers"
+          + (f" (blocks {sorted(set(config.profile_depths))})"
+             if config.profile_depths else ""))
+    print("Building MPO plans (cached SVDs) ...")
+    t0 = time.perf_counter()
+    plans = {}
+    for i, (name, _) in enumerate(layers, start=1):
+        plans[name] = build_plan(originals[name], config.mpo_sites, cache=config.svd_cache)
+        if i % max(1, len(layers) // 10) == 0 or i == len(layers):
+            print(f"    plans {i}/{len(layers)} ({time.perf_counter() - t0:.0f}s)")
+
+    auto_max = max(plans[n].max_chi for n, _ in layers)
+    chi_max = config.chi_max if config.chi_max else auto_max
+    if config.chi_values:
+        chis = sorted({int(c) for c in config.chi_values if c >= 1})
+    else:
+        chis = log_spaced_ints(config.chi_min, chi_max, config.num_chi)
+    print(f"Bond dimensions (log-spaced): {chis}")
+
+    input_ids = tokenize_corpus(tokenizer, load_cfg)
+    budget = config.per_layer_eval_tokens
+
+    def evaluate():
+        return perplexity_over_ids(
+            model, input_ids, device, config.max_length, config.stride,
+            batch_size=config.ppl_batch_size, max_eval_tokens=budget, progress=False,
+        )
+
+    path = per_layer_csv_path(config)
+    existing = [] if config.force_recompute else _read_rows(path)
+    done = {(r.get("param_name"), str(r.get("chi"))) for r in existing}
+    rows_by_key = {(r.get("param_name"), str(r.get("chi"))): r for r in existing}
+
+    print(f"\nBaseline (all layers dense) perplexity on {budget} tokens ...")
+    baseline, eval_tokens, _ = evaluate()
+    print(f"Baseline perplexity = {baseline:.4f}")
+
+    todo = [(n, p, c) for (n, p) in layers for c in chis if (n, str(c)) not in done]
+    print(f"\n{len(layers)} layers x {len(chis)} chi = {len(layers) * len(chis)} points; "
+          f"{len(todo)} to evaluate ({len(layers) * len(chis) - len(todo)} checkpointed).")
+    print(f"Checkpoint / results CSV: {path}")
+
+    start = time.perf_counter()
+    for i, (name, param, chi) in enumerate(todo, start=1):
+        plan = plans[name]
+        orig = originals[name]
+        approx, params_mpo = compress_weight(orig, plan, chi)
+        err = relative_error(orig, approx)
+        with torch.no_grad():
+            param.copy_(approx.to(dtype=param.dtype, device=param.device))
+        ppl, eval_tokens, secs = evaluate()
+        with torch.no_grad():                      # restore immediately
+            param.copy_(orig.to(dtype=param.dtype, device=param.device))
+
+        layer_type, depth = parse_layer_info(name)
+        row = asdict(PerLayerRow(
+            timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            model_id=config.model_id, param_name=name, layer_type=layer_type,
+            depth=depth, chi=chi, rows=int(param.shape[0]), cols=int(param.shape[1]),
+            params_original=plan.dense_params, params_mpo=params_mpo,
+            compression_ratio=round(params_mpo / plan.dense_params, 6),
+            relative_error=round(err, 6), perplexity=round(ppl, 4),
+            ppl_baseline=round(baseline, 4),
+            ppl_ratio=round(ppl / baseline, 4) if baseline else float("nan"),
+            eval_tokens=eval_tokens, eval_seconds=round(secs, 2),
+        ))
+        rows_by_key[(name, str(chi))] = row
+        ordered = sorted(rows_by_key.values(),
+                         key=lambda r: (str(r["param_name"]), int(r["chi"])))
+        _write_rows(path, ordered, [f.name for f in fields(PerLayerRow)])
+
+        elapsed = time.perf_counter() - start
+        eta = elapsed / i * (len(todo) - i)
+        print(f"  [{i}/{len(todo)}] {layer_type} d{depth} chi={chi:<4} "
+              f"ratio={params_mpo / plan.dense_params:.3f} rel.err={err:.4f} "
+              f"ppl={ppl:.4f} (x{ppl / baseline:.3f})  "
+              f"elapsed={elapsed:.0f}s eta={eta:.0f}s")
+
+    with torch.no_grad():
+        for name, param in layers:
+            param.copy_(originals[name].to(dtype=param.dtype, device=param.device))
+    print("\nOriginal weights restored.")
+
+    if config.make_plots:
+        plot_per_layer(_read_rows(path), compactifai_dir(config))
+    print(f"\nPer-layer profiling complete. Results in {path}")
+    return path
+
+
+# --------------------------------------------------------------------------- #
+# Plots
+# --------------------------------------------------------------------------- #
+def _import_pyplot():
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        return plt
+    except Exception as exc:                       # noqa: BLE001
+        print(f"(Skipping plots: matplotlib unavailable: {exc})")
+        return None
+
+
+def plot_per_layer(rows: list[dict], out_dir: Path) -> None:
+    """Perplexity vs. bond dimension, one curve per layer.
+
+    Panels are grouped by layer type; within a panel each curve is one decoder
+    block (depth), coloured light->dark with increasing depth. The dashed line is
+    the uncompressed baseline.
+    """
+    plt = _import_pyplot()
+    if plt is None or not rows:
+        return
+
+    data = {}
+    baseline = None
+    for r in rows:
+        try:
+            lt, depth, chi = r["layer_type"], int(r["depth"]), int(r["chi"])
+            ppl = float(r["perplexity"])
+            baseline = float(r["ppl_baseline"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        if not math.isfinite(ppl):
+            continue
+        data.setdefault(lt, {}).setdefault(depth, []).append((chi, ppl))
+
+    if not data:
+        print("(No per-layer rows to plot.)")
+        return
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    types = sorted(data)
+    ncols = min(3, len(types))
+    nrows = math.ceil(len(types) / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5.2 * ncols, 3.9 * nrows),
+                             squeeze=False, sharex=True)
+    depths = sorted({d for t in data.values() for d in t})
+    dmin, dmax = (min(depths), max(depths)) if depths else (0, 1)
+    cmap = plt.get_cmap("viridis")
+
+    for idx, lt in enumerate(types):
+        ax = axes[idx // ncols][idx % ncols]
+        for depth in sorted(data[lt]):
+            pts = sorted(data[lt][depth])
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            frac = (depth - dmin) / (dmax - dmin) if dmax > dmin else 0.5
+            ax.plot(xs, ys, marker="o", ms=3, lw=1.4, color=cmap(frac),
+                    label=f"block {depth}")
+        if baseline and math.isfinite(baseline):
+            ax.axhline(baseline, ls="--", lw=1.2, color="crimson",
+                       label="baseline (dense)")
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_title(lt, fontsize=11)
+        ax.set_xlabel(r"bond dimension $\chi$")
+        ax.set_ylabel("perplexity")
+        ax.grid(True, which="both", alpha=0.25)
+        if len(data[lt]) <= 12:
+            ax.legend(fontsize="x-small", ncol=2)
+
+    for j in range(len(types), nrows * ncols):     # hide unused panels
+        axes[j // ncols][j % ncols].axis("off")
+
+    if depths and len(depths) > 12:
+        norm = plt.Normalize(vmin=dmin, vmax=dmax)
+        fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap),
+                     ax=axes, label="decoder block (depth)", fraction=0.02, pad=0.01)
+
+    fig.suptitle("CompactifAI: perplexity vs. MPO bond dimension "
+                 "(one layer compressed at a time)", fontsize=13)
+    path = out_dir / "perplexity_vs_bond_dimension_per_layer.png"
+    fig.savefig(path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  saved plot {path}")
+
+    # Companion: every layer on a single axes, coloured by layer type.
+    fig, ax = plt.subplots(figsize=(8.5, 5.5))
+    colors = plt.get_cmap("tab10")
+    for i, lt in enumerate(types):
+        first = True
+        for depth in sorted(data[lt]):
+            pts = sorted(data[lt][depth])
+            ax.plot([p[0] for p in pts], [p[1] for p in pts], lw=1.0, alpha=0.55,
+                    color=colors(i % 10), label=lt if first else None)
+            first = False
+    if baseline and math.isfinite(baseline):
+        ax.axhline(baseline, ls="--", lw=1.3, color="black", label="baseline (dense)")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel(r"bond dimension $\chi$")
+    ax.set_ylabel("perplexity")
+    ax.set_title("Perplexity vs. bond dimension for every profiled layer")
+    ax.grid(True, which="both", alpha=0.25)
+    ax.legend(fontsize="small", ncol=2)
+    path = out_dir / "perplexity_vs_bond_dimension_all_layers.png"
+    fig.savefig(path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  saved plot {path}")
+
+
+def plot_global_sweep(rows: list[dict], out_dir: Path) -> None:
+    """Perplexity and compression vs. bond dimension for the whole-model sweep."""
+    plt = _import_pyplot()
+    if plt is None or not rows:
+        return
+    pts = []
+    baseline = None
+    for r in rows:
+        try:
+            pts.append((int(r["chi"]), float(r["perplexity"]),
+                        float(r["param_reduction_pct"])))
+            baseline = float(r["ppl_baseline"])
+        except (KeyError, ValueError, TypeError):
+            continue
+    if not pts:
+        return
+    pts.sort()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(7.5, 5))
+    ax.plot([p[0] for p in pts], [p[1] for p in pts], marker="o", color="#2a6f97",
+            label="all layers compressed")
+    if baseline and math.isfinite(baseline):
+        ax.axhline(baseline, ls="--", color="crimson", label="baseline (dense)")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel(r"bond dimension $\chi$")
+    ax.set_ylabel("perplexity")
+    ax.grid(True, which="both", alpha=0.25)
+    ax2 = ax.twinx()
+    ax2.plot([p[0] for p in pts], [p[2] for p in pts], marker="s", ms=4,
+             color="#888", alpha=0.7, label="model params removed (%)")
+    ax2.set_ylabel("model parameters removed (%)")
+    ax.set_title("CompactifAI whole-model sweep")
+    lines = ax.get_lines() + ax2.get_lines()
+    ax.legend(lines, [l.get_label() for l in lines], fontsize="small", loc="best")
+    path = out_dir / "perplexity_vs_bond_dimension_global.png"
+    fig.savefig(path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  saved plot {path}")

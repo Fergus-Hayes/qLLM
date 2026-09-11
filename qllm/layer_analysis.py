@@ -338,9 +338,27 @@ def perplexity_sensitivity(
 # --------------------------------------------------------------------------- #
 # CSV / checkpoint helpers
 # --------------------------------------------------------------------------- #
+def migrate_legacy(old_path: Path, new_path: Path) -> None:
+    """Move a result file written by an older layout into its new location.
+
+    Keeps checkpoints (and the expensive sensitivity values in them) valid when
+    outputs are reorganized into per-analysis sub-directories.
+    """
+    if old_path.exists() and not new_path.exists():
+        new_path.parent.mkdir(parents=True, exist_ok=True)
+        old_path.replace(new_path)
+        print(f"Migrated {old_path} -> {new_path}")
+
+
 def layer_csv_path(config: LayerAnalysisConfig) -> Path:
+    """<results-dir>/<model>/layer_analysis/<csv-name> (migrating the old flat path)."""
     model_name = config.model_id.rstrip("/").split("/")[-1]
-    return Path(config.results_dir) / model_name / config.csv_name
+    base = Path(config.results_dir) / model_name
+    new_path = base / "layer_analysis" / config.csv_name
+    migrate_legacy(base / config.csv_name, new_path)
+    for png in base.glob("depth_*.png"):
+        migrate_legacy(png, base / "layer_analysis" / png.name)
+    return new_path
 
 
 CSV_FIELDS = [f.name for f in fields(LayerResult)]

@@ -184,6 +184,11 @@ too. Raw columns are kept in the CSV for reference. For cross-*model* comparison
 z-scoring each normalized metric within `(model, layer_type)` groups removes any
 residual family-specific offset.
 
+Outputs go to `results/llms/<model-name>/layer_analysis/` — the
+`layer_analysis.csv` checkpoint and the `depth_<metric>.png` plots. Files from
+the older flat layout are migrated automatically on the next run, so existing
+checkpoints (and the expensive sensitivity values in them) are preserved.
+
 **Printouts & checkpointing.** Progress is printed as each layer is processed
 (spectral line, sensitivity line, running count + ETA). Results are written to
 `results/llms/<model-name>/layer_analysis.csv`, which **is** the checkpoint:
@@ -256,15 +261,46 @@ matrix, computed per model from the layer shapes).
 | `--threads`, `--device cuda`, `--dtype float16` | the usual device/precision levers |
 | `--max-eval-tokens` | caps tokens per evaluation (default 20000, since the corpus is re-scored once per χ) |
 
-**Outputs** (checkpointed after every χ; re-running skips χ already recorded,
-`--recompute` forces a redo):
+### Per-layer profiling: a perplexity curve for every layer
 
-- `results/llms/<model>/compactifai_sweep.csv` — one row per χ: parameter and
+`--mode per-layer` compresses **one layer at a time** (all others left dense) and
+measures perplexity at each χ, giving an independent curve per layer — the
+paper's layer-sensitivity profiling. This costs `n_layers x n_chi` evaluations,
+so it uses its own smaller token budget (`--per-layer-eval-tokens`, default 4096)
+and is checkpointed per (layer, χ) pair.
+
+```bash
+# Profile a handful of blocks, as the paper does (it uses blocks 0, 5, 15, 31)
+python compactify.py --mode per-layer --profile-depths 0 5 15 29
+
+# Every eligible layer (slow: ~n_layers x n_chi evaluations)
+python compactify.py --mode per-layer
+
+# Whole-model sweep and per-layer profile in one go
+python compactify.py --mode both
+
+# Redraw the figures from existing CSVs, without touching the model
+python compactify.py --plot-only
+```
+
+**Outputs** — everything lands in `results/llms/<model>/compactifai/`
+(checkpointed; re-running skips work already recorded, `--recompute` forces a
+redo; files from the older flat layout are migrated automatically):
+
+- `compactifai_sweep.csv` — one row per χ (all layers compressed): parameter and
   memory reduction (layer-level and model-level), mean relative reconstruction
   error, perplexity, and ratio to the uncompressed baseline.
-- `results/llms/<model>/compactifai_layers.csv` — per (χ, layer): the index
-  factorization, bond dimensions, parameter counts, compression ratio, and
-  Frobenius reconstruction error.
+- `compactifai_layers.csv` — per (χ, layer): the index factorization, bond
+  dimensions, parameter counts, compression ratio, and Frobenius error.
+- `compactifai_per_layer.csv` — per (layer, χ) from `--mode per-layer`:
+  perplexity with only that layer compressed.
+- `perplexity_vs_bond_dimension_per_layer.png` — **the per-layer curves**: one
+  panel per layer type, one log-log curve per decoder block (coloured by depth),
+  with the dense baseline as a dashed line.
+- `perplexity_vs_bond_dimension_all_layers.png` — every profiled layer on a
+  single axes, coloured by layer type.
+- `perplexity_vs_bond_dimension_global.png` — the whole-model sweep: perplexity
+  and percentage of parameters removed vs. χ.
 
 A summary table is printed at the end, one row per bond dimension (columns
 shown here; values are produced by the run):
