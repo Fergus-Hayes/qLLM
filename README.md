@@ -202,6 +202,83 @@ The benchmark sweep (`benchmark_llm.py`) similarly prints perplexity progress
 (running PPL + ETA) and supports `--resume` to skip models already recorded in
 their per-model CSV.
 
+## CompactifAI: MPO compression vs. bond dimension
+
+`compactify.py` (module `qllm.compactifai`) implements the compression method of
+*CompactifAI: Extreme Compression of Large Language Models using
+Quantum-Inspired Tensor Networks* (Tomut et al.) and sweeps its truncation
+parameter.
+
+**Method.** Each Self-Attention / MLP weight matrix in a decoder block is
+replaced by a **Matrix Product Operator (MPO)**: the matrix indices are
+reshaped (`d_out = o₁…o_N`, `d_in = i₁…i_N`), permuted to interleave the pairs
+`(o_k, i_k)`, and decomposed by **N−1 sequential SVDs keeping only the largest χ
+singular values** at each step. The bond dimension **χ** controls how much of the
+layer's correlation structure is retained. Parameters stored are the sum of the
+MPO tensor sizes — for the paper's 216×216 / 3-site example this reproduces
+exactly `2·36χ + 36χ²` (verified in the test suite).
+
+Embedding and head layers are excluded, as in the paper. The truncated MPO is
+contracted back into the layer so perplexity reflects the compressed operator
+exactly, while the *reported* parameter count is that of the stored MPO tensors.
+
+> The paper's subsequent **"healing"** (brief retraining) stage is *not*
+> performed here, so these are pre-healing perplexities — the raw cost of
+> truncation. The paper notes healing recovers most of the gap.
+
+```bash
+# 12 log-spaced bond dimensions on SmolLM2-135M
+python compactify.py
+
+# Explicit bond dimensions, faster eval, threaded SVD build
+python compactify.py --chi 2 4 8 16 32 64 128 --ppl-batch-size 16 --svd-workers 4
+
+# Follow the paper's sensitivity advice
+python compactify.py --exclude-down-proj      # leave block-output MLP dense
+python compactify.py --min-depth 4            # don't compress the earliest blocks
+
+# 3-site MPO (two sequential SVDs, as in the paper's figure)
+python compactify.py --mpo-sites 3
+```
+
+χ values are **logarithmically spaced** between `--chi-min` and `--chi-max`
+(default: auto — the largest χ that still stores fewer parameters than the dense
+matrix, computed per model from the layer shapes).
+
+**Speed.** The sweep is built to avoid repeated work:
+
+| technique | effect |
+| --- | --- |
+| **Cached SVDs** | a 2-site MPO needs exactly one SVD per layer, so each layer is decomposed **once** and every χ is produced by truncation alone — `n_χ × n_layers` SVDs become `n_layers` |
+| **Corpus tokenized once** | the dataset is loaded/tokenized a single time and re-scored for each χ |
+| **Batched scoring** | `--ppl-batch-size` scores many sliding windows per forward pass |
+| `--svd-workers N` | builds the SVD cache across threads (LAPACK releases the GIL) |
+| `--threads`, `--device cuda`, `--dtype float16` | the usual device/precision levers |
+| `--max-eval-tokens` | caps tokens per evaluation (default 20000, since the corpus is re-scored once per χ) |
+
+**Outputs** (checkpointed after every χ; re-running skips χ already recorded,
+`--recompute` forces a redo):
+
+- `results/llms/<model>/compactifai_sweep.csv` — one row per χ: parameter and
+  memory reduction (layer-level and model-level), mean relative reconstruction
+  error, perplexity, and ratio to the uncompressed baseline.
+- `results/llms/<model>/compactifai_layers.csv` — per (χ, layer): the index
+  factorization, bond dimensions, parameter counts, compression ratio, and
+  Frobenius reconstruction error.
+
+A summary table is printed at the end, one row per bond dimension (columns
+shown here; values are produced by the run):
+
+```
+   chi         params  model -%  layer -%  rel.err  perplexity  x base
+   ...   (compressed   (model    (layer    (Frobenius  (measured  (vs
+          param count)  size      size      recon.      ppl)       baseline)
+                        saved)    saved)    error)
+```
+
+Perplexity should fall monotonically toward the baseline as χ grows, reaching it
+once χ is large enough that the MPO is lossless.
+
 ## Use as a library
 
 ```python
@@ -220,12 +297,16 @@ run_layer_analysis(LayerAnalysisConfig(model_id="gpt2", sensitivity_eval_tokens=
 
 ```
 qllm/
-  benchmark.py       # core: config, loading, perplexity, timing, memory, CSV
-  cli.py             # benchmark CLI (single or multi-model sweeps, --resume)
-  layer_analysis.py  # per-layer entropy/spectrum/sensitivity + depth reporting
-  analyze_cli.py     # layer-analysis CLI
-  __main__.py        # enables `python -m qllm`
-benchmark_llm.py     # thin entry point for the benchmark CLI
-analyze_layers.py    # thin entry point for the layer-analysis CLI
-models.txt           # example model list for --models-file
+  benchmark.py         # core: config, loading, perplexity, timing, memory, CSV
+  cli.py               # benchmark CLI (single or multi-model sweeps, --resume)
+  layer_analysis.py    # per-layer entropy/spectrum/sensitivity + depth reporting
+  analyze_cli.py       # layer-analysis CLI
+  compactifai.py       # MPO decomposition: index factorization, truncated SVDs
+  compactifai_sweep.py # bond-dimension sweep + checkpointed CSV output
+  compactifai_cli.py   # CompactifAI CLI
+  __main__.py          # enables `python -m qllm`
+benchmark_llm.py       # thin entry point for the benchmark CLI
+analyze_layers.py      # thin entry point for the layer-analysis CLI
+compactify.py          # thin entry point for the CompactifAI sweep
+models.txt             # example model list for --models-file
 ```

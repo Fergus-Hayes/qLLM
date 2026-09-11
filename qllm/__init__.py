@@ -18,6 +18,12 @@ from .layer_analysis import (
     run_layer_analysis,
     spectral_metrics,
 )
+from .compactifai import (
+    build_plan,
+    compress_weight,
+    mpo_param_count,
+)
+from .compactifai_sweep import CompactifaiConfig, run_sweep
 
 __all__ = [
     "BenchmarkConfig",
@@ -28,6 +34,11 @@ __all__ = [
     "LayerResult",
     "run_layer_analysis",
     "spectral_metrics",
+    "CompactifaiConfig",
+    "run_sweep",
+    "build_plan",
+    "compress_weight",
+    "mpo_param_count",
 ]
 
 __version__ = "0.1.0"

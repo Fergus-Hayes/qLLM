@@ -183,46 +183,50 @@ def compute_memory_footprint(model) -> tuple[int, float, float, float]:
 # --------------------------------------------------------------------------- #
 # Measurements
 # --------------------------------------------------------------------------- #
-@torch.no_grad()
-def compute_perplexity(
-    model,
-    tokenizer,
-    device: str,
-    config: BenchmarkConfig,
-    max_length: int,
-) -> tuple[float, int, float]:
-    """Compute perplexity with a sliding window over a text corpus.
-
-    The window slides by ``stride`` tokens; only the newly revealed tokens in
-    each window contribute to the loss so that every target token is scored with
-    the maximum available left-context and never counted twice. This is the
-    standard fixed-length-model perplexity estimate.
-    """
+def tokenize_corpus(tokenizer, config: BenchmarkConfig) -> torch.Tensor:
+    """Load and tokenize the evaluation corpus once, returning ``[1, T]`` ids."""
     print(f"Loading dataset '{config.dataset}/{config.dataset_config}' [{config.split}] ...")
     dataset = load_dataset(config.dataset, config.dataset_config, split=config.split)
     text = "\n\n".join(dataset[config.text_column])
+    return tokenizer(text, return_tensors="pt").input_ids
 
-    encodings = tokenizer(text, return_tensors="pt")
-    input_ids_full = encodings.input_ids
+
+@torch.no_grad()
+def perplexity_over_ids(
+    model,
+    input_ids_full: torch.Tensor,
+    device: str,
+    max_length: int,
+    stride: int,
+    batch_size: int = 8,
+    max_eval_tokens: int | None = None,
+    progress: bool = True,
+) -> tuple[float, int, float]:
+    """Sliding-window perplexity over pre-tokenized ids.
+
+    Separated from :func:`compute_perplexity` so a sweep (e.g. over compression
+    levels) can tokenize the corpus once and re-score it many times.
+    """
     seq_len = input_ids_full.size(1)
-    if config.max_eval_tokens is not None:
-        seq_len = min(seq_len, config.max_eval_tokens)
+    if max_eval_tokens is not None:
+        seq_len = min(seq_len, max_eval_tokens)
     # Enumerate the sliding windows as (begin, end, target_len) specs; target_len
     # is the count of newly revealed tokens scored in that window.
     specs = []
     prev_end = 0
-    for begin in range(0, seq_len, config.stride):
+    for begin in range(0, seq_len, stride):
         end = min(begin + max_length, seq_len)
         specs.append((begin, end, end - prev_end))
         prev_end = end
         if end == seq_len:
             break
 
-    batch_size = max(1, getattr(config, "ppl_batch_size", 1))
+    batch_size = max(1, batch_size)
     total_windows = len(specs)
-    print(f"Evaluating perplexity over {seq_len} tokens "
-          f"(window={max_length}, stride={config.stride}, {total_windows} windows, "
-          f"batch={batch_size}) ...")
+    if progress:
+        print(f"Evaluating perplexity over {seq_len} tokens "
+              f"(window={max_length}, stride={stride}, {total_windows} windows, "
+              f"batch={batch_size}) ...")
 
     nll_sum = torch.tensor(0.0)
     n_tokens = 0
@@ -258,7 +262,8 @@ def compute_perplexity(
         n_tokens += num_valid
         processed += len(batch)
 
-        if processed - last_print >= max(batch_size, total_windows // 20) or processed == total_windows:
+        if progress and (processed - last_print >= max(batch_size, total_windows // 20)
+                         or processed == total_windows):
             last_print = processed
             elapsed = time.perf_counter() - start_time
             running_ppl = float(torch.exp(nll_sum / max(1, n_tokens)))
@@ -272,6 +277,29 @@ def compute_perplexity(
         return float("nan"), 0, elapsed
     perplexity = torch.exp(nll_sum / n_tokens).item()
     return perplexity, n_tokens, elapsed
+
+
+@torch.no_grad()
+def compute_perplexity(
+    model,
+    tokenizer,
+    device: str,
+    config: BenchmarkConfig,
+    max_length: int,
+) -> tuple[float, int, float]:
+    """Compute perplexity with a sliding window over a text corpus.
+
+    The window slides by ``stride`` tokens; only the newly revealed tokens in
+    each window contribute to the loss so that every target token is scored with
+    the maximum available left-context and never counted twice. This is the
+    standard fixed-length-model perplexity estimate.
+    """
+    input_ids_full = tokenize_corpus(tokenizer, config)
+    return perplexity_over_ids(
+        model, input_ids_full, device, max_length, config.stride,
+        batch_size=getattr(config, "ppl_batch_size", 8),
+        max_eval_tokens=config.max_eval_tokens,
+    )
 
 
 @torch.no_grad()
