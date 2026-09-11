@@ -206,15 +206,17 @@ def compute_perplexity(
     seq_len = input_ids_full.size(1)
     if config.max_eval_tokens is not None:
         seq_len = min(seq_len, config.max_eval_tokens)
+    total_windows = max(1, (seq_len + config.stride - 1) // config.stride)
+    progress_every = max(1, total_windows // 20)   # ~20 progress lines
     print(f"Evaluating perplexity over {seq_len} tokens "
-          f"(window={max_length}, stride={config.stride}) ...")
+          f"(window={max_length}, stride={config.stride}, {total_windows} windows) ...")
 
     nll_sum = torch.tensor(0.0)
     n_tokens = 0
     prev_end = 0
     start_time = time.perf_counter()
 
-    for begin in range(0, seq_len, config.stride):
+    for step, begin in enumerate(range(0, seq_len, config.stride), start=1):
         end = min(begin + max_length, seq_len)
         target_len = end - prev_end  # tokens newly scored in this window
         input_ids = input_ids_full[:, begin:end].to(device)
@@ -232,6 +234,14 @@ def compute_perplexity(
         num_valid = int((target_ids[:, 1:] != -100).sum().item())
         nll_sum += outputs.loss.detach().cpu().float() * num_valid
         n_tokens += num_valid
+
+        if step % progress_every == 0 or end == seq_len:
+            elapsed = time.perf_counter() - start_time
+            running_ppl = float(torch.exp(nll_sum / max(1, n_tokens)))
+            eta = elapsed / step * (total_windows - step)
+            print(f"    window {step}/{total_windows}  "
+                  f"running_ppl={running_ppl:.4f}  "
+                  f"elapsed={elapsed:.0f}s  eta={eta:.0f}s")
 
         prev_end = end
         if end == seq_len:

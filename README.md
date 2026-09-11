@@ -90,7 +90,46 @@ Appended to summary  results/llms/summary.csv
 > Absolute numbers depend on hardware, dtype, and evaluation settings; the
 > perplexity figure is deterministic for a given window/stride/dataset.
 
-### Use as a library
+## Per-layer analysis: entropy, spectrum & sensitivity vs. depth
+
+`analyze_layers.py` (module `qllm.layer_analysis`) inspects **every 2-D weight
+matrix** in a model and computes:
+
+| metric | definition |
+| --- | --- |
+| **Shannon entropy** | `H = -Σ pᵢ log pᵢ` of the normalized singular-value spectrum `pᵢ = σᵢ/Σσ` (nats); `exp(H)` is the *effective rank* |
+| **Rényi-2 (collision) entropy** | `H₂ = -log Σ pᵢ²` |
+| **Spectral gap** | `σ₁ − σ₂` |
+| **Condition number** | `σ_max / σ_min` |
+| **Perplexity sensitivity** | relative PPL change per unit relative weight perturbation: perturb `W` so `‖ΔW‖/‖W‖ = ε`, re-measure PPL, restore — `(PPL' − PPL)/PPL/ε` |
+
+Each weight matrix is tagged with its **layer type** (module role, e.g.
+`self_attn.q_proj`) and **depth** (transformer block index), and the tool prints
+and plots how every metric varies over depth for each layer type.
+
+```bash
+python analyze_layers.py                                  # default: SmolLM2-135M
+python analyze_layers.py HuggingFaceTB/SmolLM2-360M
+python analyze_layers.py gpt2 --skip-sensitivity          # spectral metrics only (fast)
+python analyze_layers.py --sensitivity-eval-tokens 2048 --epsilon 0.02
+```
+
+**Printouts & checkpointing.** Progress is printed as each layer is processed
+(spectral line, sensitivity line, running count + ETA). Results are written to
+`results/llms/<model-name>/layer_analysis.csv`, which **is** the checkpoint:
+each row is flushed as it is computed, and re-running skips any `param_name`
+already present — so an interrupted analysis resumes where it stopped. A console
+summary of "metric over depth, by layer type" is printed at the end, and (if
+`matplotlib` is installed) one `depth_<metric>.png` per metric is saved next to
+the CSV. The perplexity-sensitivity probe deliberately uses a small token budget
+(it runs once per layer); tune it with `--sensitivity-eval-tokens`,
+`--sensitivity-window`, `--epsilon`, and `--sensitivity-samples`.
+
+The benchmark sweep (`benchmark_llm.py`) similarly prints perplexity progress
+(running PPL + ETA) and supports `--resume` to skip models already recorded in
+their per-model CSV.
+
+## Use as a library
 
 ```python
 from qllm import BenchmarkConfig, run_benchmark, write_result_csv
@@ -98,15 +137,22 @@ from qllm import BenchmarkConfig, run_benchmark, write_result_csv
 result = run_benchmark(BenchmarkConfig(model_id="gpt2", max_eval_tokens=20000))
 print(result.perplexity, result.total_memory_mb, result.generation_tokens_per_second)
 write_result_csv(result, "results/llms/gpt2/benchmark.csv")
+
+# Per-layer analysis
+from qllm import LayerAnalysisConfig, run_layer_analysis
+run_layer_analysis(LayerAnalysisConfig(model_id="gpt2", sensitivity_eval_tokens=2048))
 ```
 
 ### Project layout
 
 ```
 qllm/
-  benchmark.py   # core: config, loading, perplexity, timing, memory, CSV
-  cli.py         # command-line interface (single or multi-model sweeps)
-  __main__.py    # enables `python -m qllm`
-benchmark_llm.py # thin CLI entry point
-models.txt       # example model list for --models-file
+  benchmark.py       # core: config, loading, perplexity, timing, memory, CSV
+  cli.py             # benchmark CLI (single or multi-model sweeps, --resume)
+  layer_analysis.py  # per-layer entropy/spectrum/sensitivity + depth reporting
+  analyze_cli.py     # layer-analysis CLI
+  __main__.py        # enables `python -m qllm`
+benchmark_llm.py     # thin entry point for the benchmark CLI
+analyze_layers.py    # thin entry point for the layer-analysis CLI
+models.txt           # example model list for --models-file
 ```

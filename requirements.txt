@@ -2,3 +2,4 @@ torch>=2.1
 transformers>=4.44
 datasets>=2.19
 accelerate>=0.30
+matplotlib>=3.7   # optional: depth plots in the layer analysis

@@ -21,6 +21,7 @@ Examples
 from __future__ import annotations
 
 import argparse
+import csv
 from pathlib import Path
 
 from .benchmark import (
@@ -112,6 +113,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="Do not write any CSV output.")
     parser.add_argument("--continue-on-error", action="store_true",
                         help="Keep going if a model fails to load or benchmark.")
+    parser.add_argument("--resume", action="store_true",
+                        help="Skip models already recorded (same model/dtype/device) "
+                             "in their per-model CSV — checkpoints a multi-model sweep.")
     return parser.parse_args(argv)
 
 
@@ -137,6 +141,20 @@ def config_from_args(model_id: str, args: argparse.Namespace) -> BenchmarkConfig
     )
 
 
+def already_benchmarked(model_id: str, args: argparse.Namespace) -> bool:
+    """True if the per-model CSV already holds a matching model/dtype/device row."""
+    csv_path = model_result_path(args.results_dir, model_id)
+    if not csv_path.exists():
+        return False
+    with csv_path.open(newline="") as f:
+        for row in csv.DictReader(f):
+            if (row.get("model_id") == model_id
+                    and row.get("dtype", "").endswith(args.dtype.replace("auto", ""))
+                    and (args.device == "auto" or row.get("device") == args.device)):
+                return True
+    return False
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
 
@@ -150,6 +168,10 @@ def main(argv=None) -> int:
 
     failures = []
     for i, model_id in enumerate(models, start=1):
+        if args.resume and already_benchmarked(model_id, args):
+            print(f"\n[{i}/{len(models)}] Skipping {model_id} "
+                  f"(already benchmarked; --resume).")
+            continue
         print(f"\n[{i}/{len(models)}] Benchmarking {model_id} ...")
         config = config_from_args(model_id, args)
         try:

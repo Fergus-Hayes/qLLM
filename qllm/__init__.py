@@ -12,12 +12,22 @@ from .benchmark import (
     run_benchmark,
     write_result_csv,
 )
+from .layer_analysis import (
+    LayerAnalysisConfig,
+    LayerResult,
+    run_layer_analysis,
+    spectral_metrics,
+)
 
 __all__ = [
     "BenchmarkConfig",
     "BenchmarkResult",
     "run_benchmark",
     "write_result_csv",
+    "LayerAnalysisConfig",
+    "LayerResult",
+    "run_layer_analysis",
+    "spectral_metrics",
 ]
 
 __version__ = "0.1.0"
