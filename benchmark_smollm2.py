@@ -17,27 +17,56 @@ optionally ``--dtype float16``/``bfloat16``) to use a GPU.
 from __future__ import annotations
 
 import argparse
+import csv
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 
 import torch
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 DEFAULT_MODEL = "HuggingFaceTB/SmolLM2-135M"
+BYTES_PER_MB = 1024 ** 2
 
 
 @dataclass
 class BenchmarkResult:
+    timestamp: str
     model_id: str
     device: str
     dtype: str
+    num_parameters: int
+    param_memory_mb: float
+    buffer_memory_mb: float
+    total_memory_mb: float
     perplexity: float
     eval_tokens: int
+    dataset: str
     perplexity_seconds: float
     prefill_latency_ms: float
     generation_tokens_per_second: float
     generated_tokens: int
+
+
+def compute_memory_footprint(model) -> tuple[int, float, float, float]:
+    """Return (#parameters, param MB, buffer MB, total MB) for the loaded model.
+
+    Memory is measured from the actual tensors, so it reflects the model's
+    loaded dtype (e.g. float16 halves the footprint versus float32). Buffers
+    (non-trainable tensors such as rotary-embedding caches) are reported
+    separately and folded into the total.
+    """
+    n_params = sum(p.numel() for p in model.parameters())
+    param_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+    buffer_bytes = sum(b.numel() * b.element_size() for b in model.buffers())
+    return (
+        n_params,
+        param_bytes / BYTES_PER_MB,
+        buffer_bytes / BYTES_PER_MB,
+        (param_bytes + buffer_bytes) / BYTES_PER_MB,
+    )
 
 
 def resolve_device(requested: str) -> str:
@@ -183,6 +212,19 @@ def benchmark_inference(
     return prefill_latency_ms, tokens_per_second, generated
 
 
+def write_result_csv(result: BenchmarkResult, csv_path: Path) -> None:
+    """Append the result as a row to ``csv_path`` (creating it with a header)."""
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    row = asdict(result)
+    write_header = not csv_path.exists()
+    with csv_path.open("a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+    print(f"\nSaved results to {csv_path}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-id", default=DEFAULT_MODEL,
@@ -225,6 +267,15 @@ def parse_args() -> argparse.Namespace:
                         help="Skip the perplexity evaluation.")
     parser.add_argument("--skip-timing", action="store_true",
                         help="Skip the inference-timing benchmark.")
+
+    # Output options.
+    parser.add_argument("--results-dir", default="results/llms",
+                        help="Base directory for CSV results; the file is written "
+                             "to <results-dir>/<model-name>/benchmark.csv.")
+    parser.add_argument("--csv-path", default=None,
+                        help="Explicit CSV output path (overrides --results-dir).")
+    parser.add_argument("--no-csv", action="store_true",
+                        help="Do not write a CSV file.")
     return parser.parse_args()
 
 
@@ -235,6 +286,7 @@ def main() -> None:
     torch.manual_seed(0)
 
     model, tokenizer = load_model_and_tokenizer(args.model_id, device, dtype)
+    n_params, param_mb, buffer_mb, total_mb = compute_memory_footprint(model)
 
     perplexity = float("nan")
     eval_tokens = 0
@@ -263,21 +315,34 @@ def main() -> None:
             warmup=args.warmup,
         )
 
+    dataset_ref = f"{args.dataset}/{args.dataset_config}:{args.split}"
     result = BenchmarkResult(
+        timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         model_id=args.model_id,
         device=device,
         dtype=args.dtype,
+        num_parameters=n_params,
+        param_memory_mb=round(param_mb, 3),
+        buffer_memory_mb=round(buffer_mb, 3),
+        total_memory_mb=round(total_mb, 3),
         perplexity=perplexity,
         eval_tokens=eval_tokens,
-        perplexity_seconds=ppl_seconds,
-        prefill_latency_ms=prefill_ms,
-        generation_tokens_per_second=tok_per_s,
+        dataset=dataset_ref,
+        perplexity_seconds=round(ppl_seconds, 2),
+        prefill_latency_ms=round(prefill_ms, 2),
+        generation_tokens_per_second=round(tok_per_s, 2),
         generated_tokens=generated,
     )
 
     print("\n" + "=" * 60)
     print(f"Model:               {result.model_id}")
     print(f"Device / dtype:      {result.device} / {result.dtype}")
+    print(f"Parameters:          {result.num_parameters:,} "
+          f"({result.num_parameters / 1e6:.1f}M)")
+    print(f"Parameter memory:    {result.param_memory_mb:.2f} MB")
+    print(f"Buffer memory:       {result.buffer_memory_mb:.2f} MB")
+    print(f"Total model memory:  {result.total_memory_mb:.2f} MB "
+          f"({result.total_memory_mb / 1024:.3f} GB)")
     if not args.skip_perplexity:
         print(f"Perplexity:          {result.perplexity:.4f} "
               f"({result.eval_tokens} tokens on "
@@ -289,6 +354,14 @@ def main() -> None:
         print(f"Generation speed:    {result.generation_tokens_per_second:.2f} tokens/s "
               f"({result.generated_tokens} new tokens)")
     print("=" * 60)
+
+    if not args.no_csv:
+        if args.csv_path is not None:
+            csv_path = Path(args.csv_path)
+        else:
+            model_name = args.model_id.split("/")[-1]
+            csv_path = Path(args.results_dir) / model_name / "benchmark.csv"
+        write_result_csv(result, csv_path)
 
 
 if __name__ == "__main__":

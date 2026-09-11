@@ -12,6 +12,15 @@ from the Hugging Face Hub and reports:
   counted exactly once.
 - **Inference time** — prefill latency (single forward pass over the prompt)
   and greedy-decoding throughput in tokens/second.
+- **Memory footprint** — parameter, buffer, and total memory needed to hold the
+  model, measured from the actual tensors so it reflects the loaded dtype
+  (e.g. `float16` halves the footprint versus `float32`).
+
+Every run is appended (with a header on first creation) to a CSV at
+`results/llms/<model-name>/benchmark.csv` — e.g.
+`results/llms/SmolLM2-135M/benchmark.csv` — so baseline and quantized runs
+accumulate in one comparable table. Override with `--csv-path`, change the base
+directory with `--results-dir`, or disable with `--no-csv`.
 
 ### Install
 
@@ -42,11 +51,17 @@ the perplexity or the timing stage).
 ============================================================
 Model:               HuggingFaceTB/SmolLM2-135M
 Device / dtype:      cpu / float32
-Perplexity:          16.1234 (270000 tokens on Salesforce/wikitext/wikitext-2-raw-v1:test)
-Perplexity eval:     42.10 s
-Prefill latency:     35.42 ms (7 prompt tokens)
-Generation speed:    28.71 tokens/s (64 new tokens)
+Parameters:          134,515,008 (134.5M)
+Parameter memory:    513.13 MB
+Buffer memory:       0.00 MB
+Total model memory:  513.13 MB (0.501 GB)
+Perplexity:          14.8021 (304985 tokens on Salesforce/wikitext/wikitext-2-raw-v1:test)
+Perplexity eval:     2514.85 s
+Prefill latency:     57.90 ms (6 prompt tokens)
+Generation speed:    16.18 tokens/s (64 new tokens)
 ============================================================
+
+Saved results to results/llms/SmolLM2-135M/benchmark.csv
 ```
 
 > Absolute numbers depend on hardware, dtype, and evaluation settings; the
