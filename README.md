@@ -117,8 +117,11 @@ python analyze_layers.py --sensitivity-eval-tokens 2048 --epsilon 0.02
 **Printouts & checkpointing.** Progress is printed as each layer is processed
 (spectral line, sensitivity line, running count + ETA). Results are written to
 `results/llms/<model-name>/layer_analysis.csv`, which **is** the checkpoint:
-each row is flushed as it is computed, and re-running skips any `param_name`
-already present — so an interrupted analysis resumes where it stopped. A console
+the CSV is rewritten atomically after each layer, and re-running skips a layer
+only when the metrics you asked for are already present. Checkpointing is
+**per-metric**, so a fast spectral-only pass (`--skip-sensitivity`) followed by a
+full run correctly fills in the missing sensitivity column in place (no
+duplicate rows). Pass `--recompute` to ignore the checkpoint entirely. A console
 summary of "metric over depth, by layer type" is printed at the end, and (if
 `matplotlib` is installed) one `depth_<metric>.png` per metric is saved next to
 the CSV. The perplexity-sensitivity probe deliberately uses a small token budget

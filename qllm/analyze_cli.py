@@ -60,6 +60,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--csv-name", default="layer_analysis.csv")
     parser.add_argument("--no-plots", action="store_true",
                         help="Do not write depth plots.")
+    parser.add_argument("--recompute", action="store_true",
+                        help="Ignore the CSV checkpoint and recompute every layer.")
     return parser.parse_args(argv)
 
 
@@ -84,6 +86,7 @@ def main(argv=None) -> int:
         results_dir=args.results_dir,
         csv_name=args.csv_name,
         make_plots=not args.no_plots,
+        force_recompute=args.recompute,
     )
     run_layer_analysis(config)
     return 0

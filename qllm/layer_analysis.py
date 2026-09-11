@@ -25,7 +25,7 @@ import math
 import re
 import time
 from collections import defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -63,6 +63,7 @@ class LayerAnalysisConfig:
     results_dir: str = "results/llms"
     csv_name: str = "layer_analysis.csv"
     make_plots: bool = True
+    force_recompute: bool = False   # ignore checkpoint and recompute every layer
 
 
 @dataclass
@@ -232,28 +233,54 @@ def layer_csv_path(config: LayerAnalysisConfig) -> Path:
     return Path(config.results_dir) / model_name / config.csv_name
 
 
-def load_completed(csv_path: Path) -> set[str]:
-    """Return the set of param_names already recorded (checkpoint state)."""
+CSV_FIELDS = [f.name for f in fields(LayerResult)]
+
+
+def read_rows_by_name(csv_path: Path) -> dict[str, dict]:
+    """Return existing rows keyed by param_name (checkpoint state)."""
+    rows: dict[str, dict] = {}
     if not csv_path.exists():
-        return set()
-    done = set()
+        return rows
     with csv_path.open(newline="") as f:
         for row in csv.DictReader(f):
             if row.get("param_name"):
-                done.add(row["param_name"])
-    return done
+                rows[row["param_name"]] = row
+    return rows
 
 
-def append_layer_row(result: LayerResult, csv_path: Path) -> None:
+def _is_finite_field(row: dict, field_name: str) -> bool:
+    try:
+        return math.isfinite(float(row.get(field_name, "")))
+    except (TypeError, ValueError):
+        return False
+
+
+def row_is_complete(row: dict, need_sensitivity: bool) -> bool:
+    """A checkpointed row is complete only if the requested metrics are present.
+
+    Spectral metrics are always expected; the perplexity-sensitivity column must
+    additionally be a finite number when sensitivity is requested. This prevents
+    a spectral-only (``--skip-sensitivity``) run from masking a later run that
+    does want sensitivity.
+    """
+    if not _is_finite_field(row, "shannon_entropy"):
+        return False
+    if need_sensitivity and not _is_finite_field(row, "perplexity_sensitivity"):
+        return False
+    return True
+
+
+def write_all_rows(csv_path: Path, rows_in_order: list[dict]) -> None:
+    """Atomically (re)write the whole CSV, so updates never duplicate a row."""
     csv_path.parent.mkdir(parents=True, exist_ok=True)
-    row = asdict(result)
-    write_header = not csv_path.exists()
-    with csv_path.open("a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
-        if write_header:
-            writer.writeheader()
-        writer.writerow(row)
+    tmp = csv_path.with_suffix(csv_path.suffix + ".tmp")
+    with tmp.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows_in_order:
+            writer.writerow(row)
         f.flush()
+    tmp.replace(csv_path)
 
 
 def read_all_rows(csv_path: Path) -> list[dict]:
@@ -381,27 +408,52 @@ def run_layer_analysis(config: LayerAnalysisConfig) -> Path:
     model, tokenizer = load_model_and_tokenizer(load_cfg, device)
 
     csv_path = layer_csv_path(config)
-    completed = load_completed(csv_path)
+    existing = read_rows_by_name(csv_path)
 
     matrices = list(iter_weight_matrices(model))
     total = len(matrices)
-    remaining = [(n, p) for n, p in matrices if n not in completed]
-    print(f"\nFound {total} weight matrices; "
-          f"{len(completed)} already in checkpoint, {len(remaining)} to do.")
+    need_sensitivity = config.run_sensitivity
+
+    # Per-metric checkpoint: recompute a layer if it is missing OR if sensitivity
+    # is now requested but its stored value is not a finite number.
+    remaining = [
+        (n, p) for n, p in matrices
+        if config.force_recompute
+        or n not in existing
+        or not row_is_complete(existing[n], need_sensitivity)
+    ]
+    skipped = total - len(remaining)
+    augment = sum(
+        1 for n, _ in matrices
+        if n in existing and not config.force_recompute
+        and _is_finite_field(existing[n], "shannon_entropy")
+        and not row_is_complete(existing[n], need_sensitivity)
+    )
+    print(f"\nFound {total} weight matrices; {skipped} complete in checkpoint, "
+          f"{len(remaining)} to compute ({augment} need sensitivity added).")
     print(f"Checkpoint / results CSV: {csv_path}")
 
-    # Baseline perplexity for the sensitivity probe (only if needed).
+    # Results keyed by name, seeded from the checkpoint so skipped rows survive
+    # the atomic rewrite. Order follows the model's parameter order.
+    order = [n for n, _ in matrices]
+    order += [n for n in existing if n not in set(order)]
+    results: dict[str, dict] = dict(existing)
+
+    # Baseline perplexity for the sensitivity probe (only if any layer needs it).
     eval_ids = None
     baseline_ppl = float("nan")
     generator = torch.Generator(device="cpu")
-    if config.run_sensitivity and remaining:
+    if need_sensitivity and remaining:
         eval_ids = _load_eval_ids(tokenizer, config)
         window = min(config.sensitivity_window, eval_ids.size(1))
         print("Computing baseline perplexity for sensitivity probe ...")
         t0 = time.perf_counter()
         baseline_ppl = quick_perplexity(model, eval_ids, device, window)
-        print(f"Baseline PPL = {baseline_ppl:.4f} "
-              f"({time.perf_counter() - t0:.1f}s)")
+        print(f"Baseline PPL = {baseline_ppl:.4f} ({time.perf_counter() - t0:.1f}s)")
+        if not math.isfinite(baseline_ppl) or baseline_ppl <= 0:
+            print("    WARNING: baseline perplexity is not a finite positive "
+                  "number; sensitivity will be NaN. This often happens with "
+                  "--dtype float16 on CPU — try --dtype float32 or --device cuda.")
 
     start = time.perf_counter()
     for i, (name, param) in enumerate(remaining, start=1):
@@ -410,7 +462,6 @@ def run_layer_analysis(config: LayerAnalysisConfig) -> Path:
         print(f"\n[{i}/{len(remaining)}] {name}  "
               f"(type={layer_type}, depth={depth}, shape={rows_}x{cols_})")
 
-        t_layer = time.perf_counter()
         sm = spectral_metrics(param)
         print(f"    spectral: sigma1={sm['sigma_1']:.4g} gap={sm['spectral_gap']:.4g} "
               f"cond={sm['condition_number']:.4g} "
@@ -454,11 +505,14 @@ def run_layer_analysis(config: LayerAnalysisConfig) -> Path:
             epsilon=config.epsilon,
             sensitivity_samples=config.sensitivity_samples,
         )
-        append_layer_row(result, csv_path)         # checkpoint after every layer
-        done_now = len(completed) + i
+        # Update in place and rewrite the whole CSV: this checkpoints after every
+        # layer and updates existing rows (e.g. adding sensitivity) without ever
+        # writing a duplicate param_name.
+        results[name] = asdict(result)
+        write_all_rows(csv_path, [results[n] for n in order if n in results])
+        done_now = skipped + i
         elapsed = time.perf_counter() - start
-        rate = elapsed / i
-        eta = rate * (len(remaining) - i)
+        eta = elapsed / i * (len(remaining) - i)
         print(f"    checkpointed ({done_now}/{total})  "
               f"elapsed={elapsed:.0f}s  eta={eta:.0f}s")
 
