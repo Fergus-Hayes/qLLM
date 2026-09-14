@@ -1,15 +1,27 @@
 """CLI for the hybrid PQC+TN vs. pure TN per-layer sweep.
 
+Nothing here is specialized to a particular model or layer: the model is a
+positional argument and the layers are chosen with ``--profile-depths`` /
+``--num-depths`` and ``--layer-types``, so any single layer, any subset, or a
+whole model is one invocation. ``--solve`` additionally reports N*, M* and
+M*/N* on the just-measured layers, so a targeted comparison is one command.
+
 Examples
 --------
     # Both surfaces for a representative subset of layers
     python hybridize.py --preset standard
 
-    # Two-qubit brickwalls of growing depth on one layer type
-    python hybridize.py --gate-sizes 2 --circuit-depths 0 1 2 4 8 --layer-types v_proj
+    # Two-qubit brickwalls of growing depth on one layer type, any model
+    python hybridize.py MODEL_ID --gate-sizes 2 --circuit-depths 0 1 2 4 8 \
+        --layer-types v_proj
 
-    # Cheap NISQ-style circuits: two-qubit brickwalls of growing depth
-    python hybridize.py --gate-sizes 2 --circuit-depths 0 1 2 4 8 --restarts 3
+    # One specific layer (a block index + a layer type), measured AND solved:
+    python hybridize.py MODEL_ID --profile-depths 10 --layer-types v_proj \
+        --gate-sizes 2 --circuit-depths 0 1 2 4 8 --solve --budgets 1.003
+
+    # e.g. arXiv:2410.17397v2's layer is just those arguments on SmolLM2:
+    #   MODEL_ID = HuggingFaceTB/SmolLM2-135M, --profile-depths 10,
+    #   --layer-types v_proj  (its (576,192) self-attention projection)
 
 Re-running resumes from the CSV checkpoint: (layer, method, chi, D) points
 already recorded are skipped.
@@ -30,7 +42,6 @@ from .hybrid_planner import (
 from .hybrid_sweep import (
     HybridConfig,
     default_depths,
-    hybrid_csv_path,
     run_hybrid_sweep,
     validate_gate_sizes,
 )
@@ -116,6 +127,24 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--split", default="test")
     parser.add_argument("--text-column", default="text")
 
+    parser.add_argument("--solve", action="store_true",
+                        help="After the sweep, solve the memory budget on the "
+                             "just-measured layers and print N*, M* and M*/N* "
+                             "(the same report as analyze_budget.py, in one "
+                             "command). Narrowed by --layer-types / "
+                             "--profile-depths when given.")
+    parser.add_argument("--budgets", type=float, nargs="+",
+                        default=[1.001, 1.01, 1.05],
+                        help="Perplexity budgets for --solve, as a ratio to the "
+                             "dense baseline (1.01 = at most 1%% worse).")
+    parser.add_argument("--q-weights", type=float, nargs="+", default=[0.0, 1.0],
+                        help="Quantum-parameter prices for --solve (0 = the "
+                             "circuits are free QPU memory; 1 = an angle costs a "
+                             "classical weight).")
+    parser.add_argument("--no-pareto", action="store_true",
+                        help="With --solve, skip the Pareto-front printout.")
+    parser.add_argument("--pareto-limit", type=int, default=6,
+                        help="Layers listed in the --solve Pareto printout.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Do not score anything: print which (k, D) can "
                              "undercut the classical MPO on parameter count "
@@ -221,9 +250,24 @@ def main(argv=None) -> int:
                             revision=config.revision), device)
         return _run_plan(args, shapes_from_model(model, config))
 
-    run_hybrid_sweep(config)
-    print(f"\nNext: analyse the budget with\n"
-          f"    python analyze_budget.py {hybrid_csv_path(config)}")
+    path = run_hybrid_sweep(config)
+
+    if args.solve:
+        from .budget_cli import filter_curves, report_curves
+        from .budget_frontier import load_curves, read_rows
+        curves = filter_curves(
+            load_curves(read_rows(path)),
+            layer_types=args.layer_types, depths=args.profile_depths)
+        if not curves:
+            print("\n(--solve: no layers to report after filtering.)")
+        else:
+            report_curves(curves, args.budgets, sorted(set(args.q_weights)),
+                          pareto=not args.no_pareto,
+                          pareto_limit=args.pareto_limit)
+            print(f"\nFull figure suite: python analyze_budget.py {path}")
+    else:
+        print(f"\nNext: analyse the budget with\n"
+              f"    python analyze_budget.py {path}")
     return 0
 
 

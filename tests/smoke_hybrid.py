@@ -265,9 +265,9 @@ except Exception as exc:                            # noqa: BLE001
     print(f"  (plots skipped: {exc})")
 
 # --------------------------------------------------------------------------- #
-# 6. Two-qubit-gate restriction and the paper-layer CLI
+# 6. Two-qubit-gate restriction and the general "sweep + solve" CLI
 # --------------------------------------------------------------------------- #
-print("\n=== 6. k<=2 restriction and the paper-layer CLI ===")
+print("\n=== 6. k<=2 restriction and hybridize.py --solve ===")
 from qllm.hybrid_sweep import MAX_GATE_SIZE, validate_gate_sizes
 
 assert validate_gate_sizes([2]) == [2] and validate_gate_sizes([1, 2]) == [1, 2]
@@ -280,20 +280,24 @@ for bad in ([0], [3], [2, 4]):
         raise AssertionError(f"gate sizes {bad} should have been rejected")
 print(f"  gate sizes capped at k = {MAX_GATE_SIZE}; k=0 and k>2 rejected")
 
-from qllm.paper_layer_cli import main as paper_main
+from qllm.hybrid_cli import main as hybridize_main
 
-shutil.rmtree(SCRATCH + "-paper", ignore_errors=True)
-rc = paper_main([
-    "tiny-gpt2", "--block", "0", "--layer-type", "c_proj",
-    "--circuit-depths", "0", "1", "2", "--chi", "1", "2", "4",
+# A general, argument-driven targeted run: one block, one layer type, solved in
+# the same command. Nothing here is specialized to a particular model or layer.
+shutil.rmtree(SCRATCH + "-solve", ignore_errors=True)
+rc = hybridize_main([
+    "tiny-gpt2", "--profile-depths", "0", "--layer-types", "c_proj",
+    "--gate-sizes", "2", "--circuit-depths", "0", "1", "2",
+    "--chi", "1", "2", "4",
     "--per-layer-eval-tokens", "256", "--max-length", "64",
-    "--ppl-batch-size", "4", "--budgets", "1.01", "--q-weights", "0", "1",
-    "--results-dir", SCRATCH + "-paper", "--no-plots",
+    "--ppl-batch-size", "4", "--solve", "--budgets", "1.01", "1.05",
+    "--q-weights", "0", "1", "--no-pareto",
+    "--results-dir", SCRATCH + "-solve",
 ])
-assert rc == 0, f"paper-layer CLI returned {rc}"
+assert rc == 0, f"hybridize --solve returned {rc}"
 # It must refuse a gate size the build does not allow.
-rc_bad = paper_main(["tiny-gpt2", "--gate-sizes", "4"])
-assert rc_bad == 2, "paper-layer CLI should reject k>2"
-print("  paper-layer CLI ran and rejected k>2")
+rc_bad = hybridize_main(["tiny-gpt2", "--gate-sizes", "4"])
+assert rc_bad == 2, "hybridize should reject k>2"
+print("  hybridize --solve ran a targeted run end-to-end and rejected k>2")
 
 print("\nALL HYBRID SMOKE STAGES PASSED")

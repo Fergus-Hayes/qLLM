@@ -83,15 +83,48 @@ def _filters(args) -> list[str] | None:
     return args.layer_types
 
 
+def filter_curves(curves: dict, layer_types=None, depths=None) -> dict:
+    """Restrict a curve set to layer types (substring) and/or block depths.
+
+    Both filters are general: ``layer_types`` matches any substring against
+    ``"<layer_type> <param_name>"`` (so ``"v_proj"`` or ``"attn"`` both work),
+    and ``depths`` keeps only those decoder blocks. Passing neither returns the
+    curves unchanged.
+    """
+    out = curves
+    if layer_types:
+        out = {n: c for n, c in out.items()
+               if any(k in f"{c.layer_type} {n}" for k in layer_types)}
+    if depths is not None:
+        keep = set(depths)
+        out = {n: c for n, c in out.items() if c.depth in keep}
+    return out
+
+
+def report_curves(curves: dict, budgets, q_weights, *, pareto: bool = True,
+                  pareto_limit: int = 6) -> list:
+    """Print the N*/M*/M*-over-N* report for every (budget, quantum-price) pair.
+
+    This is the shared reporting core used both by ``analyze_budget.py`` (from a
+    CSV) and by ``hybridize.py --solve`` (right after a sweep). It is agnostic to
+    which layers or model produced ``curves``. Returns the solutions from the
+    last (q_weight, budget) pair, for downstream plotting.
+    """
+    solutions = None
+    for q_weight in q_weights:
+        for budget in budgets:
+            solutions = print_report(curves, budget, q_weight)
+        if pareto:
+            print_pareto(curves, q_weight, pareto_limit)
+    return solutions
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     csv_path = Path(args.hybrid_csv)
     curves = load_curves(read_rows(csv_path))
 
-    keep = _filters(args)
-    if keep:
-        curves = {n: c for n, c in curves.items()
-                  if any(k in f"{c.layer_type} {n}" for k in keep)}
+    curves = filter_curves(curves, layer_types=_filters(args))
     if not curves:
         print("No layers left after filtering.")
         return 1
@@ -104,9 +137,8 @@ def main(argv=None) -> int:
         print("Both surfaces are needed for the comparison; re-run hybridize.py.")
         return 1
 
-    solutions = None
-    for budget in args.budgets:
-        solutions = print_report(curves, budget, args.q_weight)
+    solutions = report_curves(curves, args.budgets, [args.q_weight],
+                              pareto=False)
 
     if args.q_weight_scan:
         print("\n" + "=" * 78)

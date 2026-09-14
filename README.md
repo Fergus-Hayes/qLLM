@@ -526,7 +526,17 @@ checkpoint.
 
 ### Solve the budget
 
+Either in the same command as the sweep (`hybridize.py --solve`) or afterwards
+from the CSV (`analyze_budget.py`) -- both call the same reporting core and both
+work for any layers/model:
+
 ```bash
+# Measure and solve one targeted layer in a single command (any model)
+python hybridize.py MODEL_ID --profile-depths 10 --layer-types v_proj \
+    --gate-sizes 2 --circuit-depths 0 1 2 4 8 --solve --budgets 1.003 \
+    --q-weights 0 1
+
+# Or analyse an existing sweep CSV
 python analyze_budget.py results/llms/SmolLM2-135M/compactifai/hybrid_per_layer.csv
 
 # The paper's framing: the circuits run on a QPU and cost no classical memory
@@ -538,6 +548,11 @@ python analyze_budget.py HYBRID.csv --q-weight-scan 0 0.01 0.1 1 10
 # Tight budget, attention only
 python analyze_budget.py HYBRID.csv --budgets 1.002 --attention-only
 ```
+
+`--solve` reports on the layers the sweep just measured (narrowed by
+`--layer-types` / `--profile-depths` when given); `analyze_budget.py` reports on
+whatever is in the CSV, filterable the same way. Neither is tied to a particular
+model or layer -- the specifics are all arguments.
 
 Budgets are perplexity **ratios** to the dense baseline (`1.01` = at most 1%
 worse), which is what the per-layer probe resolves: every point is scored on the
@@ -581,36 +596,25 @@ A low `M*/N*` needs all three to line up: little padding waste, a circuit wide
 enough to actually disentangle, and a price at which its angles are cheaper than
 the bond dimensions they save.
 
-### The paper's layer, in one command
+### Reproducing a specific layer (e.g. the paper's)
 
-`paper_layer.py` (module `qllm.paper_layer_cli`) wraps the whole flow for the
-exact layer of arXiv:2410.17397v2 -- the `(576, 192)` self-attention projection
-of block 10 of a compressed SmolLM2 -- with two-qubit gates. It runs the sweep on
-that one layer and prints `M*/N*` directly, alongside the paper's own reported
-figures (its Table I, which uses the full 10q/8q disentangler) for comparison.
+There is no per-paper script: any single layer is a targeted run of the general
+tool. The layer of arXiv:2410.17397v2 -- the `(576, 192)` self-attention
+projection of block 10 of a compressed SmolLM2 -- is simply
 
 ```bash
-# Defaults to HuggingFaceTB/SmolLM2-135M, block 10, v_proj (the (576,192) matrix)
-python paper_layer.py
-
-# Faster probe on a GPU; sweep several budgets and quantum-parameter prices
-python paper_layer.py --device cuda --ppl-batch-size 16 \
-    --budgets 1.001 1.003 1.01 --q-weights 0 0.01 1
-
-# The other (576,192) projection, or a different block
-python paper_layer.py --layer-type k_proj --block 10
+python hybridize.py HuggingFaceTB/SmolLM2-135M \
+    --profile-depths 10 --layer-types v_proj \
+    --gate-sizes 2 --circuit-depths 0 1 2 4 8 \
+    --solve --budgets 1.003 --q-weights 0 1
 ```
 
-For each budget `B` and price `w` it reports `N*` (`chi`), `M*` (`chi'`, `D`),
-and `M*/N*`, plus the break-even price `w*`. `B = 1.003` is the paper's headline
-figure for this layer (its disentangler holds the perplexity to `+0.3%`), so it
-is a natural budget to solve at. Because this build's gates are `k <= 2`, the
-disentangling is weaker than the paper's wide-gate circuits, and the report makes
-that gap explicit: it prints the paper's `chi' = 1 -> 36 parameters at +0.26%`
-next to what two-qubit gates actually achieve on the same layer.
-
-This CLI needs to load the model (it measures perplexity), so it requires access
-to the Hugging Face model files.
+`--profile-depths 10` picks block 10, `--layer-types v_proj` its `(576, 192)`
+projection (`k_proj` is the same shape), and `--budgets 1.003` is the paper's
+headline tolerance for that layer (`+0.3%` perplexity). Point the same command
+at any `MODEL_ID`, block, or layer type to compare a different layer. Because
+this build's gates are `k <= 2`, the disentangling is weaker than the paper's
+wide-gate circuits -- which is exactly what `M*/N*` at `w > 0` quantifies.
 
 ## Use as a library
 
@@ -655,8 +659,7 @@ qllm/
   disentangler.py      # PQC disentanglers: brickwall circuits + environment sweeps
   hybrid_sweep.py      # PPL(chi) and PPL(chi', D, k) on the same probe tokens
   hybrid_planner.py    # offline verdict on (k, D) from parameter counts alone
-  hybrid_cli.py        # hybrid-sweep CLI
-  paper_layer_cli.py   # M*/N* for the (576,192) layer of arXiv:2410.17397, k<=2
+  hybrid_cli.py        # hybrid-sweep CLI (+ --solve: sweep and report M*/N*)
   budget_frontier.py   # N*, M*, M*/N*, break-even price, Pareto front
   budget_plots.py      # figures for the budget comparison
   budget_cli.py        # budget-analysis CLI
@@ -665,7 +668,6 @@ benchmark_llm.py       # thin entry point for the benchmark CLI
 analyze_layers.py      # thin entry point for the layer-analysis CLI
 compactify.py          # thin entry point for the CompactifAI sweep
 hybridize.py           # thin entry point for the hybrid PQC+TN sweep
-paper_layer.py         # thin entry point for the arXiv:2410.17397 layer
 analyze_budget.py      # thin entry point for the budget comparison
 analyze_compressibility.py  # thin entry point for the metrics correlation
 tests/                 # offline smoke tests (real torch, stubbed network I/O)
