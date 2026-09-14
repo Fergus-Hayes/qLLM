@@ -24,6 +24,7 @@ from .compactifai import (
     mpo_param_count,
 )
 from .compactifai_sweep import CompactifaiConfig, run_sweep
+from .compressibility_metrics import correlate as correlate_compressibility
 
 __all__ = [
     "BenchmarkConfig",
@@ -39,6 +40,7 @@ __all__ = [
     "build_plan",
     "compress_weight",
     "mpo_param_count",
+    "correlate_compressibility",
 ]
 
 __version__ = "0.1.0"
