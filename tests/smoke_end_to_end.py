@@ -86,7 +86,7 @@ print("  monotone in chi, exact at full rank -> OK")
 # ---- (3) per-layer sweep
 from qllm.compactifai_sweep import CompactifaiConfig, run_per_layer_sweep, per_layer_csv_path, _read_rows
 print("\n=== 3. Per-layer sweep (real model, one layer at a time) ===")
-scratch = "/tmp/claude-0/-home-user-qLLM/cc5fda4e-5c0d-5a0e-a40c-8c979e8a8f61/scratchpad/smoke-out"
+scratch = os.environ.get("QLLM_SMOKE_DIR", "/tmp/qllm-smoke")
 import shutil; shutil.rmtree(scratch, ignore_errors=True)
 t0 = time.perf_counter()
 cfg2 = CompactifaiConfig(model_id="tiny-gpt2", device="cpu", dtype="float32",
