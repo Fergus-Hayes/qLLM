@@ -22,7 +22,6 @@ spending perplexity evaluations on.
 
 from __future__ import annotations
 
-import math
 
 from .compactifai import mpo_dims, mpo_param_count
 from .disentangler import n_qubits_for, quantum_param_count

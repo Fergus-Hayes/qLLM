@@ -424,6 +424,161 @@ family (e.g. `--attention-only`) removes the MLP-vs-attention split that
 otherwise dominates the correlations, so what remains reflects variation *within*
 that family.
 
+## Quantum disentanglers: is the PQC worth its parameters?
+
+`hybridize.py` (modules `qllm.disentangler`, `qllm.hybrid_sweep`) implements the
+hybrid layer of *Quantum Large Language Models via Tensor Network Disentanglers*
+(Aizpurua et al.) and measures it **against** the CompactifAI layer above, on the
+same probe tokens. `analyze_budget.py` (module `qllm.budget_frontier`) then
+answers the question the two methods are really competing over:
+
+> At a perplexity budget **B**, which layer is smaller -- the tensor network, or
+> the tensor network with quantum circuits bolted on?
+
+Formally, per layer:
+
+```
+N* = min_chi        C(chi)                    s.t.  PPL_classical(chi)   <= B
+M* = min_{chi',D,k} C(chi') + w . Q(D, k)     s.t.  PPL_hybrid(chi',D,k) <= B
+```
+
+`C` is the classical parameter count of the stored MPO tensors, `Q` that of the
+two disentangling circuits, and `w` the price of a quantum parameter in units of
+a classical one. Where `M*/N*` is small, the circuits buy real compression.
+
+### The hybrid layer
+
+Each weight matrix is rewritten as `W ~= U MPO_new V^T`, with `U` and `V`
+variational quantum circuits acting on the layer's output and input indices and
+`MPO_new` the residual tensor network that stays classical. Disentangling moves
+correlations out of the network and into the circuits, so `MPO_new` tolerates a
+far smaller bond dimension than the MPO of `W` itself -- in the paper, all the
+way to `chi' = 1`.
+
+| ingredient | how it is implemented here |
+| --- | --- |
+| **qubit embedding** | each index is zero-padded to `2^ceil(log2 d)` (the paper's `(576, 192) -> (10, 8)` qubits). The padding is exact but enlarges the residual MPO, so it is a real cost -- see `D = 0` below |
+| **circuit ansatz** | brickwall of real orthogonal `k`-qubit gates, depth `D`; `k = 0` means one gate spanning the whole register (the paper's widest case, which disentangles at `L = 1`) |
+| **optimization** | the paper's Appendix A: each gate is updated from its environment tensor, `E = P S Q -> g <- P Q`, sweeping both circuits until converged |
+| **objective** | `min ||U^T W V - T_chi(U^T W V)||`. The target is re-truncated each iteration, so the alternation is **monotone** in the error the compressed layer actually incurs. `--disentangle-target fixed` freezes it at the original's truncation instead, which is the literal objective behind the paper's Eq. (4) accuracy |
+| **`Q(D, k)`** | independent gate angles, `dim O(2^k) = 2^(k-1)(2^k - 1)` per gate (`--quantum-param-counting entries` counts `4^k` matrix entries instead, the right figure if a gate is stored as a dense classical tensor) |
+| **`D = 0`** | always measured: the circuits are the identity, so that row isolates the qubit-padding overhead from the benefit of the circuits |
+
+Sweeping costs no extra memory. The gates are orthogonal, so the partial product
+to the right of the current gate is recovered from the running one by applying
+the *old* gate transposed, and the left one accumulates from the freshly updated
+gates -- one sweep is `O(#gates)` applications and stores `O(1)` of them. One
+disentangling optimization is reused across the whole `chi'` grid (its SVD is
+cached), exactly as the classical sweep reuses one SVD per layer, so the heavy
+term is the perplexity probe: one evaluation per measured point.
+
+### Prune the grid first (no model, no tokens)
+
+Whether the hybrid *can* win is settled by arithmetic before any token is
+scored: `C_pad(chi') + w Q(D, k) < C(chi)`. `--shapes` answers that offline.
+
+```bash
+# SmolLM2-135M's actual layer shapes, against the dense layer
+python hybridize.py --shapes v_proj:576x192 q_proj:576x576 up_proj:1536x576 \
+    --gate-sizes 2 4 6 8 0 --circuit-depths 1 4
+
+# Against a realistic classical operating point instead
+python hybridize.py --shapes v_proj:576x192 --gate-sizes 2 4 6 8 0 \
+    --circuit-depths 1 4 --reference-chi 32 --q-weight 1
+```
+
+It prints, per `(layer, k, D)`, the circuits' surcharge expressed in bond
+dimensions, the largest `chi'` still affordable, and a **VETO** when not even
+`chi' = 1` fits. `--dry-run` does the same from a real model's shapes.
+
+This matters because the two levers pull against each other: gate size is what
+disentangles (the paper's smallest gates barely reduce the entanglement, its
+widest ones disentangle at `L = 1`), but `Q` grows as `4^k` per gate. For
+SmolLM2-135M at `w = 1`, a register-wide gate carries 0.5-2.6 M parameters
+against layers of 0.1-0.9 M -- vetoed outright -- which is the paper's own
+observation that as circuits the disentanglers "carry at least as many trainable
+parameters as `W`", counted as the quantum resource rather than as stored
+weights.
+
+### Measure both surfaces
+
+```bash
+# Both curves for a representative subset of layers
+python hybridize.py --preset standard --gate-sizes 2 4 --circuit-depths 0 1 2 4
+
+# The paper's configuration on one layer type
+python hybridize.py --gate-sizes 0 --circuit-depths 0 1 --layer-types v_proj
+
+# Best of several circuit initializations (the optimization is not convex)
+python hybridize.py --gate-sizes 4 --circuit-depths 1 2 4 --restarts 3
+```
+
+Output is `results/llms/<model>/compactifai/hybrid_per_layer.csv`, one row per
+`(layer, method, chi, D, k)` with `classical_params`, `quantum_params`,
+`perplexity`, `ppl_ratio`, and the disentangling diagnostics
+(`disentangle_accuracy` -- the paper's Eq. (4) -- `disentangle_entropy`, and
+`disentangle_retained`, the fraction of the layer's weight the target bond
+dimension keeps). `method=classical` rows are the pure-TN curve, measured in the
+same run so the two budgets are directly comparable. Re-running resumes from the
+checkpoint.
+
+### Solve the budget
+
+```bash
+python analyze_budget.py results/llms/SmolLM2-135M/compactifai/hybrid_per_layer.csv
+
+# The paper's framing: the circuits run on a QPU and cost no classical memory
+python analyze_budget.py HYBRID.csv --q-weight 0
+
+# How does the verdict depend on how a quantum parameter is priced?
+python analyze_budget.py HYBRID.csv --q-weight-scan 0 0.01 0.1 1 10
+
+# Tight budget, attention only
+python analyze_budget.py HYBRID.csv --budgets 1.002 --attention-only
+```
+
+Budgets are perplexity **ratios** to the dense baseline (`1.01` = at most 1%
+worse), which is what the per-layer probe resolves: every point is scored on the
+same tokens, so corpus-sampling error largely cancels in `ppl_ratio`. Both
+minimizations run over the *measured grid* rather than a fitted curve, so a
+non-monotone probe cannot produce a spuriously small `N*`.
+
+It prints:
+
+- the **per-layer table** -- `N*`, `M*`, `M*/N*`, and the winning `(chi', D, k)`;
+- **by layer type and by depth** -- median and best `M*/N*`, and how many layers
+  the PQC wins, which is the map of *where* the circuits pay;
+- the **Pareto front** over both methods together, with the owner of each step;
+- the **break-even price** `w*` per layer: the largest `w` at which the hybrid
+  still wins. `w*` is the scale-free version of the whole question -- how cheap a
+  quantum parameter has to be for that layer to be worth hybridizing -- and it is
+  defined even when the hybrid loses at `w = 1`;
+- a **model-level rollup**, `N*` and `M*` summed over the comparable layers.
+
+Layers that only one method can bring inside the budget are reported as
+`hybrid_only` / `classical_only` rather than scored, so the ratio column never
+mixes "smaller" with "the only one that works".
+
+Figures land next to the CSV: `hybrid_vs_classical_ratio.png` (the `M*/N*` map
+over layer type x depth, annotated with the winning configuration),
+`breakeven_weight.png`, `pareto_front.png`, and `ratio_vs_budget.png` (how the
+verdict moves as the budget is loosened).
+
+### Interpreting a result
+
+Three quantities decide every layer, and the tooling separates them:
+
+1. **the padding overhead** -- read it off the `D = 0` rows, where the circuits
+   are the identity. A layer whose dimensions sit just above a power of two pays
+   for it here before the circuits do anything;
+2. **how much the circuits disentangle** -- `disentangle_retained` at `D = 0`
+   versus at `D > 0`, and the bond entropy alongside it;
+3. **what they cost** -- `Q(D, k)`, and hence `w*`.
+
+A low `M*/N*` needs all three to line up: little padding waste, a circuit wide
+enough to actually disentangle, and a price at which its angles are cheaper than
+the bond dimensions they save.
+
 ## Use as a library
 
 ```python
@@ -436,6 +591,19 @@ write_result_csv(result, "results/llms/gpt2/benchmark.csv")
 # Per-layer analysis
 from qllm import LayerAnalysisConfig, run_layer_analysis
 run_layer_analysis(LayerAnalysisConfig(model_id="gpt2", sensitivity_eval_tokens=2048))
+
+# Disentangle one weight matrix into circuits + a residual MPO
+from qllm import disentangle, hybrid_weight
+res = disentangle(weight, gate_size=4, depth=2, target_chi=1)
+print(res.quantum_params, res.retained, res.entropy)
+approx, classical_params = hybrid_weight(res, chi=2)
+
+# Solve the budget from a hybrid sweep CSV
+from qllm import load_curves, solve_all
+from qllm.budget_frontier import read_rows
+curves = load_curves(read_rows("hybrid_per_layer.csv"))
+for s in solve_all(curves, budget=1.01, q_weight=1.0):
+    print(s.layer_type, s.depth, s.ratio, s.m_star_chi, s.m_star_circuit_depth)
 ```
 
 ### Project layout
@@ -448,10 +616,23 @@ qllm/
   analyze_cli.py       # layer-analysis CLI
   compactifai.py       # MPO decomposition: index factorization, truncated SVDs
   compactifai_sweep.py # bond-dimension sweep + checkpointed CSV output
+  compactifai_heal.py  # healing: brief retraining of a compressed layer
   compactifai_cli.py   # CompactifAI CLI
+  compressibility_metrics.py  # which layer metrics predict compressibility
+  disentangler.py      # PQC disentanglers: brickwall circuits + environment sweeps
+  hybrid_sweep.py      # PPL(chi) and PPL(chi', D, k) on the same probe tokens
+  hybrid_planner.py    # offline verdict on (k, D) from parameter counts alone
+  hybrid_cli.py        # hybrid-sweep CLI
+  budget_frontier.py   # N*, M*, M*/N*, break-even price, Pareto front
+  budget_plots.py      # figures for the budget comparison
+  budget_cli.py        # budget-analysis CLI
   __main__.py          # enables `python -m qllm`
 benchmark_llm.py       # thin entry point for the benchmark CLI
 analyze_layers.py      # thin entry point for the layer-analysis CLI
 compactify.py          # thin entry point for the CompactifAI sweep
+hybridize.py           # thin entry point for the hybrid PQC+TN sweep
+analyze_budget.py      # thin entry point for the budget comparison
+analyze_compressibility.py  # thin entry point for the metrics correlation
+tests/                 # offline smoke tests (real torch, stubbed network I/O)
 models.txt             # example model list for --models-file
 ```

@@ -27,7 +27,7 @@ import argparse
 from pathlib import Path
 
 from .budget_frontier import (
-    budget_scan,
+    _median,
     group_summary,
     load_curves,
     print_pareto,
@@ -121,7 +121,6 @@ def main(argv=None) -> int:
             wins = sum(r["n_wins"] for r in rows)
             comparable = sum(r["n_comparable"] for r in rows)
             ratios = [s.ratio for s in sols if s.ratio == s.ratio]
-            from .budget_frontier import _median
             print(f"{w:>10g} {f'{wins}/{comparable}':>12} "
                   f"{_median(ratios):>14.4f} "
                   f"{min(ratios, default=float('nan')):>12.4f}")

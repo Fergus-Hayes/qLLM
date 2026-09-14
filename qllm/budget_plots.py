@@ -37,6 +37,22 @@ def _plt():
         return None
 
 
+def _tidy_log_axes(ax, y_scalar: bool = True) -> None:
+    """Readable log axes: no minor tick labels, plain numbers on the y axis.
+
+    Perplexity ratios live in a narrow band just above 1, where matplotlib's
+    default log minor labels collide into an unreadable smear.
+    """
+    from matplotlib.ticker import NullFormatter, ScalarFormatter
+
+    ax.xaxis.set_minor_formatter(NullFormatter())
+    ax.yaxis.set_minor_formatter(NullFormatter())
+    if y_scalar:
+        fmt = ScalarFormatter()
+        fmt.set_scientific(False)
+        ax.yaxis.set_major_formatter(fmt)
+
+
 def _grid(solutions: list[LayerSolution], value):
     """(layer types, depths, matrix[type][depth]) for the heatmap views."""
     types = sorted({s.layer_type for s in solutions})
@@ -97,7 +113,7 @@ def plot_ratio_vs_budget(curves: dict[str, LayerCurves], budgets: list[float],
     plt = _plt()
     if plt is None or not curves:
         return
-    from .budget_frontier import _median, group_summary
+    from .budget_frontier import group_summary
 
     types = sorted({c.layer_type for c in curves.values()})
     series = {t: [] for t in types}
@@ -123,6 +139,7 @@ def plot_ratio_vs_budget(curves: dict[str, LayerCurves], budgets: list[float],
     axes[0].set_ylabel("median M*/N*")
     axes[0].set_title(f"Does the PQC pay?  (w = {q_weight:g}; below the red line it does)")
     axes[0].grid(True, which="both", alpha=0.25)
+    _tidy_log_axes(axes[0])
     axes[0].legend(fontsize="small", ncol=2)
     axes[1].set_xscale("symlog", linthresh=0.1)
     axes[1].set_xlabel("perplexity budget B  (% above the dense baseline)")
@@ -180,6 +197,7 @@ def plot_pareto(curves: dict[str, LayerCurves], out_dir: Path, q_weight: float,
         ax.set_ylabel("perplexity / baseline")
         ax.set_title(f"{curve.layer_type}  block {curve.depth}", fontsize=10)
         ax.grid(True, which="both", alpha=0.22)
+        _tidy_log_axes(ax)
         if idx == 0:
             ax.legend(fontsize="x-small", ncol=2)
     for j in range(len(names), nrows * ncols):

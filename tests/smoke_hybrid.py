@@ -37,7 +37,7 @@ def rel(a, b):
 # --------------------------------------------------------------------------- #
 from qllm.disentangler import (
     apply_circuit, apply_right, build_circuit, disentangle, gate_positions,
-    hybrid_weight, n_qubits_for, quantum_param_count, sweep_circuit,
+    hybrid_weight, quantum_param_count, sweep_circuit,
 )
 from qllm.compactifai import build_plan, compress_weight, full_rank_chi
 
@@ -59,6 +59,33 @@ assert len(gate_positions(10, 10, 5)) == 1, "a register-wide gate must not stack
 assert quantum_param_count(10, 8, 10, 1) == 1024 * 1023 // 2 + 256 * 255 // 2
 print(f"  Q for the paper's (10qU, 8qV, L=1): "
       f"{quantum_param_count(10, 8, 10, 1):,} parameters")
+
+# The two sweeps see the SAME objective <W, U M V^T>, the V side through a
+# transposition. Getting that convention wrong would still reconstruct exactly
+# (U, V orthogonal), so it is checked against the dense matrices directly.
+n_out, n_in = 6, 5
+Wt = torch.randn(1 << n_out, 1 << n_in)
+Mt = torch.randn(1 << n_out, 1 << n_in)
+ug = build_circuit(n_out, 2, 3, init="random", generator=torch.Generator().manual_seed(1))
+vg = build_circuit(n_in, 2, 3, init="random", generator=torch.Generator().manual_seed(2))
+Um = apply_circuit(ug, torch.eye(1 << n_out), n_out)
+Vm = apply_circuit(vg, torch.eye(1 << n_in), n_in)
+f_ref = float((Wt * (Um @ Mt @ Vm.T)).sum())
+f_u = float((Wt * apply_circuit(ug, apply_right(vg, Mt, n_in), n_out)).sum())
+f_v = float((Wt.T * apply_circuit(vg, apply_circuit(ug, Mt, n_out).T.contiguous(),
+                                  n_in)).sum())
+assert abs(f_u - f_ref) < 1e-3 and abs(f_v - f_ref) < 1e-3, (f_ref, f_u, f_v)
+cur = apply_right(vg, apply_circuit(ug, Wt, n_out, transpose=True), n_in, transpose=True)
+assert torch.allclose(cur, Um.T @ Wt @ Vm, atol=1e-4), "MPO_new != U^T W V"
+# A V-only sweep must raise the objective on its own.
+vg2 = build_circuit(n_in, 2, 3, init="identity")
+src = apply_circuit(ug, Mt, n_out).T.contiguous()
+v_before = float((Wt.T * apply_circuit(vg2, src, n_in)).sum())
+for _ in range(4):
+    v_after = sweep_circuit(vg2, Wt.T.contiguous(), src, n_in)
+assert v_after > v_before, (v_before, v_after)
+print(f"  both sweeps optimize the same objective ({f_ref:.4f}); the V side "
+      f"alone lifts it {v_before:.1f} -> {v_after:.1f}")
 
 # --------------------------------------------------------------------------- #
 # 2. Environment sweep is monotone
@@ -96,6 +123,14 @@ for k, D in [(2, 1), (2, 4), (4, 2), (7, 1)]:
           f"entropy {res.entropy:.3f}  chi'=1 err "
           f"{rel(W, hybrid_weight(res, 1)[0]):.4f} (classical {err_classical:.4f})")
 assert retained[(7, 1)] > retained[(2, 1)], "a wider gate must disentangle more"
+# Depth 0 leaves the circuits at identity, so the hybrid layer must then BE the
+# padded classical MPO -- that row is the padding overhead, nothing else.
+from qllm.disentangler import pad_to_qubits
+res0 = disentangle(W, gate_size=2, depth=0, target_chi=2)
+pad, _, _ = pad_to_qubits(W)
+ref0, _ = compress_weight(pad, build_plan(pad, 2), 2)
+assert torch.allclose(hybrid_weight(res0, 2)[0], ref0[:d_out, :d_in], atol=1e-5), \
+    "D=0 must reduce to the padded classical MPO"
 assert all(v >= retained[(2, 1)] - 1e-6 or k == 2 for (k, _D), v in retained.items())
 print("  monotone, exact at full chi, wider gates disentangle more")
 

@@ -317,13 +317,23 @@ def weight_scan(curves: dict[str, LayerCurves], budget: float,
 # Reporting
 # --------------------------------------------------------------------------- #
 def _fmt(value: float, width: int = 10) -> str:
+    """Ratios and prices: 3 decimals, with 'n/a' and 'inf' spelled out."""
     if value != value:
         return f"{'n/a':>{width}}"
     if math.isinf(value):
         return f"{'inf':>{width}}"
-    if value >= 1000:
+    if abs(value) >= 1000:
         return f"{value:>{width},.0f}"
     return f"{value:>{width}.3f}"
+
+
+def _fmt_count(value: float, width: int = 10) -> str:
+    """Parameter counts: thousands separators, no false precision."""
+    if value != value:
+        return f"{'n/a':>{width}}"
+    if math.isinf(value):
+        return f"{'none':>{width}}"
+    return f"{value:>{width},.0f}"
 
 
 def print_layer_table(solutions: list[LayerSolution], title: str = "") -> None:
@@ -336,8 +346,8 @@ def print_layer_table(solutions: list[LayerSolution], title: str = "") -> None:
           "{:>8} {:>9}".format(*head))
     print("-" * 118)
     for s in sorted(solutions, key=lambda x: (x.ratio if x.ratio == x.ratio else INF)):
-        print(f"{s.layer_type[:22]:22} {s.depth:>4} {_fmt(s.n_star, 11)} "
-              f"{s.n_star_chi:>5} {_fmt(s.m_star, 12)} {s.m_star_chi:>5} "
+        print(f"{s.layer_type[:22]:22} {s.depth:>4} {_fmt_count(s.n_star, 11)} "
+              f"{s.n_star_chi:>5} {_fmt_count(s.m_star, 12)} {s.m_star_chi:>5} "
               f"{s.m_star_circuit_depth:>3} {s.m_star_gate_size:>3} "
               f"{s.m_star_c if s.m_star_c >= 0 else 0:>10,} "
               f"{s.m_star_q if s.m_star_q >= 0 else 0:>10,} "
