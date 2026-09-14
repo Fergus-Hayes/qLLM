@@ -388,6 +388,42 @@ python compactify.py --mode per-layer --preset standard --heal \
 point, so it is much heavier than the raw probe — use a GPU, keep `--heal-steps`
 modest, and profile a subset (`--profile-depths` / `--layer-types`) first.
 
+## What predicts compressibility? (metrics vs. compression)
+
+`analyze_compressibility.py` (module `qllm.compressibility_metrics`) joins the
+per-layer MPO sweep to the `layer_analysis` metrics on `param_name` and asks:
+**which layer property predicts how far a layer can be compressed before
+perplexity degrades?**
+
+It reduces each layer's perplexity-vs-χ curve to a compressibility scalar
+(default: negated log perplexity-ratio at the median χ; higher = more
+compressible; alternatives `--target chi_at_budget` / `max_compression` with a
+`--budget`), then Spearman-correlates each metric against it. **Only the
+shape-normalized / scale-free metrics are considered** — the entropies ÷ log k,
+the rank ratios ÷ k, the relative spectral gap, the log / RMT-normalized
+condition number, and the already-relative perplexity sensitivity — so the
+comparison is not confounded by raw scale or matrix size.
+
+```bash
+# All eligible layers
+python analyze_compressibility.py     results/llms/SmolLM2-135M/compactifai/compactifai_per_layer.csv     results/llms/SmolLM2-135M/layer_analysis/layer_analysis.csv
+
+# Self-attention layers only (q/k/v/o)
+python analyze_compressibility.py PER_LAYER.csv LAYER_ANALYSIS.csv --attention-only
+
+# MLP layers only, or a custom subset
+python analyze_compressibility.py PER_LAYER.csv LAYER_ANALYSIS.csv --mlp-only
+python analyze_compressibility.py PER_LAYER.csv LAYER_ANALYSIS.csv --layer-types o_proj v_proj
+```
+
+It prints the metrics ranked by |Spearman ρ| (positive ρ = more of that metric →
+more compressible, regardless of `--target`) and writes
+`compressibility_vs_metrics.png` (scatter of compressibility vs. each top metric,
+coloured by layer type) next to the per-layer CSV. Restricting to a single
+family (e.g. `--attention-only`) removes the MLP-vs-attention split that
+otherwise dominates the correlations, so what remains reflects variation *within*
+that family.
+
 ## Use as a library
 
 ```python

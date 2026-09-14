@@ -20,15 +20,19 @@ import math
 from collections import defaultdict
 from pathlib import Path
 
-# Metrics from layer_analysis.csv worth correlating (shape-normalized first).
-METRIC_COLUMNS = [
+# Only the shape-normalized / scale-free metrics from layer_analysis.csv are
+# considered, so the correlation is not confounded by raw scale or matrix size.
+# (perplexity_sensitivity is already a relative quantity; the rest are the
+# normalized variants -- entropies / log k, ranks / k, gap / sigma_1, log or
+# random-matrix-normalized condition number.)
+NORMALIZED_METRICS = [
     "perplexity_sensitivity",
     "shannon_entropy_normalized", "renyi2_entropy_normalized",
     "effective_rank_ratio", "stable_rank_ratio",
-    "relative_spectral_gap", "log_condition_number",
-    "condition_number_rmt_ratio",
-    "effective_rank", "stable_rank", "condition_number", "spectral_gap",
+    "relative_spectral_gap",
+    "log_condition_number", "condition_number_rmt_ratio",
 ]
+METRIC_COLUMNS = NORMALIZED_METRICS   # backwards-compatible alias
 
 
 def _f(x):
@@ -114,25 +118,42 @@ def spearman(a: list[float], b: list[float]) -> float:
     return cov / (va * vb) if va > 0 and vb > 0 else float("nan")
 
 
+def _matches_filter(layer_type: str, param_name: str, layer_filter) -> bool:
+    if not layer_filter:
+        return True
+    hay = f"{layer_type} {param_name}".lower()
+    return any(str(tok).lower() in hay for tok in layer_filter)
+
+
 def correlate(per_layer_csv: str | Path, layer_analysis_csv: str | Path,
               target: str = "log_ppl_ratio_ref", ref_chi: int | None = None,
-              budget: float = 1.10) -> dict:
+              budget: float = 1.10, layer_filter=None,
+              metric_columns=None) -> dict:
     """Join the two CSVs and Spearman-correlate each metric with compressibility.
 
     ``target`` is the compressibility scalar to correlate against. The sign
     convention below is set so a POSITIVE rho means "more of this metric -> more
     compressible" regardless of which target is chosen.
+
+    ``layer_filter`` restricts the analysis to layers whose ``layer_type`` (or
+    ``param_name``) contains any of the given substrings, e.g. ``["self_attn"]``
+    for the attention projections only. ``metric_columns`` overrides the set of
+    metrics to correlate (default: the normalized metrics).
     """
+    metric_columns = list(metric_columns or NORMALIZED_METRICS)
     scal = compressibility_scalars(_read(per_layer_csv), ref_chi, budget)
     metrics = {r["param_name"]: r for r in _read(layer_analysis_csv)}
 
     joined = []
     for name, s in scal.items():
-        if name in metrics:
-            row = dict(s)
-            for m in METRIC_COLUMNS:
-                row[m] = _f(metrics[name].get(m, "nan"))
-            joined.append(row)
+        if name not in metrics:
+            continue
+        if not _matches_filter(s.get("layer_type", ""), name, layer_filter):
+            continue
+        row = dict(s)
+        for m in metric_columns:
+            row[m] = _f(metrics[name].get(m, "nan"))
+        joined.append(row)
 
     # "compressibility" increases when damage decreases -> flip damage targets.
     flip = target in ("log_ppl_ratio_ref", "ppl_ratio_ref", "relative_error_ref",
@@ -140,17 +161,22 @@ def correlate(per_layer_csv: str | Path, layer_analysis_csv: str | Path,
     y = [(-row[target] if flip else row[target]) for row in joined]
 
     results = []
-    for m in METRIC_COLUMNS:
+    for m in metric_columns:
         x = [row[m] for row in joined]
         results.append((m, spearman(x, y)))
     results.sort(key=lambda kv: (-(abs(kv[1]) if kv[1] == kv[1] else -1)))
+    layer_types = sorted({r.get("layer_type", "") for r in joined})
     return {"n_layers": len(joined), "target": target, "budget": budget,
+            "layer_filter": layer_filter, "layer_types": layer_types,
             "joined": joined, "correlations": results}
 
 
 def print_report(res: dict) -> None:
-    print(f"\nCompressibility vs. layer_analysis metrics "
+    scope = (", ".join(res.get("layer_types", [])) or "all layers")
+    print(f"\nCompressibility vs. normalized layer_analysis metrics "
           f"({res['n_layers']} layers joined)")
+    if res.get("layer_filter"):
+        print(f"restricted to: {res['layer_filter']}  ->  {scope}")
     print(f"target = compressibility (higher = more compressible), "
           f"derived from '{res['target']}'")
     print("=" * 64)
