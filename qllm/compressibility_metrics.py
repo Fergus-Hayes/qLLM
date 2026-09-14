@@ -125,6 +125,63 @@ def _matches_filter(layer_type: str, param_name: str, layer_filter) -> bool:
     return any(str(tok).lower() in hay for tok in layer_filter)
 
 
+def _betacf(a: float, b: float, x: float) -> float:
+    # Lentz continued fraction for the incomplete beta (Numerical Recipes).
+    tiny = 1e-30
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c = 1.0
+    d = 1.0 - qab * x / qap
+    if abs(d) < tiny:
+        d = tiny
+    d = 1.0 / d
+    h = d
+    for m in range(1, 200):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        if abs(d) < tiny:
+            d = tiny
+        c = 1.0 + aa / c
+        if abs(c) < tiny:
+            c = tiny
+        d = 1.0 / d
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        if abs(d) < tiny:
+            d = tiny
+        c = 1.0 + aa / c
+        if abs(c) < tiny:
+            c = tiny
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < 3e-9:
+            break
+    return h
+
+
+def _betai(a: float, b: float, x: float) -> float:
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    bt = math.exp(math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+                  + a * math.log(x) + b * math.log(1.0 - x))
+    if x < (a + 1.0) / (a + b + 2.0):
+        return bt * _betacf(a, b, x) / a
+    return 1.0 - bt * _betacf(b, a, 1.0 - x) / b
+
+
+def spearman_pvalue(rho: float, n: int) -> float:
+    """Two-sided p-value for a Spearman rho via the Student-t approximation."""
+    if not (rho == rho) or n < 4 or abs(rho) >= 1.0:
+        return float("nan")
+    df = n - 2
+    t = rho * math.sqrt(df / (1.0 - rho * rho))
+    return _betai(df / 2.0, 0.5, df / (df + t * t))   # two-sided
+
+
 def correlate(per_layer_csv: str | Path, layer_analysis_csv: str | Path,
               target: str = "log_ppl_ratio_ref", ref_chi: int | None = None,
               budget: float = 1.10, layer_filter=None,
@@ -160,10 +217,12 @@ def correlate(per_layer_csv: str | Path, layer_analysis_csv: str | Path,
                        "chi_at_budget")
     y = [(-row[target] if flip else row[target]) for row in joined]
 
+    n = len(joined)
     results = []
     for m in metric_columns:
         x = [row[m] for row in joined]
-        results.append((m, spearman(x, y)))
+        rho = spearman(x, y)
+        results.append((m, rho, spearman_pvalue(rho, n)))
     results.sort(key=lambda kv: (-(abs(kv[1]) if kv[1] == kv[1] else -1)))
     layer_types = sorted({r.get("layer_type", "") for r in joined})
     return {"n_layers": len(joined), "target": target, "budget": budget,
@@ -180,20 +239,23 @@ def print_report(res: dict) -> None:
     print(f"target = compressibility (higher = more compressible), "
           f"derived from '{res['target']}'")
     print("=" * 64)
-    print(f"{'metric':30} {'Spearman rho':>12}  interpretation")
-    for m, rho in res["correlations"]:
+    n = res["n_layers"]
+    print(f"{'metric':28} {'rho':>7} {'p':>8}  {'sig':>4}  interpretation")
+    any_sig = False
+    for m, rho, pval in res["correlations"]:
         if rho != rho:
-            tag = "n/a"
-        elif abs(rho) >= 0.6:
-            tag = "STRONG"
-        elif abs(rho) >= 0.4:
-            tag = "moderate"
-        elif abs(rho) >= 0.2:
-            tag = "weak"
-        else:
-            tag = "~none"
-        sign = "+more compressible" if rho > 0 else "-less compressible"
-        print(f"{m:30} {rho:>+12.3f}  {tag} ({sign})")
+            print(f"{m:28} {'n/a':>7}"); continue
+        star = "***" if pval < 0.001 else "**" if pval < 0.01 else "*" if pval < 0.05 else ""
+        any_sig = any_sig or (pval < 0.05)
+        strength = ("STRONG" if abs(rho) >= 0.6 else "moderate" if abs(rho) >= 0.4
+                    else "weak" if abs(rho) >= 0.2 else "~none")
+        sign = "+more" if rho > 0 else "-less"
+        print(f"{m:28} {rho:>+7.3f} {pval:>8.3f}  {star:>4}  {strength} ({sign} compressible)")
+    print(f"\nn = {n} layers; p is the two-sided Spearman significance "
+          f"(* p<0.05, ** p<0.01, *** p<0.001).")
+    if not any_sig:
+        print("No metric reaches p<0.05: within this set of layers, none of the "
+              "normalized metrics predicts compressibility.")
 
 
 def make_plots(res: dict, out_dir: Path, top: int = 6) -> None:
@@ -207,7 +269,7 @@ def make_plots(res: dict, out_dir: Path, top: int = 6) -> None:
     joined = res["joined"]
     if not joined:
         return
-    metrics = [m for m, rho in res["correlations"] if rho == rho][:top]
+    metrics = [m for m, rho, _p in res["correlations"] if rho == rho][:top]
     types = sorted({r["layer_type"] for r in joined})
     cmap = plt.get_cmap("tab10")
     tcol = {t: cmap(i % 10) for i, t in enumerate(types)}
@@ -224,7 +286,7 @@ def make_plots(res: dict, out_dir: Path, top: int = 6) -> None:
             ys = [(-r[res["target"]] if flip else r[res["target"]])
                   for r in joined if r["layer_type"] == t]
             ax.scatter(xs, ys, s=28, color=tcol[t], label=t, alpha=0.8)
-        rho = dict(res["correlations"])[m]
+        rho = {mm: rr for mm, rr, _p in res["correlations"]}[m]
         ax.set_xlabel(m)
         ax.set_ylabel(f"compressibility (-{res['target']})")
         ax.set_title(f"{m}  (rho={rho:+.2f})", fontsize=10)
