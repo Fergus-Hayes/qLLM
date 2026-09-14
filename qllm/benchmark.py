@@ -90,15 +90,38 @@ class BenchmarkResult:
 # --------------------------------------------------------------------------- #
 # Device / dtype helpers
 # --------------------------------------------------------------------------- #
+def _cuda_available() -> bool:
+    return torch.cuda.is_available()
+
+
+def _mps_available() -> bool:
+    mps = getattr(torch.backends, "mps", None)
+    return mps is not None and mps.is_available()
+
+
 def resolve_device(requested: str) -> str:
-    """Turn a requested device string into a concrete, available device."""
-    if requested != "auto":
-        return requested
-    if torch.cuda.is_available():
-        return "cuda"
-    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
+    """Turn a requested device string into a concrete, available device.
+
+    ``auto`` picks the best available backend. An explicit ``cuda``/``mps`` that
+    is not available falls back to CPU with a clear warning, rather than crashing
+    deep inside ``model.to()`` (e.g. "Torch not compiled with CUDA enabled").
+    """
+    if requested == "auto":
+        if _cuda_available():
+            return "cuda"
+        if _mps_available():
+            return "mps"
+        return "cpu"
+    if requested == "cuda" and not _cuda_available():
+        print("    WARNING: --device cuda requested but no CUDA is available in "
+              "this PyTorch build; falling back to --device cpu. (Install a "
+              "CUDA-enabled torch, or pass --device cpu to silence this.)")
+        return "cpu"
+    if requested == "mps" and not _mps_available():
+        print("    WARNING: --device mps requested but MPS is unavailable; "
+              "falling back to --device cpu.")
+        return "cpu"
+    return requested
 
 
 def resolve_dtype(name: str):
@@ -114,6 +137,9 @@ def resolve_dtype(name: str):
 def load_model_and_tokenizer(config: BenchmarkConfig, device: str):
     """Fetch a model and tokenizer from the Hub (or a local path)."""
     print(f"Fetching '{config.model_id}' from the Hugging Face Hub ...")
+    if device == "cpu" and config.dtype == "float16":
+        print("    WARNING: float16 on CPU is slow and unsupported for some ops; "
+              "prefer --dtype float32 (or bfloat16) on CPU.")
     dtype = resolve_dtype(config.dtype)
 
     tokenizer = AutoTokenizer.from_pretrained(
