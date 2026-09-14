@@ -15,6 +15,10 @@ Speed strategy
 * Perplexity scoring batches sliding windows into single forward passes
   (``--ppl-batch-size``) and honours ``--device``/``--dtype``/``--threads``.
 * Results are checkpointed per ``chi``, so an interrupted sweep resumes.
+
+Per-layer mode optionally applies the paper's *healing* step (``--heal``): after
+each layer is truncated, its MPO tensors are briefly retrained (every other
+weight frozen) and the healed perplexity recorded alongside the raw one.
 """
 
 from __future__ import annotations
@@ -47,6 +51,7 @@ from .compactifai import (
     mpo_param_count,
     relative_error,
 )
+from .compactifai_heal import heal_layer, make_heal_batches
 from .layer_analysis import parse_layer_info
 
 # Default targets: the Self-Attention and MLP sub-modules inside decoder blocks,
@@ -98,6 +103,17 @@ class CompactifaiConfig:
     layer_types: list[str] | None = None      # restrict to these layer types
     per_layer_eval_tokens: int | None = 8192  # budget per evaluation
     per_layer_stride: int | None = None       # default: non-overlapping windows
+
+    # Healing: brief retraining of the compressed layer's MPO tensors (all other
+    # weights frozen) to recover accuracy lost to truncation. Uses a disjoint
+    # train split so healed perplexity is not measured on the healing data.
+    heal: bool = False
+    heal_steps: int = 40
+    heal_lr: float = 1e-3
+    heal_tokens: int = 16384
+    heal_batch: int = 2
+    heal_split: str = "train"
+    heal_dataset: str | None = None           # default: same as eval dataset
 
     # Output.
     results_dir: str = "results/llms"
@@ -174,6 +190,12 @@ class PerLayerRow:
     perplexity: float
     ppl_baseline: float
     ppl_ratio: float
+    perplexity_healed: float
+    ppl_ratio_healed: float
+    heal_recovered_frac: float
+    heal_steps: int
+    heal_final_loss: float
+    heal_seconds: float
     eval_tokens: int
     eval_seconds: float
 
@@ -602,9 +624,41 @@ def run_per_layer_sweep(config: CompactifaiConfig) -> Path:
             batch_size=config.ppl_batch_size, max_eval_tokens=budget, progress=False,
         )
 
+    # Healing corpus: a DISJOINT split (train by default) so healed perplexity is
+    # never measured on the healing tokens. Tokenized once and reused per layer.
+    heal_batches = []
+    if config.heal:
+        if config.mpo_sites != 2 or not config.svd_cache:
+            raise RuntimeError("Healing requires --mpo-sites 2 and the SVD cache on.")
+        heal_cfg = BenchmarkConfig(
+            model_id=config.model_id, dataset=config.heal_dataset or config.dataset,
+            dataset_config=config.dataset_config, split=config.heal_split,
+            text_column=config.text_column,
+        )
+        heal_ids = tokenize_corpus(tokenizer, heal_cfg)
+        heal_batches = make_heal_batches(heal_ids, config.max_length,
+                                         config.heal_batch, config.heal_tokens)
+        print(f"Healing enabled: {config.heal_steps} Adam steps @ lr {config.heal_lr} "
+              f"on {config.heal_tokens} tokens from "
+              f"'{config.heal_dataset or config.dataset}:{config.heal_split}' "
+              f"({len(heal_batches)} batches of {config.heal_batch}x{config.max_length}); "
+              f"only the compressed layer's MPO tensors are trained.")
+
     path = per_layer_csv_path(config)
     existing = [] if config.force_recompute else _read_rows(path)
-    done = {(r.get("param_name"), str(r.get("chi"))) for r in existing}
+
+    def _row_complete(r):
+        # When healing is requested, a checkpointed row counts as done only if it
+        # already carries a finite healed perplexity (so a prior no-heal run does
+        # not mask a heal run).
+        if not config.heal:
+            return True
+        try:
+            return math.isfinite(float(r.get("perplexity_healed", "nan")))
+        except (TypeError, ValueError):
+            return False
+
+    done = {(r.get("param_name"), str(r.get("chi"))) for r in existing if _row_complete(r)}
     rows_by_key = {(r.get("param_name"), str(r.get("chi"))): r for r in existing}
 
     print(f"\nBaseline (all layers dense) perplexity on {budget} tokens ...")
@@ -643,6 +697,26 @@ def run_per_layer_sweep(config: CompactifaiConfig) -> Path:
         with torch.no_grad():                      # restore immediately
             param.copy_(orig.to(dtype=param.dtype, device=param.device))
 
+        # Healing: retrain this layer's MPO tensors (others frozen), then re-score.
+        ppl_healed, ratio_healed, recovered = float("nan"), float("nan"), float("nan")
+        heal_loss, heal_secs = float("nan"), 0.0
+        if config.heal and heal_batches:
+            th = time.perf_counter()
+            healed_w, _, heal_loss = heal_layer(
+                model, name, plan, chi, heal_batches, device,
+                steps=config.heal_steps, lr=config.heal_lr, log=False,
+            )
+            with torch.no_grad():
+                param.copy_(healed_w.to(dtype=param.dtype, device=param.device))
+            ppl_healed, _, _ = evaluate()
+            with torch.no_grad():
+                param.copy_(orig.to(dtype=param.dtype, device=param.device))
+            heal_secs = time.perf_counter() - th
+            ratio_healed = ppl_healed / baseline if baseline else float("nan")
+            # Fraction of the truncation damage recovered by healing, in [0, 1].
+            damage = ppl - baseline
+            recovered = max(0.0, min(1.0, (ppl - ppl_healed) / damage)) if damage > 1e-9 else 1.0
+
         layer_type, depth = parse_layer_info(name)
         row = asdict(PerLayerRow(
             timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -653,6 +727,12 @@ def run_per_layer_sweep(config: CompactifaiConfig) -> Path:
             relative_error=round(err, 6), perplexity=round(ppl, 4),
             ppl_baseline=round(baseline, 4),
             ppl_ratio=round(ppl / baseline, 4) if baseline else float("nan"),
+            perplexity_healed=round(ppl_healed, 4) if ppl_healed == ppl_healed else float("nan"),
+            ppl_ratio_healed=round(ratio_healed, 4) if ratio_healed == ratio_healed else float("nan"),
+            heal_recovered_frac=round(recovered, 4) if recovered == recovered else float("nan"),
+            heal_steps=config.heal_steps if config.heal else 0,
+            heal_final_loss=round(heal_loss, 4) if heal_loss == heal_loss else float("nan"),
+            heal_seconds=round(heal_secs, 2),
             eval_tokens=eval_tokens, eval_seconds=round(secs, 2),
         ))
         rows_by_key[(name, str(chi))] = row
@@ -666,9 +746,12 @@ def run_per_layer_sweep(config: CompactifaiConfig) -> Path:
             print(f"    (first point took {elapsed:.1f}s -> estimated total "
                   f"{elapsed * len(todo) / 60:.0f} min for {len(todo)} points; "
                   f"reduce with --profile-depths / --num-chi / --per-layer-eval-tokens)")
+        heal_str = (f" -> healed {ppl_healed:.4f} (x{ratio_healed:.3f}, "
+                    f"{recovered*100:.0f}% recovered)"
+                    if config.heal and heal_batches else "")
         print(f"  [{i}/{len(todo)}] {layer_type} d{depth} chi={chi:<4} "
               f"ratio={params_mpo / plan.dense_params:.3f} rel.err={err:.4f} "
-              f"ppl={ppl:.4f} (x{ppl / baseline:.3f})  "
+              f"ppl={ppl:.4f} (x{ppl / baseline:.3f}){heal_str}  "
               f"elapsed={elapsed:.0f}s eta={eta:.0f}s")
 
     with torch.no_grad():
@@ -718,7 +801,13 @@ def plot_per_layer(rows: list[dict], out_dir: Path) -> None:
             continue
         if not math.isfinite(ppl):
             continue
-        data.setdefault(lt, {}).setdefault(depth, []).append((chi, ppl))
+        healed = None
+        try:
+            hv = float(r.get("perplexity_healed", "nan"))
+            healed = hv if math.isfinite(hv) else None
+        except (TypeError, ValueError):
+            healed = None
+        data.setdefault(lt, {}).setdefault(depth, []).append((chi, ppl, healed))
 
     if not data:
         print("(No per-layer rows to plot.)")
@@ -736,6 +825,7 @@ def plot_per_layer(rows: list[dict], out_dir: Path) -> None:
 
     for idx, lt in enumerate(types):
         ax = axes[idx // ncols][idx % ncols]
+        any_healed = False
         for depth in sorted(data[lt]):
             pts = sorted(data[lt][depth])
             xs = [p[0] for p in pts]
@@ -743,6 +833,11 @@ def plot_per_layer(rows: list[dict], out_dir: Path) -> None:
             frac = (depth - dmin) / (dmax - dmin) if dmax > dmin else 0.5
             ax.plot(xs, ys, marker="o", ms=3, lw=1.4, color=cmap(frac),
                     label=f"block {depth}")
+            hpts = [(c, h) for (c, _p, h) in pts if h is not None]
+            if hpts:
+                any_healed = True
+                ax.plot([c for c, _ in hpts], [h for _, h in hpts], marker="^",
+                        ms=3, lw=1.2, ls="--", color=cmap(frac))
         if baseline and math.isfinite(baseline):
             ax.axhline(baseline, ls="--", lw=1.2, color="crimson",
                        label="baseline (dense)")
@@ -763,8 +858,11 @@ def plot_per_layer(rows: list[dict], out_dir: Path) -> None:
         fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap),
                      ax=axes, label="decoder block (depth)", fraction=0.02, pad=0.01)
 
+    healed_any = any(h is not None for lt in data.values() for dd in lt.values()
+                     for (_c, _p, h) in dd)
+    subtitle = "  (solid = truncated, dashed ^ = healed)" if healed_any else ""
     fig.suptitle("CompactifAI: perplexity vs. MPO bond dimension "
-                 "(one layer compressed at a time)", fontsize=13)
+                 "(one layer compressed at a time)" + subtitle, fontsize=13)
     path = out_dir / "perplexity_vs_bond_dimension_per_layer.png"
     fig.savefig(path, dpi=140, bbox_inches="tight")
     plt.close(fig)
@@ -779,6 +877,10 @@ def plot_per_layer(rows: list[dict], out_dir: Path) -> None:
             pts = sorted(data[lt][depth])
             ax.plot([p[0] for p in pts], [p[1] for p in pts], lw=1.0, alpha=0.55,
                     color=colors(i % 10), label=lt if first else None)
+            hpts = [(c, h) for (c, _p, h) in pts if h is not None]
+            if hpts:
+                ax.plot([c for c, _ in hpts], [h for _, h in hpts], lw=1.0,
+                        ls="--", alpha=0.55, color=colors(i % 10))
             first = False
     if baseline and math.isfinite(baseline):
         ax.axhline(baseline, ls="--", lw=1.3, color="black", label="baseline (dense)")

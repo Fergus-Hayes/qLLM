@@ -146,6 +146,25 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--per-layer-stride", type=int, default=None,
                         help="Probe stride (default: non-overlapping windows, "
                              "i.e. equal to --max-length).")
+
+    # Healing (brief retraining of the compressed layer).
+    parser.add_argument("--heal", action="store_true",
+                        help="After truncating each layer, briefly retrain its "
+                             "MPO tensors (all other weights frozen) and record "
+                             "the healed perplexity alongside the raw one.")
+    parser.add_argument("--heal-steps", type=int, default=40,
+                        help="Adam steps of healing per (layer, chi) point.")
+    parser.add_argument("--heal-lr", type=float, default=1e-3,
+                        help="Healing learning rate.")
+    parser.add_argument("--heal-tokens", type=int, default=16384,
+                        help="Tokens drawn from the healing split per point.")
+    parser.add_argument("--heal-batch", type=int, default=2,
+                        help="Windows per healing step (batch size).")
+    parser.add_argument("--heal-split", default="train",
+                        help="Dataset split used for healing (disjoint from the "
+                             "perplexity split; default: train).")
+    parser.add_argument("--heal-dataset", default=None,
+                        help="Healing dataset (default: same as --dataset).")
     parser.add_argument("--plot-only", action="store_true",
                         help="Regenerate plots from existing CSVs without "
                              "loading the model or recomputing anything.")
@@ -213,6 +232,13 @@ def main(argv=None) -> int:
         layer_types=args.layer_types,
         per_layer_eval_tokens=args.per_layer_eval_tokens or None,
         per_layer_stride=args.per_layer_stride,
+        heal=args.heal,
+        heal_steps=args.heal_steps,
+        heal_lr=args.heal_lr,
+        heal_tokens=args.heal_tokens,
+        heal_batch=args.heal_batch,
+        heal_split=args.heal_split,
+        heal_dataset=args.heal_dataset,
         results_dir=args.results_dir,
         csv_name=args.csv_name,
         layer_csv_name=args.layer_csv_name,

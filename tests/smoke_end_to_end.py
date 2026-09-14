@@ -96,6 +96,23 @@ cfg2 = CompactifaiConfig(model_id="tiny-gpt2", device="cpu", dtype="float32",
     per_layer_eval_tokens=512, ppl_batch_size=4,
     results_dir=scratch, make_plots=True)
 run_per_layer_sweep(cfg2)
+
+# ---- (4) per-layer sweep WITH healing (retrain the compressed layer)
+print("\n=== 4. Per-layer sweep with healing (--heal) ===")
+import shutil as _sh; _sh.rmtree(scratch + "-heal", ignore_errors=True)
+cfg3 = CompactifaiConfig(model_id="tiny-gpt2", device="cpu", dtype="float32",
+    include_pattern=r"h\.\d+\.(attn|mlp)\.", exclude_pattern=r"(wte|wpe|lm_head|ln|bias)",
+    chi_min=2, chi_max=16, num_chi=2, num_depths=1,
+    max_length=64, stride=64, per_layer_stride=64,
+    per_layer_eval_tokens=256, ppl_batch_size=4,
+    heal=True, heal_steps=8, heal_lr=5e-3, heal_tokens=512, heal_batch=2, heal_split="train",
+    results_dir=scratch + "-heal", make_plots=False)
+run_per_layer_sweep(cfg3)
+hrows = _read_rows(per_layer_csv_path(cfg3))
+assert hrows and all(r.get("perplexity_healed") not in (None, "", "nan") for r in hrows), \
+    "healed perplexity missing"
+print(f"healed {len(hrows)} (layer, chi) points; sample recovered% = "
+      + ", ".join(r["heal_recovered_frac"] for r in hrows[:4]))
 rows = _read_rows(per_layer_csv_path(cfg2))
 print(f"\n{len(rows)} (layer, chi) rows written in {time.perf_counter()-t0:.1f}s")
 from pathlib import Path

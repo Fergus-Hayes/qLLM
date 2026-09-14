@@ -21,8 +21,9 @@ exactly the effective operator the compressed model applies, so perplexity is
 identical to running the factorized layers directly, while the *parameter count*
 reported is that of the stored MPO tensors (not the reconstruction).
 
-Note: this module implements the compression + evaluation only. The paper's
-subsequent "healing" (brief retraining) stage is not performed, so the reported
+Note: this module implements the compression only. The paper's subsequent
+"healing" (brief retraining) stage lives in ``compactifai_heal.py`` and is
+applied optionally by the sweep (``--heal``); without it the reported
 perplexities are the pre-healing values.
 """
 

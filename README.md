@@ -236,9 +236,10 @@ exactly, while the *reported* parameter count is that of the stored MPO tensors.
 
 Use `--mode both` to run each in turn.
 
-> The paper's subsequent **"healing"** (brief retraining) stage is *not*
-> performed here, so these are pre-healing perplexities — the raw cost of
-> truncation. The paper notes healing recovers most of the gap.
+>
+> The paper's **"healing"** (brief retraining) stage is available in per-layer
+> mode via `--heal` (see below). Without it, reported perplexities are
+> pre-healing — the raw cost of truncation.
 
 ```bash
 # 12 log-spaced bond dimensions on SmolLM2-135M
@@ -354,6 +355,38 @@ shown here; values are produced by the run):
 
 Perplexity should fall monotonically toward the baseline as χ grows, reaching it
 once χ is large enough that the MPO is lossless.
+
+## Healing: recover accuracy by retraining the compressed layer
+
+`--heal` (per-layer mode) adds the paper's healing step. After a layer is
+truncated to its MPO, that layer's **two MPO tensors are briefly retrained**
+(Adam) to minimise the language-model loss, while **every other weight in the
+model stays frozen**. The layer therefore stays compressed — its parameter count
+is unchanged; only the low-rank factors move — and the run records the healed
+perplexity next to the raw one.
+
+```bash
+python compactify.py --mode per-layer --preset standard --heal \
+    --heal-steps 40 --heal-lr 1e-3 --heal-tokens 16384 --heal-split train \
+    --device cuda --ppl-batch-size 16
+```
+
+- Healing trains on a **disjoint split** (`--heal-split`, default `train`) so the
+  healed perplexity is never measured on the healing tokens.
+- Requires the default 2-site MPO (`--mpo-sites 2`) so the truncation factors
+  cleanly into the two trainable tensors `A @ B`.
+- Extra CSV columns: `perplexity_healed`, `ppl_ratio_healed`,
+  `heal_recovered_frac` (fraction of the truncation-induced perplexity increase
+  recovered, in [0, 1]), `heal_steps`, `heal_final_loss`, `heal_seconds`.
+- The per-layer plot overlays the healed curve as a dashed line (triangles) on
+  top of the raw (solid) curve, so the recovery is visible per layer.
+- Checkpointing is heal-aware: re-running with `--heal` fills in the healed
+  columns for points a prior no-heal run left blank (it does not re-evaluate
+  points already healed).
+
+**Cost:** healing runs a short training loop (forward + backward) per (layer, χ)
+point, so it is much heavier than the raw probe — use a GPU, keep `--heal-steps`
+modest, and profile a subset (`--profile-depths` / `--layer-types`) first.
 
 ## Use as a library
 
