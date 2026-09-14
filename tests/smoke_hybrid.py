@@ -178,7 +178,7 @@ hcfg = H.HybridConfig(
     model_id="tiny-gpt2", device="cpu", dtype="float32",
     include_pattern=r"h\.\d+\.(attn|mlp)\.", exclude_pattern=r"(wte|wpe|lm_head|ln|bias)",
     chi_min=2, chi_max=16, num_chi=3, num_depths=1,
-    circuit_depths=[0, 2], gate_sizes=[2, 0], disentangle_sweeps=6,
+    circuit_depths=[0, 2], gate_sizes=[1, 2], disentangle_sweeps=6,
     max_length=64, stride=64, per_layer_stride=64,
     per_layer_eval_tokens=256, ppl_batch_size=4,
     results_dir=SCRATCH, make_plots=False,
@@ -263,5 +263,37 @@ try:
     print(f"  figures: {sorted(p.name for p in out.glob('*.png'))}")
 except Exception as exc:                            # noqa: BLE001
     print(f"  (plots skipped: {exc})")
+
+# --------------------------------------------------------------------------- #
+# 6. Two-qubit-gate restriction and the paper-layer CLI
+# --------------------------------------------------------------------------- #
+print("\n=== 6. k<=2 restriction and the paper-layer CLI ===")
+from qllm.hybrid_sweep import MAX_GATE_SIZE, validate_gate_sizes
+
+assert validate_gate_sizes([2]) == [2] and validate_gate_sizes([1, 2]) == [1, 2]
+for bad in ([0], [3], [2, 4]):
+    try:
+        validate_gate_sizes(bad)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(f"gate sizes {bad} should have been rejected")
+print(f"  gate sizes capped at k = {MAX_GATE_SIZE}; k=0 and k>2 rejected")
+
+from qllm.paper_layer_cli import main as paper_main
+
+shutil.rmtree(SCRATCH + "-paper", ignore_errors=True)
+rc = paper_main([
+    "tiny-gpt2", "--block", "0", "--layer-type", "c_proj",
+    "--circuit-depths", "0", "1", "2", "--chi", "1", "2", "4",
+    "--per-layer-eval-tokens", "256", "--max-length", "64",
+    "--ppl-batch-size", "4", "--budgets", "1.01", "--q-weights", "0", "1",
+    "--results-dir", SCRATCH + "-paper", "--no-plots",
+])
+assert rc == 0, f"paper-layer CLI returned {rc}"
+# It must refuse a gate size the build does not allow.
+rc_bad = paper_main(["tiny-gpt2", "--gate-sizes", "4"])
+assert rc_bad == 2, "paper-layer CLI should reject k>2"
+print("  paper-layer CLI ran and rejected k>2")
 
 print("\nALL HYBRID SMOKE STAGES PASSED")

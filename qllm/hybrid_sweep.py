@@ -56,6 +56,29 @@ from .compactifai_sweep import (
 from .disentangler import disentangle, hybrid_weight, n_qubits_for
 from .layer_analysis import parse_layer_info
 
+# The circuits are restricted to at most two-qubit gates. This is the
+# hardware-realistic regime -- the paper runs only its two-qubit-gate
+# disentanglers on a real QPU (its "ku = kv = 2" configuration), transpiling
+# wider gates is what blows up the physical depth -- and it is where the
+# quantum parameter count Q ~ 4^k per gate stays affordable against the layer.
+MAX_GATE_SIZE = 2
+
+
+def validate_gate_sizes(gate_sizes) -> list[int]:
+    """Keep the requested gate sizes, rejecting anything wider than two qubits.
+
+    ``k = 0`` (one gate spanning the whole register) and ``k > 2`` are refused:
+    both leave the two-qubit-gate regime this build is restricted to.
+    """
+    sizes = sorted({int(k) for k in (gate_sizes or [MAX_GATE_SIZE])})
+    bad = [k for k in sizes if k < 1 or k > MAX_GATE_SIZE]
+    if bad:
+        raise ValueError(
+            f"gate size(s) {bad} are outside the allowed 1..{MAX_GATE_SIZE} "
+            f"qubits; this build considers only k <= {MAX_GATE_SIZE} "
+            f"(two-qubit gates). Drop k=0 (whole register) and k>2.")
+    return sizes
+
 
 @dataclass
 class HybridConfig(CompactifaiConfig):
@@ -173,14 +196,12 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
 
     depths = sorted({int(d) for d in (config.circuit_depths or default_depths())
                      if d >= 0})
-    # k = 0 is the paper's widest case: one gate spanning the whole register,
-    # resolved per layer since the register size follows the layer's shape.
-    gate_sizes = sorted({int(k) for k in (config.gate_sizes or [2]) if k >= 0})
+    gate_sizes = validate_gate_sizes(config.gate_sizes)
     types_present = sorted({parse_layer_info(n)[0] for n, _ in layers})
     print(f"\nHybrid plan: {len(keep)} of {len(available)} decoder blocks {keep}")
     print(f"             {len(types_present)} layer types {types_present}")
     print(f"             circuit depths D = {depths}, gate sizes k = "
-          + ", ".join("full register" if k == 0 else str(k) for k in gate_sizes))
+          + ", ".join(str(k) for k in gate_sizes) + " qubit(s)")
     print(f"             disentangling target chi = {config.disentangle_target_chi}, "
           f"Q counted as gate {config.quantum_param_counting}")
 

@@ -5,11 +5,8 @@ Examples
     # Both surfaces for a representative subset of layers
     python hybridize.py --preset standard
 
-    # The paper's configuration: one full-register gate per side, one layer
-    python hybridize.py --gate-sizes 0 --circuit-depths 0 1 --layer-types v_proj
-
-    # Sweep the circuit ansatz: narrow brickwalls through to the widest gate
-    python hybridize.py --gate-sizes 2 4 0 --circuit-depths 0 1 2 4
+    # Two-qubit brickwalls of growing depth on one layer type
+    python hybridize.py --gate-sizes 2 --circuit-depths 0 1 2 4 8 --layer-types v_proj
 
     # Cheap NISQ-style circuits: two-qubit brickwalls of growing depth
     python hybridize.py --gate-sizes 2 --circuit-depths 0 1 2 4 8 --restarts 3
@@ -30,7 +27,13 @@ from .hybrid_planner import (
     print_plan,
     shapes_from_model,
 )
-from .hybrid_sweep import HybridConfig, default_depths, hybrid_csv_path, run_hybrid_sweep
+from .hybrid_sweep import (
+    HybridConfig,
+    default_depths,
+    hybrid_csv_path,
+    run_hybrid_sweep,
+    validate_gate_sizes,
+)
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -64,10 +67,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                              "D=0 keeps the circuits at identity and measures "
                              "the qubit-padding overhead on its own.")
     parser.add_argument("--gate-sizes", type=int, nargs="+", default=[2],
-                        help="Qubits per gate k to try (default: 2). Use 0 for "
-                             "one gate spanning the whole register -- the "
-                             "paper's widest case, which disentangles in a "
-                             "single layer but carries a huge Q(D).")
+                        help="Qubits per gate k to try (default: 2). This build "
+                             "considers only two-qubit gates, so k must be 1 or "
+                             "2 -- the hardware-realistic regime, and the one "
+                             "where Q(D) ~ 4^k per gate stays affordable.")
     parser.add_argument("--disentangle-target-chi", type=int, default=1,
                         help="Bond dimension the circuits are optimized to "
                              "squeeze the layer into (the paper uses 1).")
@@ -167,6 +170,11 @@ def _run_plan(args, shapes) -> int:
 
 def main(argv=None) -> int:
     args = apply_preset(parse_args(argv))
+    try:
+        args.gate_sizes = validate_gate_sizes(args.gate_sizes)
+    except ValueError as exc:
+        print(f"error: {exc}")
+        return 2
     if args.threads:
         import torch
         torch.set_num_threads(args.threads)

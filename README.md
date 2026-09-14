@@ -458,7 +458,7 @@ way to `chi' = 1`.
 | ingredient | how it is implemented here |
 | --- | --- |
 | **qubit embedding** | each index is zero-padded to `2^ceil(log2 d)` (the paper's `(576, 192) -> (10, 8)` qubits). The padding is exact but enlarges the residual MPO, so it is a real cost -- see `D = 0` below |
-| **circuit ansatz** | brickwall of real orthogonal `k`-qubit gates, depth `D`; `k = 0` means one gate spanning the whole register (the paper's widest case, which disentangles at `L = 1`) |
+| **circuit ansatz** | brickwall of real orthogonal `k`-qubit gates, depth `D`. **This build considers only `k <= 2`** (`--gate-sizes 1 2`): the hardware-realistic regime -- the paper runs only its two-qubit-gate disentanglers on a real QPU, and transpiling wider gates is what blows up the physical depth -- and the one where `Q ~ 4^k` per gate stays affordable. Depth `D` is the lever that is swept |
 | **optimization** | the paper's Appendix A: each gate is updated from its environment tensor, `E = P S Q -> g <- P Q`, sweeping both circuits until converged |
 | **objective** | `min ||U^T W V - T_chi(U^T W V)||`. The target is re-truncated each iteration, so the alternation is **monotone** in the error the compressed layer actually incurs. `--disentangle-target fixed` freezes it at the original's truncation instead, which is the literal objective behind the paper's Eq. (4) accuracy |
 | **`Q(D, k)`** | independent gate angles, `dim O(2^k) = 2^(k-1)(2^k - 1)` per gate (`--quantum-param-counting entries` counts `4^k` matrix entries instead, the right figure if a gate is stored as a dense classical tensor) |
@@ -480,37 +480,39 @@ scored: `C_pad(chi') + w Q(D, k) < C(chi)`. `--shapes` answers that offline.
 ```bash
 # SmolLM2-135M's actual layer shapes, against the dense layer
 python hybridize.py --shapes v_proj:576x192 q_proj:576x576 up_proj:1536x576 \
-    --gate-sizes 2 4 6 8 0 --circuit-depths 1 4
+    --gate-sizes 2 --circuit-depths 1 2 4 8
 
 # Against a realistic classical operating point instead
-python hybridize.py --shapes v_proj:576x192 --gate-sizes 2 4 6 8 0 \
+python hybridize.py --shapes v_proj:576x192 --gate-sizes 2 \
     --circuit-depths 1 4 --reference-chi 32 --q-weight 1
 ```
 
 It prints, per `(layer, k, D)`, the circuits' surcharge expressed in bond
 dimensions, the largest `chi'` still affordable, and a **VETO** when not even
-`chi' = 1` fits. `--dry-run` does the same from a real model's shapes.
+`chi' = 1` fits. `--dry-run` does the same from a real model's shapes. (The
+planner will accept `k = 0` and wider gates for a *what-if* comparison, but the
+measured sweep below is restricted to `k <= 2`.)
 
 This matters because the two levers pull against each other: gate size is what
 disentangles (the paper's smallest gates barely reduce the entanglement, its
-widest ones disentangle at `L = 1`), but `Q` grows as `4^k` per gate. For
-SmolLM2-135M at `w = 1`, a register-wide gate carries 0.5-2.6 M parameters
-against layers of 0.1-0.9 M -- vetoed outright -- which is the paper's own
-observation that as circuits the disentanglers "carry at least as many trainable
-parameters as `W`", counted as the quantum resource rather than as stored
-weights.
+widest ones disentangle at `L = 1`), but `Q` grows as `4^k` per gate -- for
+SmolLM2-135M a register-wide gate carries 0.5-2.6 M parameters against layers of
+0.1-0.9 M, the paper's own observation that as circuits the disentanglers "carry
+at least as many trainable parameters as `W`". Capping at `k <= 2` keeps `Q`
+small (36-66 parameters for these registers), so with two-qubit gates the useful
+lever is the brickwall **depth** `D`.
 
 ### Measure both surfaces
 
 ```bash
-# Both curves for a representative subset of layers
-python hybridize.py --preset standard --gate-sizes 2 4 --circuit-depths 0 1 2 4
+# Both curves for a representative subset of layers, depth-swept at k=2
+python hybridize.py --preset standard --gate-sizes 2 --circuit-depths 0 1 2 4 8
 
-# The paper's configuration on one layer type
-python hybridize.py --gate-sizes 0 --circuit-depths 0 1 --layer-types v_proj
+# One layer type only
+python hybridize.py --gate-sizes 2 --circuit-depths 0 1 2 4 --layer-types v_proj
 
 # Best of several circuit initializations (the optimization is not convex)
-python hybridize.py --gate-sizes 4 --circuit-depths 1 2 4 --restarts 3
+python hybridize.py --gate-sizes 2 --circuit-depths 1 2 4 --restarts 3
 ```
 
 Output is `results/llms/<model>/compactifai/hybrid_per_layer.csv`, one row per
@@ -579,6 +581,37 @@ A low `M*/N*` needs all three to line up: little padding waste, a circuit wide
 enough to actually disentangle, and a price at which its angles are cheaper than
 the bond dimensions they save.
 
+### The paper's layer, in one command
+
+`paper_layer.py` (module `qllm.paper_layer_cli`) wraps the whole flow for the
+exact layer of arXiv:2410.17397v2 -- the `(576, 192)` self-attention projection
+of block 10 of a compressed SmolLM2 -- with two-qubit gates. It runs the sweep on
+that one layer and prints `M*/N*` directly, alongside the paper's own reported
+figures (its Table I, which uses the full 10q/8q disentangler) for comparison.
+
+```bash
+# Defaults to HuggingFaceTB/SmolLM2-135M, block 10, v_proj (the (576,192) matrix)
+python paper_layer.py
+
+# Faster probe on a GPU; sweep several budgets and quantum-parameter prices
+python paper_layer.py --device cuda --ppl-batch-size 16 \
+    --budgets 1.001 1.003 1.01 --q-weights 0 0.01 1
+
+# The other (576,192) projection, or a different block
+python paper_layer.py --layer-type k_proj --block 10
+```
+
+For each budget `B` and price `w` it reports `N*` (`chi`), `M*` (`chi'`, `D`),
+and `M*/N*`, plus the break-even price `w*`. `B = 1.003` is the paper's headline
+figure for this layer (its disentangler holds the perplexity to `+0.3%`), so it
+is a natural budget to solve at. Because this build's gates are `k <= 2`, the
+disentangling is weaker than the paper's wide-gate circuits, and the report makes
+that gap explicit: it prints the paper's `chi' = 1 -> 36 parameters at +0.26%`
+next to what two-qubit gates actually achieve on the same layer.
+
+This CLI needs to load the model (it measures perplexity), so it requires access
+to the Hugging Face model files.
+
 ## Use as a library
 
 ```python
@@ -623,6 +656,7 @@ qllm/
   hybrid_sweep.py      # PPL(chi) and PPL(chi', D, k) on the same probe tokens
   hybrid_planner.py    # offline verdict on (k, D) from parameter counts alone
   hybrid_cli.py        # hybrid-sweep CLI
+  paper_layer_cli.py   # M*/N* for the (576,192) layer of arXiv:2410.17397, k<=2
   budget_frontier.py   # N*, M*, M*/N*, break-even price, Pareto front
   budget_plots.py      # figures for the budget comparison
   budget_cli.py        # budget-analysis CLI
@@ -631,6 +665,7 @@ benchmark_llm.py       # thin entry point for the benchmark CLI
 analyze_layers.py      # thin entry point for the layer-analysis CLI
 compactify.py          # thin entry point for the CompactifAI sweep
 hybridize.py           # thin entry point for the hybrid PQC+TN sweep
+paper_layer.py         # thin entry point for the arXiv:2410.17397 layer
 analyze_budget.py      # thin entry point for the budget comparison
 analyze_compressibility.py  # thin entry point for the metrics correlation
 tests/                 # offline smoke tests (real torch, stubbed network I/O)

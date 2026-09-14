@@ -31,7 +31,12 @@ from .disentangler import (
     hybrid_weight,
     quantum_param_count,
 )
-from .hybrid_sweep import HybridConfig, run_hybrid_sweep
+from .hybrid_sweep import (
+    HybridConfig,
+    MAX_GATE_SIZE,
+    run_hybrid_sweep,
+    validate_gate_sizes,
+)
 from .budget_frontier import (
     LayerSolution,
     load_curves,
@@ -60,7 +65,9 @@ __all__ = [
     "hybrid_weight",
     "quantum_param_count",
     "HybridConfig",
+    "MAX_GATE_SIZE",
     "run_hybrid_sweep",
+    "validate_gate_sizes",
     "LayerSolution",
     "load_curves",
     "pareto_front",
