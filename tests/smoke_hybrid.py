@@ -432,6 +432,15 @@ assert all(r["target_chi"] == "1" and r["tensorization"] == "qubit" for r in sca
 assert all(r["ppl_ratio"] in ("", "nan") for r in scan), "no perplexity without a model"
 print(f"  accuracy(Eq.4) rises with L for k=2: {accs[0]:.4f} (L=1) -> {accs[-1]:.4f} "
       f"(L={scan[-1]['n_layers']})")
+# M* = C(chi') + Q(D): classical part constant, total grows with L (more layers)
+assert all(int(r["total_params"]) == int(r["classical_params"]) + int(r["quantum_params"])
+           for r in scan), "total_params must equal classical + quantum"
+for gk in {int(r["gate_size"]) for r in scan}:
+    ks = sorted((r for r in scan if int(r["gate_size"]) == gk), key=lambda r: int(r["n_layers"]))
+    assert len({int(r["classical_params"]) for r in ks}) == 1, "C(chi') is fixed across L"
+    assert int(ks[-1]["total_params"]) > int(ks[0]["total_params"]), "M* grows with L"
+m_lo, m_hi = int(scan[0]["total_params"]), int(sorted(scan, key=lambda r: int(r["total_params"]))[-1]["total_params"])
+print(f"  M* = C(chi')+Q(D) recorded and grows with L: {m_lo} -> {m_hi} params")
 # k>2 refused, and it runs offline from a synthetic shape (no model needed)
 assert scaling_main(["--shape", "8x8", "--gate-sizes", "4"]) == 2
 print("  runs offline on a synthetic shape; rejects k>2")

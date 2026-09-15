@@ -47,9 +47,17 @@ from pathlib import Path
 
 import torch
 
-from .disentangler import disentangle, hybrid_weight, n_qubits_for
+from .compactifai import mpo_param_count
+from .disentangler import (
+    disentangle,
+    hybrid_weight,
+    n_qubits_for,
+    pad_to_qubits,
+    quantum_param_count,
+)
 from .hybrid_sweep import MAX_GATE_SIZE, validate_gate_sizes
 from .layer_analysis import parse_layer_info
+from .qubit_mpo import make_plan
 
 DEFAULT_MODEL = "HuggingFaceTB/SmolLM2-135M"
 
@@ -116,6 +124,7 @@ ROW_FIELDS = ["gate_size", "n_layers", "d_out", "d_in", "n_out_qubits",
               "n_in_qubits", "target_chi", "disentangle_target",
               "tensorization", "optimizer",
               "accuracy", "entropy", "retained", "retained_classical",
+              "classical_params", "quantum_params", "total_params",
               "perplexity", "ppl_baseline", "ppl_ratio",
               "sweeps_run", "seconds", "source"]
 
@@ -239,7 +248,10 @@ def plot_scaling(rows: list[dict], out_dir: Path, target_chi: int) -> None:
     ks = sorted(by_k)
     cmap = plt.get_cmap("viridis")
 
-    # A third panel (perplexity ratio vs. L) is added when perplexity was measured.
+    # Beyond accuracy + entropy, an M* panel (total parameters vs. L) is added
+    # whenever it was recorded, and a perplexity-ratio panel when perplexity was
+    # measured (model path only).
+    has_m = _finite(rows, "total_params")
     has_ppl = _finite(rows, "ppl_ratio")
     baseline = None
     if has_ppl:
@@ -249,10 +261,14 @@ def plot_scaling(rows: list[dict], out_dir: Path, target_chi: int) -> None:
             except (KeyError, TypeError, ValueError):
                 pass
 
-    n_panels = 3 if has_ppl else 2
+    n_panels = 2 + int(has_m) + int(has_ppl)
     fig, axes = plt.subplots(n_panels, 1, figsize=(7, 4 * n_panels), sharex=True)
+    axes = list(axes)
     ax_a, ax_s = axes[0], axes[1]
-    ax_p = axes[2] if has_ppl else None
+    idx = 2
+    ax_m = axes[idx] if has_m else None
+    idx += int(has_m)
+    ax_p = axes[idx] if has_ppl else None
 
     def _pts(k, key):
         pts = sorted(by_k[k], key=lambda r: int(r["n_layers"]))
@@ -265,6 +281,8 @@ def plot_scaling(rows: list[dict], out_dir: Path, target_chi: int) -> None:
         lab = f"{k}q gates"
         ax_a.plot(*_pts(k, "accuracy"), marker="o", color=col, label=lab)
         ax_s.plot(*_pts(k, "entropy"), marker="s", color=col, label=lab)
+        if ax_m is not None:
+            ax_m.plot(*_pts(k, "total_params"), marker="D", color=col, label=lab)
         if ax_p is not None:
             ax_p.plot(*_pts(k, "ppl_ratio"), marker="^", color=col, label=lab)
 
@@ -273,6 +291,14 @@ def plot_scaling(rows: list[dict], out_dir: Path, target_chi: int) -> None:
                    f"(target $\\chi'$ = {target_chi})")
     ax_s.set_ylabel("mean bond entropy (nats)")
     panels = [ax_a, ax_s]
+    if ax_m is not None:
+        cvals = [float(r["classical_params"]) for r in rows
+                 if _is_finite(r.get("classical_params"))]
+        if cvals:
+            ax_m.axhline(cvals[0], ls=":", color="gray", lw=1.2,
+                         label=f"classical $C(\\chi'={target_chi})$ only")
+        ax_m.set_ylabel(f"total parameters $M^*$\n$C(\\chi'={target_chi}) + Q(D)$")
+        panels.append(ax_m)
     if ax_p is not None:
         if baseline is not None:
             ax_p.axhline(1.0, ls="--", color="crimson", lw=1.2, label="dense baseline")
@@ -336,6 +362,21 @@ def main(argv=None) -> int:
           f"L = {layers} | target chi' = {args.target_chi} | "
           f"{args.disentangle_target} target | {args.optimizer} | {args.tensorization} MPO")
 
+    # M* = C(chi') + Q(D): the stored MPO parameters (constant across L, since
+    # chi' and the tensorization geometry are fixed) plus the circuits' Q(D),
+    # which grows with the brickwall depth. Both are pure functions of the layer
+    # geometry, so they are the same numbers the disentangler records -- computed
+    # here directly so every point (including resumed ones) gets M* without a
+    # re-optimization.
+    _ref_plan = make_plan(pad_to_qubits(weight)[0], args.tensorization, 2,
+                          svd_cache=False, align="msb")  # disentangle()'s default
+    classical_params = mpo_param_count(_ref_plan.out_dims, _ref_plan.in_dims,
+                                       args.target_chi)
+
+    def _params_for(k: int, L: int) -> tuple[int, int, int]:
+        q = quantum_param_count(n_out, n_in, k, L, "manifold")
+        return classical_params, q, classical_params + q
+
     def evaluate():
         from .benchmark import perplexity_over_ids
         ppl, _tokens, _secs = perplexity_over_ids(
@@ -383,6 +424,9 @@ def main(argv=None) -> int:
             continue
         if not measure_ppl or _is_finite(r.get("ppl_ratio")):
             r["disentangle_target"] = r.get("disentangle_target") or args.disentangle_target
+            if not _is_finite(r.get("total_params")):    # backfill pre-M* rows
+                cp, qp, tp = _params_for(rk, rl)
+                r["classical_params"], r["quantum_params"], r["total_params"] = cp, qp, tp
             seeded.append(r)
             done_points.add((rk, rl))
 
@@ -424,7 +468,7 @@ def main(argv=None) -> int:
     done = 0
     ppl_head = f"{'ppl':>9} {'x base':>7} " if measure_ppl else ""
     print(f"\n{'k':>3} {'L':>4} {'accuracy':>9} {'entropy':>9} {'retained':>9} "
-          f"{ppl_head}{'sec':>6}")
+          f"{'M*':>9} {ppl_head}{'sec':>6}")
     for k in gate_sizes:
         for L in layers:
             if (k, L) in done_points:
@@ -446,6 +490,7 @@ def main(argv=None) -> int:
                 with torch.no_grad():
                     param.copy_(orig.to(dtype=param.dtype, device=param.device))
             ratio = ppl / baseline if measure_ppl and baseline else float("nan")
+            cparams, qparams, tparams = _params_for(k, L)
             rows.append(dict(
                 gate_size=k, n_layers=L, d_out=d_out, d_in=d_in,
                 n_out_qubits=n_out, n_in_qubits=n_in, target_chi=args.target_chi,
@@ -454,6 +499,8 @@ def main(argv=None) -> int:
                 accuracy=round(res.accuracy, 6), entropy=round(res.entropy, 6),
                 retained=round(res.retained, 6),
                 retained_classical=round(res.retained_classical, 6),
+                classical_params=cparams, quantum_params=qparams,
+                total_params=tparams,
                 perplexity=round(ppl, 4) if measure_ppl else "",
                 ppl_baseline=round(baseline, 4) if measure_ppl else "",
                 ppl_ratio=round(ratio, 6) if measure_ppl else "",
@@ -462,7 +509,7 @@ def main(argv=None) -> int:
             done += 1
             ppl_str = f"{ppl:>9.4f} {ratio:>7.4f} " if measure_ppl else ""
             print(f"{k:>3} {L:>4} {res.accuracy:>9.4f} {res.entropy:>9.4f} "
-                  f"{res.retained:>9.4f} {ppl_str}{res.seconds:>6.1f}")
+                  f"{res.retained:>9.4f} {tparams:>9} {ppl_str}{res.seconds:>6.1f}")
             _write(rows)                                # checkpoint after each point
 
     if not existing and not rows:                      # nothing done, nothing cached
@@ -486,6 +533,9 @@ def main(argv=None) -> int:
             trend = "increases" if hi_a > lo_a else "flat/decreases"
             line = (f"  k={k}: accuracy {lo_a:.4f} (L={lo['n_layers']}) -> "
                     f"{hi_a:.4f} (L={hi['n_layers']})  [{trend} with L]")
+            if _is_finite(lo.get("total_params")) and _is_finite(hi.get("total_params")):
+                line += (f";  M* {int(float(lo['total_params']))} -> "
+                         f"{int(float(hi['total_params']))} params")
             if measure_ppl and _is_finite(lo.get("ppl_ratio")) and _is_finite(hi.get("ppl_ratio")):
                 line += (f";  perplexity/base {float(lo['ppl_ratio']):.4f} -> "
                          f"{float(hi['ppl_ratio']):.4f}")
