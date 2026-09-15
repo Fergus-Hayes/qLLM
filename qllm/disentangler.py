@@ -67,7 +67,7 @@ import numpy as np
 import pennylane as qml
 import torch
 
-from .compactifai import MPOPlan, mpo_param_count
+from .compactifai import MPOPlan, _interleave_perm, mpo_param_count
 from .qubit_mpo import make_plan, plan_bond_entropy, plan_compress
 
 
@@ -323,6 +323,7 @@ class DisentangleResult:
     retained_classical: float              # ||T_chi(W_pad)|| / ||W|| (no circuits)
     sweeps_run: int
     seconds: float
+    optimizer: str = "explicit"            # 'explicit' (env-SVD) or 'gradient'
     history: list[float] = field(default_factory=list)
 
     @property
@@ -352,12 +353,150 @@ def bond_entropy(matrix: torch.Tensor, plan: MPOPlan) -> float:
     return float(-(p * p.log()).sum())
 
 
+# --------------------------------------------------------------------------- #
+# Gradient training: optimize the gate angles directly (the "implicit" scheme)
+# --------------------------------------------------------------------------- #
+# A real orthogonal ``k``-qubit gate is parameterized by its Lie-algebra angles:
+# ``g(theta) = expm(A(theta))`` with ``A`` skew-symmetric, ``theta`` filling its
+# strict upper triangle. That is ``dim so(2^k) = 2^(k-1)(2^k-1)`` angles per gate
+# -- exactly ``quantum_param_count`` -- and ``g`` is orthogonal for any theta, so
+# unconstrained gradient descent on ``theta`` stays on the gate manifold.
+def _skew(theta: torch.Tensor, dim: int) -> torch.Tensor:
+    idx = torch.triu_indices(dim, dim, offset=1)
+    a = theta.new_zeros(dim, dim)
+    a[idx[0], idx[1]] = theta
+    return a - a.T
+
+
+def _gate_from_angles(theta: torch.Tensor, k: int) -> torch.Tensor:
+    """Orthogonal ``2^k x 2^k`` gate ``expm(skew(theta))`` -- differentiable in theta."""
+    return torch.linalg.matrix_exp(_skew(theta, 1 << k))
+
+
+def _register_unitary_torch(gate_mats: list[torch.Tensor],
+                            positions: list[tuple[int, int]], n: int) -> torch.Tensor:
+    """Differentiable register unitary from gate matrices (torch, for autograd).
+
+    Mirrors :func:`circuit_unitary` but built in torch so gradients flow to the
+    gate angles; the trained gates are re-materialized as PennyLane ops afterward.
+    """
+    u = torch.eye(1 << n, dtype=gate_mats[0].dtype if gate_mats else torch.float32)
+    for (start, k), g in zip(positions, gate_mats):
+        u = apply_gate(u, g, start, k, n)
+    return u
+
+
+def disentangle_loss(current: torch.Tensor, out_dims: list[int], in_dims: list[int],
+                     n_sites: int, chi: int) -> torch.Tensor:
+    """Differentiable disentangling objective: mean discarded weight over MPO bonds.
+
+    Interleaves ``current`` into the MPO chain of the tensorization and, at every
+    bond cut, measures the Frobenius weight a rank-``chi`` truncation discards
+    (``1 - sum(top-chi sigma^2)/sum(sigma^2)``, from ``svdvals`` so it is
+    differentiable). Zero means every bond already fits in ``chi`` -- the
+    product-operator target of the paper. This is the loss gradient descent
+    minimizes; it matches the error the explicit sweep drives down.
+    """
+    perm = _interleave_perm(n_sites)
+    chain = current.reshape(*out_dims, *in_dims).permute(*perm).contiguous()
+    site = [out_dims[k] * in_dims[k] for k in range(n_sites)]
+    losses = []
+    for cut in range(1, n_sites):
+        left = math.prod(site[:cut])
+        mat = chain.reshape(left, -1)
+        s2 = torch.linalg.svdvals(mat) ** 2
+        total = s2.sum().clamp_min(1e-30)
+        losses.append(1.0 - s2[:chi].sum() / total)
+    if not losses:
+        return current.new_zeros(())
+    return torch.stack(losses).mean()
+
+
+def _train_gradient(padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
+                    steps, lr, init, seed, log):
+    """Optimize the gate angles by Adam to minimize :func:`disentangle_loss`.
+
+    Returns ``(u_gates, v_gates, steps_run, history)`` with the trained gates as
+    :class:`Gate` objects (PennyLane ``QubitUnitary`` under the hood).
+    """
+    pos_u = gate_positions(n_out, gate_size, depth)
+    pos_v = gate_positions(n_in, gate_size, depth)
+    gen = torch.Generator().manual_seed(seed)
+
+    def _init(positions):
+        out = []
+        for _s, k in positions:
+            m = (1 << k) * ((1 << k) - 1) // 2
+            if init == "random":
+                out.append((0.1 * torch.randn(m, generator=gen)).requires_grad_(True))
+            else:
+                out.append(torch.zeros(m, requires_grad=True))  # identity gates
+        return out
+
+    theta_u, theta_v = _init(pos_u), _init(pos_v)
+    params = theta_u + theta_v
+    history: list[float] = []
+    if not params:                                   # depth 0: no gates to train
+        return [], [], 0, history
+
+    out_dims, in_dims, n_sites = plan_pad.out_dims, plan_pad.in_dims, plan_pad.n_sites
+    opt = torch.optim.Adam(params, lr=lr)
+    for step in range(max(1, steps)):
+        opt.zero_grad()
+        gu = [_gate_from_angles(t, k) for t, (_s, k) in zip(theta_u, pos_u)]
+        gv = [_gate_from_angles(t, k) for t, (_s, k) in zip(theta_v, pos_v)]
+        u = _register_unitary_torch(gu, pos_u, n_out)
+        v = _register_unitary_torch(gv, pos_v, n_in)
+        current = u.transpose(0, 1) @ padded @ v
+        loss = disentangle_loss(current, out_dims, in_dims, n_sites, target_chi)
+        loss.backward()
+        opt.step()
+        history.append(1.0 - float(loss.detach()))
+        if log and (step == 0 or (step + 1) % max(1, steps // 5) == 0):
+            print(f"      gd step {step + 1:>4}/{steps}  loss={float(loss):.6f}")
+
+    with torch.no_grad():
+        u_gates = [Gate(s, k, _gate_from_angles(t, k).detach())
+                   for t, (s, k) in zip(theta_u, pos_u)]
+        v_gates = [Gate(s, k, _gate_from_angles(t, k).detach())
+                   for t, (s, k) in zip(theta_v, pos_v)]
+    return u_gates, v_gates, max(1, steps), history
+
+
+def _build_result(weight, padded, u_gates, v_gates, n_out, n_in, gate_size, depth,
+                  target_chi, plan_fn, param_counting, retained_classical, target_ref,
+                  ref_norm, norm, sweeps_run, t0, history, optimizer) -> DisentangleResult:
+    """Assemble a :class:`DisentangleResult` from trained gates (shared by both schemes)."""
+    current = apply_right(v_gates,
+                          apply_circuit(u_gates, padded, n_out, transpose=True),
+                          n_in, transpose=True)
+    plan = plan_fn(current)
+    final_target, _ = plan_compress(current, plan, target_chi)
+    retained = float(torch.linalg.norm(final_target)) / norm if norm else 0.0
+    accuracy = (float((target_ref * current).sum()) / (norm * ref_norm)
+                if norm and ref_norm else float("nan"))
+    return DisentangleResult(
+        u_gates=u_gates, v_gates=v_gates, n_out_qubits=n_out, n_in_qubits=n_in,
+        gate_size=gate_size, depth=depth,
+        shape=(int(weight.shape[0]), int(weight.shape[1])),
+        padded_shape=(1 << n_out, 1 << n_in), plan=plan, operator=current,
+        quantum_params=quantum_param_count(n_out, n_in, gate_size, depth,
+                                           param_counting),
+        target_chi=target_chi, accuracy=accuracy,
+        entropy=plan_bond_entropy(current, plan), retained=retained,
+        retained_classical=retained_classical, sweeps_run=sweeps_run,
+        seconds=time.perf_counter() - t0, optimizer=optimizer,
+        history=list(history) + [retained],
+    )
+
+
 def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
                       target_chi: int = 1, n_sites: int = 2, sweeps: int = 12,
                       tol: float = 1e-6, init: str = "identity", seed: int = 0,
                       param_counting: str = "manifold",
                       target_mode: str = "adaptive", tensorization: str = "balanced",
-                      qubit_align: str = "msb",
+                      qubit_align: str = "msb", optimizer: str = "explicit",
+                      gd_steps: int = 200, gd_lr: float = 0.05,
                       log: bool = False) -> DisentangleResult:
     """Disentangle ``W`` into ``U MPO_new V^T`` with brickwall circuits of depth ``D``.
 
@@ -367,7 +506,7 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
     dimension for free -- which is how the hybrid sweep reuses one optimization
     across its whole chi' grid (the paper's Table I).
 
-    ``target_mode`` selects the objective:
+    ``target_mode`` selects the explicit objective:
 
     * ``adaptive`` (default) re-truncates the *current* disentangled operator at
       every iteration, which minimizes the quantity that actually decides the
@@ -375,13 +514,19 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
     * ``fixed`` freezes the target at ``T_chi(W_pad)``, the truncation of the
       original operator -- the literal objective behind the paper's Eq. (4)
       disentangling accuracy, kept for comparison with its figures.
+
+    ``optimizer`` selects the training scheme:
+
+    * ``explicit`` (default) -- the paper's environment / SVD sweep (Appendix A):
+      each gate is set to the polar factor of its environment, a closed-form
+      optimal step, alternating U/V sweeps to convergence.
+    * ``gradient`` -- optimize the gate angles directly by Adam on
+      :func:`disentangle_loss` (``gd_steps`` steps at ``gd_lr``). Same objective,
+      an implicit iterative solver instead of the closed-form update.
     """
     t0 = time.perf_counter()
     padded, n_out, n_in = pad_to_qubits(weight)
     norm = float(torch.linalg.norm(padded))
-    generator = torch.Generator().manual_seed(seed)
-    u_gates = build_circuit(n_out, gate_size, depth, init, generator)
-    v_gates = build_circuit(n_in, gate_size, depth, init, generator)
 
     def _plan(op):
         return make_plan(op, tensorization, n_sites, svd_cache=True, align=qubit_align)
@@ -392,6 +537,20 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
     retained_classical = float(torch.linalg.norm(trunc_pad)) / norm if norm else 0.0
     target_ref = trunc_pad                       # MPO_target of the paper's Eq. (4)
     ref_norm = float(torch.linalg.norm(target_ref))
+
+    if optimizer == "gradient":
+        u_gates, v_gates, steps_run, history = _train_gradient(
+            padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
+            gd_steps, gd_lr, init, seed, log)
+        return _build_result(
+            weight, padded, u_gates, v_gates, n_out, n_in, gate_size, depth,
+            target_chi, _plan, param_counting, retained_classical, target_ref,
+            ref_norm, norm, steps_run, t0, history, "gradient")
+
+    # --- explicit environment / SVD sweep (paper Appendix A) ---
+    generator = torch.Generator().manual_seed(seed)
+    u_gates = build_circuit(n_out, gate_size, depth, init, generator)
+    v_gates = build_circuit(n_in, gate_size, depth, init, generator)
 
     current = padded                             # U^T W V, starts at W (identity gates)
     history: list[float] = []
@@ -427,25 +586,10 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
             break                                # the gate sweeps have converged
         score = new_score
 
-    plan = _plan(current)
-    final_target, _ = plan_compress(current, plan, target_chi)
-    retained = float(torch.linalg.norm(final_target)) / norm if norm else 0.0
-    history.append(retained)
-    accuracy = (float((target_ref * current).sum()) / (norm * ref_norm)
-                if norm and ref_norm else float("nan"))
-
-    return DisentangleResult(
-        u_gates=u_gates, v_gates=v_gates, n_out_qubits=n_out, n_in_qubits=n_in,
-        gate_size=gate_size, depth=depth,
-        shape=(int(weight.shape[0]), int(weight.shape[1])),
-        padded_shape=(1 << n_out, 1 << n_in), plan=plan, operator=current,
-        quantum_params=quantum_param_count(n_out, n_in, gate_size, depth,
-                                           param_counting),
-        target_chi=target_chi, accuracy=accuracy,
-        entropy=plan_bond_entropy(current, plan), retained=retained,
-        retained_classical=retained_classical, sweeps_run=sweeps_run,
-        seconds=time.perf_counter() - t0, history=history,
-    )
+    return _build_result(
+        weight, padded, u_gates, v_gates, n_out, n_in, gate_size, depth,
+        target_chi, _plan, param_counting, retained_classical, target_ref,
+        ref_norm, norm, sweeps_run, t0, history, "explicit")
 
 
 def hybrid_weight(result: DisentangleResult, chi: int) -> tuple[torch.Tensor, int]:
@@ -475,25 +619,26 @@ def disentangle(weight: torch.Tensor, gate_size: int, depth: int,
                 tol: float = 1e-6, init: str = "identity", seed: int = 0,
                 param_counting: str = "manifold", target_mode: str = "adaptive",
                 tensorization: str = "balanced", qubit_align: str = "msb",
+                optimizer: str = "explicit", gd_steps: int = 200, gd_lr: float = 0.05,
                 restarts: int = 1, log: bool = False) -> DisentangleResult:
     """Disentangle ``W``, keeping the best of ``restarts`` initializations.
 
-    The alternating optimization is monotone but not convex, so the gates can
-    settle in different optima. ``restarts`` runs it again from Haar-random
-    circuits (one fresh seed each) and keeps whichever run retains the most
-    weight at the target bond dimension; ``restarts=1`` is a single run from
-    ``init``. Random starts usually edge out the identity start for wide gates,
-    while the identity start is the one that begins exactly at the classical
-    (padded) layer.
+    The optimization is not convex, so the gates can settle in different optima.
+    ``restarts`` runs it again from random initializations (one fresh seed each)
+    and keeps whichever run retains the most weight at the target bond dimension;
+    ``restarts=1`` is a single run from ``init``. ``optimizer`` picks the training
+    scheme: ``explicit`` (the paper's environment-SVD sweep, default) or
+    ``gradient`` (Adam on the gate angles); both minimize the same objective.
     """
-    best = _disentangle_once(weight, gate_size, depth, target_chi, n_sites,
-                             sweeps, tol, init, seed, param_counting,
-                             target_mode, tensorization, qubit_align, log)
+    def _run(this_init, this_seed):
+        return _disentangle_once(
+            weight, gate_size, depth, target_chi, n_sites, sweeps, tol, this_init,
+            this_seed, param_counting, target_mode, tensorization, qubit_align,
+            optimizer, gd_steps, gd_lr, log)
+
+    best = _run(init, seed)
     for extra in range(1, max(1, restarts)):
-        candidate = _disentangle_once(weight, gate_size, depth, target_chi,
-                                      n_sites, sweeps, tol, "random",
-                                      seed + extra, param_counting, target_mode,
-                                      tensorization, qubit_align, log)
+        candidate = _run("random", seed + extra)
         if candidate.retained > best.retained:
             best = candidate
     return best

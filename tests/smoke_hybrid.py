@@ -361,6 +361,41 @@ assert qrows and {r["method"] for r in qrows} == {"classical", "hybrid"}
 assert {r["tensorization"] for r in qrows} == {"qubit"}, "rows must record the geometry"
 print(f"  hybrid sweep ran in qubit mode: {len(qrows)} rows, both surfaces")
 
+# --- gradient ("implicit") training scheme, alongside the explicit env-SVD one
+Wg = (torch.randn(64, 32) @ torch.randn(32, 48) / 32 + 0.2 * torch.randn(64, 48))
+gexp = disentangle(Wg, gate_size=2, depth=2, target_chi=1, optimizer="explicit", sweeps=20)
+ggd = disentangle(Wg, gate_size=2, depth=2, target_chi=1, optimizer="gradient",
+                  gd_steps=200, gd_lr=0.05)
+assert gexp.optimizer == "explicit" and ggd.optimizer == "gradient"
+# gradient stays on the gate manifold (orthogonal gates) and is exact at full rank
+frg = full_rank_chi(ggd.plan.out_dims, ggd.plan.in_dims)
+assert rel(Wg, hybrid_weight(ggd, frg)[0]) < 1e-4, "gradient not exact at full rank"
+# both beat the circuit-free baseline (the loss went down)
+assert ggd.retained >= ggd.retained_classical - 1e-6
+assert gexp.retained >= gexp.retained_classical - 1e-6
+# the trained gates are still PennyLane ops
+assert all(isinstance(o, qml.QubitUnitary) for o in circuit_ops(ggd.u_gates))
+print(f"  gradient scheme: retained {ggd.retained_classical:.4f} -> {ggd.retained:.4f} "
+      f"(explicit -> {gexp.retained:.4f}); gates are QubitUnitary, exact at full rank")
+
+# a gradient sweep writes its own CSV (no mixing with the explicit run)
+shutil.rmtree(SCRATCH + "-gd", ignore_errors=True)
+gdcfg = H.HybridConfig(
+    model_id="tiny-gpt2", device="cpu", dtype="float32",
+    include_pattern=r"h\.\d+\.attn\.c_proj", exclude_pattern=r"(wte|wpe|lm_head|ln|bias)",
+    disentangle_optimizer="gradient", disentangle_gd_steps=40, disentangle_gd_lr=0.1,
+    chi_min=1, chi_max=8, num_chi=2, num_depths=1,
+    circuit_depths=[0, 1], gate_sizes=[2],
+    max_length=64, stride=64, per_layer_stride=64,
+    per_layer_eval_tokens=256, ppl_batch_size=4,
+    results_dir=SCRATCH + "-gd", make_plots=False)
+gdpath = H.run_hybrid_sweep(gdcfg)
+exppath = H.hybrid_csv_path(H.HybridConfig(model_id="tiny-gpt2", results_dir=SCRATCH + "-gd"))
+assert "gradient" in gdpath.name and gdpath != exppath, "optimizer must isolate the CSV"
+gdrows = H._read_rows(gdpath)
+assert {r["optimizer"] for r in gdrows if r["method"] == "hybrid"} == {"gradient"}
+print(f"  gradient sweep isolated in {gdpath.name}; hybrid rows tagged 'gradient'")
+
 # The two geometries must never share a checkpoint file (else one masks the
 # other's points and the solver mixes non-comparable C(chi)).
 from qllm.budget_frontier import filter_rows_by_tensorization, tensorizations_in

@@ -87,7 +87,10 @@ class HybridConfig(CompactifaiConfig):
     circuit_depths: list[int] | None = None    # D values (0 = no circuit)
     gate_sizes: list[int] | None = None        # qubits per gate k (0 = whole register)
     disentangle_target_chi: int = 1            # bond dimension the circuits aim at
-    disentangle_sweeps: int = 12
+    disentangle_optimizer: str = "explicit"    # 'explicit' (env-SVD) or 'gradient' (Adam)
+    disentangle_sweeps: int = 12               # explicit: max environment sweeps
+    disentangle_gd_steps: int = 200            # gradient: Adam steps
+    disentangle_gd_lr: float = 0.05            # gradient: Adam learning rate
     disentangle_tol: float = 1e-6
     disentangle_init: str = "identity"
     disentangle_target_mode: str = "adaptive"  # 'adaptive' or the paper's 'fixed'
@@ -109,6 +112,7 @@ class HybridRow:
     depth: int                 # decoder block index
     method: str                # 'classical' | 'hybrid'
     tensorization: str         # 'balanced' | 'qubit' -- the MPO geometry
+    optimizer: str             # 'explicit' | 'gradient' (classical rows: '-')
     chi: int                   # bond dimension (chi for classical, chi' for hybrid)
     circuit_depth: int         # D (-1 for classical rows)
     gate_size: int
@@ -137,8 +141,12 @@ class HybridRow:
 
 
 def hybrid_csv_path(config: HybridConfig) -> Path:
-    return compactifai_dir(config) / tensorized_name(
-        config.hybrid_csv_name, config.tensorization)
+    # Isolate each geometry AND training scheme in its own checkpoint file, so
+    # non-comparable rows never mix (C(chi) differs by geometry; the hybrid curve
+    # differs by optimizer).
+    name = tensorized_name(config.hybrid_csv_name, config.tensorization)
+    name = tensorized_name(name, config.disentangle_optimizer, default="explicit")
+    return compactifai_dir(config) / name
 
 
 def default_depths(max_depth: int = 8, count: int = 4) -> list[int]:
@@ -204,8 +212,12 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
     print(f"             {len(types_present)} layer types {types_present}")
     print(f"             circuit depths D = {depths}, gate sizes k = "
           + ", ".join(str(k) for k in gate_sizes) + " qubit(s)")
+    train = (f"gradient (Adam, {config.disentangle_gd_steps} steps @ "
+             f"{config.disentangle_gd_lr})" if config.disentangle_optimizer == "gradient"
+             else f"explicit (env-SVD, <= {config.disentangle_sweeps} sweeps)")
     print(f"             disentangling target chi = {config.disentangle_target_chi}, "
           f"Q counted as gate {config.quantum_param_counting}")
+    print(f"             training scheme = {train}")
 
     originals = {name: p.detach().to("cpu", copy=True) for name, p in layers}
 
@@ -321,7 +333,7 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
             timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
             model_id=config.model_id, param_name=name, layer_type=layer_type,
             depth=block, method="classical",
-            tensorization=config.tensorization, chi=chi, circuit_depth=-1,
+            tensorization=config.tensorization, optimizer="-", chi=chi, circuit_depth=-1,
             gate_size=0, rows=int(orig.shape[0]), cols=int(orig.shape[1]),
             padded_rows=int(orig.shape[0]), padded_cols=int(orig.shape[1]),
             n_out_qubits=0, n_in_qubits=0, params_original=plan.dense_params,
@@ -354,6 +366,8 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
             init=config.disentangle_init, seed=config.disentangle_seed,
             param_counting=config.quantum_param_counting,
             target_mode=config.disentangle_target_mode,
+            optimizer=config.disentangle_optimizer,
+            gd_steps=config.disentangle_gd_steps, gd_lr=config.disentangle_gd_lr,
             restarts=config.disentangle_restarts,
         )
         print(f"    {res.n_out_qubits}q x {res.n_in_qubits}q, Q(D)={res.quantum_params:,} "
@@ -376,7 +390,8 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
                 timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 model_id=config.model_id, param_name=name, layer_type=layer_type,
                 depth=block, method="hybrid",
-                tensorization=config.tensorization, chi=chi, circuit_depth=d,
+                tensorization=config.tensorization,
+                optimizer=config.disentangle_optimizer, chi=chi, circuit_depth=d,
                 gate_size=k_row,
                 rows=int(orig.shape[0]), cols=int(orig.shape[1]),
                 padded_rows=res.padded_shape[0], padded_cols=res.padded_shape[1],

@@ -459,7 +459,7 @@ way to `chi' = 1`.
 | --- | --- |
 | **qubit embedding** | each index is zero-padded to `2^ceil(log2 d)` (the paper's `(576, 192) -> (10, 8)` qubits). The padding is exact but enlarges the residual MPO, so it is a real cost -- see `D = 0` below |
 | **circuit ansatz** | brickwall of real orthogonal `k`-qubit gates as **PennyLane `qml.QubitUnitary` operations**, depth `D`. Circuits are realized by `qml.matrix` (`qllm.disentangler.circuit_unitary`) and can be handed to hardware/transpilation via `circuit_ops`. **This build considers only `k <= 2`** (`--gate-sizes 1 2`): the hardware-realistic regime -- the paper runs only its two-qubit-gate disentanglers on a real QPU, and transpiling wider gates is what blows up the physical depth -- and the one where `Q ~ 4^k` per gate stays affordable. Depth `D` is the lever that is swept |
-| **training** | the paper's explicit disentangling algorithm (Appendix A), **not** gradient descent / parameter-shift / a device: each gate is updated to the polar factor of its environment tensor, `E = A S B -> g <- A B` (Eq. A4), sweeping both circuits until the overlap converges. The gate unitaries are the trained parameters |
+| **training** (`--disentangle-optimizer`) | two schemes for the same objective. **`explicit`** (default) is the paper's disentangling algorithm (Appendix A): each gate is set to the polar factor of its environment tensor, `E = A S B -> g <- A B` (Eq. A4), a closed-form optimal step, sweeping U/V until the overlap converges. **`gradient`** optimizes the gate *angles* directly by Adam on a differentiable truncation loss (`--disentangle-gd-steps`, `--disentangle-gd-lr`): each 2-qubit gate is `expm(skew(theta))` with `theta` its `dim so(4) = 6` Lie-algebra angles, so unconstrained descent stays on the orthogonal-gate manifold. Same gates (`qml.QubitUnitary`), same objective; a closed-form vs. an iterative solver |
 | **objective** | `min ||U^T W V - T_chi(U^T W V)||`. The target is re-truncated each iteration, so the alternation is **monotone** in the error the compressed layer actually incurs. `--disentangle-target fixed` freezes it at the original's truncation instead, which is the literal objective behind the paper's Eq. (4) accuracy |
 | **`Q(D, k)`** | independent gate angles, `dim O(2^k) = 2^(k-1)(2^k - 1)` per gate (`--quantum-param-counting entries` counts `4^k` matrix entries instead, the right figure if a gate is stored as a dense classical tensor) |
 | **`D = 0`** | always measured: the circuits are the identity, so that row isolates the qubit-padding overhead from the benefit of the circuits |
@@ -545,10 +545,20 @@ python hybridize.py --gate-sizes 2 --circuit-depths 0 1 2 4 --layer-types v_proj
 
 # Best of several circuit initializations (the optimization is not convex)
 python hybridize.py --gate-sizes 2 --circuit-depths 1 2 4 --restarts 3
+
+# Train the circuits by gradient descent instead of the env-SVD sweep
+python hybridize.py --gate-sizes 2 --circuit-depths 0 1 2 4 \
+    --disentangle-optimizer gradient --disentangle-gd-steps 300 --disentangle-gd-lr 0.05
 ```
 
+Each `--tensorization` and each `--disentangle-optimizer` writes its **own** CSV
+(`hybrid_per_layer.csv`, `hybrid_per_layer_qubit.csv`,
+`hybrid_per_layer_gradient.csv`, …) so runs whose `C(chi)` or circuits are not
+comparable never share a checkpoint or get mixed in one budget report.
+
 Output is `results/llms/<model>/compactifai/hybrid_per_layer.csv`, one row per
-`(layer, method, chi, D, k)` with `classical_params`, `quantum_params`,
+`(layer, method, chi, D, k)` with `tensorization`, `optimizer`,
+`classical_params`, `quantum_params`,
 `perplexity`, `ppl_ratio`, and the disentangling diagnostics
 (`disentangle_accuracy` -- the paper's Eq. (4) -- `disentangle_entropy`, and
 `disentangle_retained`, the fraction of the layer's weight the target bond

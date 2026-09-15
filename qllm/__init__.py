@@ -37,6 +37,7 @@ from .disentangler import (
     circuit_ops,
     circuit_unitary,
     disentangle,
+    disentangle_loss,
     hybrid_weight,
     quantum_param_count,
 )
@@ -78,6 +79,7 @@ __all__ = [
     "circuit_ops",
     "circuit_unitary",
     "disentangle",
+    "disentangle_loss",
     "hybrid_weight",
     "quantum_param_count",
     "HybridConfig",

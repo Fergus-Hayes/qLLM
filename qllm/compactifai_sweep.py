@@ -237,14 +237,14 @@ def _migrate_legacy(old_path: Path, new_path: Path) -> None:
         print(f"Migrated {old_path} -> {new_path}")
 
 
-def tensorized_name(name: str, tensorization: str) -> str:
-    """Insert a non-default tensorization into a CSV name so geometries never
-    share a checkpoint file (``compactifai_per_layer.csv`` ->
-    ``compactifai_per_layer_qubit.csv``). ``balanced`` keeps the plain name."""
-    if tensorization == "balanced":
+def tensorized_name(name: str, tag: str, default: str = "balanced") -> str:
+    """Insert a non-default ``tag`` into a CSV name so incompatible runs never
+    share a checkpoint file (``hybrid_per_layer.csv`` ->
+    ``hybrid_per_layer_qubit.csv``). The ``default`` tag keeps the plain name."""
+    if tag == default:
         return name
     stem, dot, ext = name.rpartition(".")
-    return f"{stem}_{tensorization}{dot}{ext}" if dot else f"{name}_{tensorization}"
+    return f"{stem}_{tag}{dot}{ext}" if dot else f"{name}_{tag}"
 
 
 def sweep_csv_path(config: CompactifaiConfig) -> Path:
