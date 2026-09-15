@@ -683,10 +683,23 @@ panels (accuracy and entropy vs. `L`, log-`x`). It also records and plots the
 **total parameter count `M* = C(chi') + Q(D)`** against `L`: the stored MPO
 parameters `C(chi')` (constant, since `chi'` and the tensorization are fixed --
 `36` for the paper's qubit MPO at `chi'=1`) plus the circuits' `Q(D)`, which
-grows with the brickwall depth. The panel draws a dotted line at the classical
-`C(chi')`-only cost so the quantum overhead `Q(D)` of adding layers is visible;
-the `classical_params` / `quantum_params` / `total_params` columns hold the
-numbers. On the **model path** it adds a further **perplexity-vs-`L`** curve: at
+grows with the brickwall depth. The `classical_params` / `quantum_params` /
+`total_params` columns hold the numbers.
+
+Every panel also draws two **tensor-network-only reference lines** (both with
+`Q(D)=0`, so they do not depend on `L`), written to the CSV as marked rows
+(`kind` column) alongside the swept circuits:
+
+* **`D=0` (TN only, padded)** -- the hybrid with zero circuit depth, i.e. the
+  identity circuits, which collapses to the plain `chi'`-truncated MPO on the
+  *padded* qubit geometry. This is the floor the circuits lift off from, at
+  `M* = C(chi')` (dashed line; `36` for the paper's qubit MPO at `chi'=1`).
+* **`TN only, no padding`** -- plain CompactifAI: the balanced 2-site MPO on the
+  layer's *raw* dimensions, with no power-of-two padding (dash-dot line). It
+  usually retains more of the layer than the padded `D=0` truncation but costs
+  more parameters, so it is the classical baseline the padded hybrid undercuts.
+
+On the **model path** it adds a further **perplexity-vs-`L`** curve: at
 each `L` the target layer is swapped for its
 disentangled `chi'`-truncated reconstruction (`U T_{chi'}(MPO_new) V^T`), the full
 model is re-scored, and `perplexity / baseline` is plotted against `L` -- so you

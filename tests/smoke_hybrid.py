@@ -425,7 +425,8 @@ import csv as _csv
 from pathlib import Path as _Path
 fig3_csv = _Path(SCRATCH + "-fig3") / "synthetic" / "disentangle_scaling" / "disentangle_scaling.csv"
 with fig3_csv.open() as f:
-    scan = sorted(_csv.DictReader(f), key=lambda r: int(r["n_layers"]))
+    all_rows = list(_csv.DictReader(f))
+scan = sorted((r for r in all_rows if r["kind"] == "sweep"), key=lambda r: int(r["n_layers"]))
 accs = [float(r["accuracy"]) for r in scan]
 assert accs[-1] > accs[0], f"accuracy should rise with L: {accs}"
 assert all(r["target_chi"] == "1" and r["tensorization"] == "qubit" for r in scan)
@@ -441,6 +442,18 @@ for gk in {int(r["gate_size"]) for r in scan}:
     assert int(ks[-1]["total_params"]) > int(ks[0]["total_params"]), "M* grows with L"
 m_lo, m_hi = int(scan[0]["total_params"]), int(sorted(scan, key=lambda r: int(r["total_params"]))[-1]["total_params"])
 print(f"  M* = C(chi')+Q(D) recorded and grows with L: {m_lo} -> {m_hi} params")
+# Reference rows: D=0 hybrid (identity circuits == padded TN) and the unpadded TN.
+refs = {r["kind"]: r for r in all_rows if r["kind"] in ("tn_d0", "tn_nopad")}
+assert set(refs) == {"tn_d0", "tn_nopad"}, "both reference rows must be written"
+d0, nopad = refs["tn_d0"], refs["tn_nopad"]
+assert int(d0["quantum_params"]) == 0 and int(nopad["quantum_params"]) == 0, "references have Q=0"
+assert d0["tensorization"] == "qubit" and int(d0["n_layers"]) == 0, "D=0 is the padded TN"
+assert int(d0["total_params"]) == int(d0["classical_params"]), "D=0 M* = C(chi')"
+assert int(d0["total_params"]) == int(scan[0]["classical_params"]), "D=0 == the swept C(chi')"
+assert nopad["tensorization"] == "balanced(no pad)", "unpadded TN uses the raw-dims MPO"
+assert float(d0["accuracy"]) == float(d0["retained_classical"]), "D=0 accuracy == retained_classical"
+print(f"  references: D=0 (padded TN) acc={float(d0['accuracy']):.4f} M*={d0['total_params']}; "
+      f"TN-no-pad acc={float(nopad['accuracy']):.4f} M*={nopad['total_params']}")
 # k>2 refused, and it runs offline from a synthetic shape (no model needed)
 assert scaling_main(["--shape", "8x8", "--gate-sizes", "4"]) == 2
 print("  runs offline on a synthetic shape; rejects k>2")
@@ -457,11 +470,17 @@ rc = scaling_main([
 assert rc == 0
 ppl_csv = _Path(SCRATCH + "-fig3ppl") / "tiny-gpt2" / "disentangle_scaling" / "disentangle_scaling.csv"
 with ppl_csv.open() as f:
-    prows = list(_csv.DictReader(f))
+    prows = [r for r in _csv.DictReader(f) if r["kind"] == "sweep"]
 assert prows and all(float(r["ppl_ratio"]) > 0 and r["perplexity"] for r in prows), \
     "model path must record a finite perplexity per L"
+# The references get their perplexity swapped in on the model path too.
+with ppl_csv.open() as f:
+    prefs = {r["kind"]: r for r in _csv.DictReader(f) if r["kind"].startswith("tn_")}
+assert set(prefs) == {"tn_d0", "tn_nopad"} and all(float(r["ppl_ratio"]) > 0 for r in prefs.values()), \
+    "reference rows must carry a perplexity ratio on the model path"
 print(f"  model path adds perplexity vs L: x{float(prows[0]['ppl_ratio']):.4f} -> "
-      f"x{float(prows[-1]['ppl_ratio']):.4f} baseline")
+      f"x{float(prows[-1]['ppl_ratio']):.4f} baseline; "
+      f"D=0 x{float(prefs['tn_d0']['ppl_ratio']):.4f}, TN-no-pad x{float(prefs['tn_nopad']['ppl_ratio']):.4f}")
 
 # Resume: re-running with an extra L reuses the finished points and the cached
 # baseline (no re-evaluation) instead of recomputing from scratch.
@@ -481,7 +500,7 @@ assert rc == 0
 assert "from checkpoint" in out, "baseline should be reused from the checkpoint CSV"
 assert "Resuming: 2/3" in out, f"two of three points should be reused:\n{out}"
 with ppl_csv.open() as f:
-    prows2 = {int(r["n_layers"]): r for r in _csv.DictReader(f)}
+    prows2 = {int(r["n_layers"]): r for r in _csv.DictReader(f) if r["kind"] == "sweep"}
 assert set(prows2) == {1, 4, 8}, "added L=4 without dropping the finished points"
 assert all(prows2[L]["ppl_baseline"] == prev_base for L in prows2), \
     "the reused baseline must match the checkpointed one"
@@ -503,7 +522,10 @@ rc = scaling_main([
 ])
 assert rc == 0
 with ppl_csv.open() as f:
-    assert len(list(_csv.DictReader(f))) == 1, "--recompute rewrites the CSV fresh"
+    fresh = list(_csv.DictReader(f))
+assert sum(1 for r in fresh if r["kind"] == "sweep") == 1, "--recompute rewrites the CSV fresh"
+assert {r["kind"] for r in fresh if r["kind"].startswith("tn_")} == {"tn_d0", "tn_nopad"}, \
+    "--recompute recomputes the references too"
 print("  refuses a conflicting config; --recompute overwrites")
 
 print("\nALL HYBRID SMOKE STAGES PASSED")

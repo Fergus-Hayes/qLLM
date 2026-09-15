@@ -15,8 +15,19 @@ This CLI sweeps L (= the brickwall depth D) at a fixed target bond dimension
   truncation (``--disentangle-target fixed``, the paper's main-text choice);
 * ``entropy``   -- the mean von Neumann entropy over the MPO bonds;
 * ``retained``  -- ``||T1(U^T W V)|| / ||W||``, the weight the bond-1 truncation keeps.
+* ``classical_params`` / ``quantum_params`` / ``total_params`` -- the hybrid cost
+  ``M* = C(chi') + Q(D)``, plotted against L.
 
-It writes a CSV and, if matplotlib is present, the two Fig. 3 panels.
+Alongside the swept circuits it also records two tensor-network-only baselines
+(``kind`` column; both with ``Q(D)=0``), drawn as horizontal reference lines:
+
+* ``tn_d0``    -- the depth-0 hybrid: identity circuits, i.e. the plain chi'-MPO
+  truncation on the *padded* qubit geometry, at ``M* = C(chi')``;
+* ``tn_nopad`` -- plain CompactifAI: the balanced 2-site MPO on the layer's *raw*
+  dimensions, with no power-of-two padding.
+
+It writes a CSV and, if matplotlib is present, the Fig. 3 panels (accuracy,
+entropy, M*, and -- on the model path -- perplexity vs. L).
 
 The CSV is a checkpoint: a re-run reuses every (gate size, L) point already in
 it for the same configuration -- and, on the model path, the cached baseline
@@ -52,12 +63,11 @@ from .disentangler import (
     disentangle,
     hybrid_weight,
     n_qubits_for,
-    pad_to_qubits,
     quantum_param_count,
 )
 from .hybrid_sweep import MAX_GATE_SIZE, validate_gate_sizes
 from .layer_analysis import parse_layer_info
-from .qubit_mpo import make_plan
+from .qubit_mpo import make_plan, plan_bond_entropy, plan_compress
 
 DEFAULT_MODEL = "HuggingFaceTB/SmolLM2-135M"
 
@@ -120,13 +130,18 @@ def load_model_layer(args):
     return model, tok, dev, name, param
 
 
-ROW_FIELDS = ["gate_size", "n_layers", "d_out", "d_in", "n_out_qubits",
+ROW_FIELDS = ["kind", "gate_size", "n_layers", "d_out", "d_in", "n_out_qubits",
               "n_in_qubits", "target_chi", "disentangle_target",
               "tensorization", "optimizer",
               "accuracy", "entropy", "retained", "retained_classical",
               "classical_params", "quantum_params", "total_params",
               "perplexity", "ppl_baseline", "ppl_ratio",
               "sweeps_run", "seconds", "source"]
+
+# Reference rows carried alongside the swept (D>=1) circuits: the depth-0 hybrid
+# (identity circuits -> the padded tensor-network truncation) and the plain
+# CompactifAI tensor network on the *unpadded* matrix. Both have Q(D)=0.
+KIND_SWEEP, KIND_TN_D0, KIND_TN_NOPAD = "sweep", "tn_d0", "tn_nopad"
 
 
 def _read_rows(path: Path) -> list[dict]:
@@ -234,7 +249,8 @@ def _finite(rows: list[dict], key: str) -> bool:
     return False
 
 
-def plot_scaling(rows: list[dict], out_dir: Path, target_chi: int) -> None:
+def plot_scaling(rows: list[dict], out_dir: Path, target_chi: int,
+                 refs: list[dict] | None = None) -> None:
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -286,22 +302,37 @@ def plot_scaling(rows: list[dict], out_dir: Path, target_chi: int) -> None:
         if ax_p is not None:
             ax_p.plot(*_pts(k, "ppl_ratio"), marker="^", color=col, label=lab)
 
+    # Horizontal reference lines: the D=0 hybrid (identity circuits == padded TN)
+    # and the plain TN on the *unpadded* matrix. Neither depends on L.
+    ref_styles = {
+        KIND_TN_D0: dict(ls="--", color="dimgray", lw=1.4,
+                         label=f"$D=0$ (TN only, padded), $C(\\chi'={target_chi})$"),
+        KIND_TN_NOPAD: dict(ls="-.", color="black", lw=1.4,
+                            label="TN only (no padding)"),
+    }
+
+    def _ref_line(ax, key):
+        for r in (refs or []):
+            st = ref_styles.get(r.get("kind"))
+            if st and _is_finite(r.get(key)):
+                ax.axhline(float(r[key]), **st)
+
+    _ref_line(ax_a, "accuracy")
+    _ref_line(ax_s, "entropy")
+
     ax_a.set_ylabel("disentangling accuracy $A$  (Eq. 4)")
     ax_a.set_title(f"Fig. 3 reproduction: disentangling vs. layers "
                    f"(target $\\chi'$ = {target_chi})")
     ax_s.set_ylabel("mean bond entropy (nats)")
     panels = [ax_a, ax_s]
     if ax_m is not None:
-        cvals = [float(r["classical_params"]) for r in rows
-                 if _is_finite(r.get("classical_params"))]
-        if cvals:
-            ax_m.axhline(cvals[0], ls=":", color="gray", lw=1.2,
-                         label=f"classical $C(\\chi'={target_chi})$ only")
+        _ref_line(ax_m, "total_params")
         ax_m.set_ylabel(f"total parameters $M^*$\n$C(\\chi'={target_chi}) + Q(D)$")
         panels.append(ax_m)
     if ax_p is not None:
         if baseline is not None:
             ax_p.axhline(1.0, ls="--", color="crimson", lw=1.2, label="dense baseline")
+        _ref_line(ax_p, "ppl_ratio")
         ax_p.set_ylabel(f"perplexity / baseline\n($\\chi'$={target_chi} layer swapped in)")
         panels.append(ax_p)
     panels[-1].set_xlabel("number of layers $L$")
@@ -367,9 +398,10 @@ def main(argv=None) -> int:
     # which grows with the brickwall depth. Both are pure functions of the layer
     # geometry, so they are the same numbers the disentangler records -- computed
     # here directly so every point (including resumed ones) gets M* without a
-    # re-optimization.
-    _ref_plan = make_plan(pad_to_qubits(weight)[0], args.tensorization, 2,
-                          svd_cache=False, align="msb")  # disentangle()'s default
+    # re-optimization. The plan is built from the original weight (build_qubit_plan
+    # accounts for the power-of-two padding internally), so its leg dims -- hence
+    # C(chi') -- match the disentangler's.
+    _ref_plan = make_plan(weight, args.tensorization, 2, svd_cache=False, align="msb")
     classical_params = mpo_param_count(_ref_plan.out_dims, _ref_plan.in_dims,
                                        args.target_chi)
 
@@ -383,6 +415,15 @@ def main(argv=None) -> int:
             model, input_ids, device, args.max_length, args.stride,
             batch_size=args.ppl_batch_size, max_eval_tokens=args.eval_tokens,
             progress=False)
+        return ppl
+
+    def _ppl_of(recon: torch.Tensor) -> float:
+        """Score the model with the target layer swapped for ``recon``, then restore."""
+        with torch.no_grad():
+            param.copy_(recon.to(dtype=param.dtype, device=param.device))
+        ppl = evaluate()
+        with torch.no_grad():
+            param.copy_(orig.to(dtype=param.dtype, device=param.device))
         return ppl
 
     out_dir = _out_dir(args)
@@ -406,7 +447,11 @@ def main(argv=None) -> int:
                 str(r.get("disentangle_target") or args.disentangle_target))
 
     existing = [] if args.recompute else _read_rows(path)
-    conflict = next((r for r in existing if _row_cfg(r) != cur_cfg), None)
+    # Reference rows (kind != sweep) are always recomputed and carry a different
+    # geometry (the unpadded TN), so they are excluded from the swept-grid's
+    # configuration check and resume bookkeeping.
+    sweep_existing = [r for r in existing if (r.get("kind") or KIND_SWEEP) == KIND_SWEEP]
+    conflict = next((r for r in sweep_existing if _row_cfg(r) != cur_cfg), None)
     if conflict is not None:
         print(f"error: {path} holds rows from a different configuration "
               f"({_row_cfg(conflict)} vs {cur_cfg}). Re-run with --recompute to "
@@ -417,12 +462,13 @@ def main(argv=None) -> int:
     # are asking for now, so a --no-perplexity run can be extended with it later.
     seeded: list[dict] = []
     done_points: set[tuple[int, int]] = set()
-    for r in existing:
+    for r in sweep_existing:
         try:
             rk, rl = int(r["gate_size"]), int(r["n_layers"])
         except (KeyError, ValueError, TypeError):
             continue
         if not measure_ppl or _is_finite(r.get("ppl_ratio")):
+            r["kind"] = KIND_SWEEP
             r["disentangle_target"] = r.get("disentangle_target") or args.disentangle_target
             if not _is_finite(r.get("total_params")):    # backfill pre-M* rows
                 cp, qp, tp = _params_for(rk, rl)
@@ -437,6 +483,25 @@ def main(argv=None) -> int:
                 cached_baseline = float(r["ppl_baseline"])
                 break
 
+    # Reference rows (D=0 and unpadded TN): reuse a checkpointed one only if it
+    # matches this run and, on the model path, already carries a perplexity ratio.
+    def _find_ref(kind: str):
+        if args.recompute:
+            return None
+        for r in existing:
+            if (r.get("kind") == kind
+                    and str(r.get("source", "")) == source
+                    and str(r.get("target_chi", "")) == str(args.target_chi)
+                    and (str(r.get("disentangle_target") or args.disentangle_target)
+                         == args.disentangle_target)
+                    and str(r.get("optimizer", "")) == args.optimizer
+                    and (not measure_ppl or _is_finite(r.get("ppl_ratio")))):
+                return r
+        return None
+    ref_cache = {KIND_TN_D0: _find_ref(KIND_TN_D0),
+                 KIND_TN_NOPAD: _find_ref(KIND_TN_NOPAD)}
+    need_ref_eval = measure_ppl and any(v is None for v in ref_cache.values())
+
     grid = [(k, L) for k in gate_sizes for L in layers]
     total = len(grid)
     reused = sum(1 for kl in grid if kl in done_points)
@@ -446,11 +511,12 @@ def main(argv=None) -> int:
               f"{to_run} to run.")
 
     # --- baseline perplexity: reuse the checkpoint's value, else measure once.
+    #     Tokenize whenever any sweep point or reference still needs evaluating.
     if measure_ppl:
         if math.isfinite(cached_baseline):
             baseline = cached_baseline
             print(f"\nBaseline (dense) perplexity from checkpoint = {baseline:.4f}")
-        if to_run:
+        if to_run or need_ref_eval:
             from .benchmark import BenchmarkConfig, tokenize_corpus
             load_cfg = BenchmarkConfig(
                 model_id=args.model, device=args.device, dtype=args.dtype,
@@ -463,12 +529,81 @@ def main(argv=None) -> int:
                 baseline = evaluate()
                 print(f"Baseline perplexity = {baseline:.4f}")
 
+    # --- reference rows: the D=0 hybrid (identity circuits == padded TN) and the
+    #     plain TN on the *unpadded* matrix, both with Q(D)=0. Computed once, up
+    #     front, so every checkpoint carries them.
+    def _ref_ppl_fields(recon):
+        ppl = _ppl_of(recon) if measure_ppl else float("nan")
+        ratio = ppl / baseline if measure_ppl and baseline else float("nan")
+        return dict(perplexity=round(ppl, 4) if measure_ppl else "",
+                    ppl_baseline=round(baseline, 4) if measure_ppl else "",
+                    ppl_ratio=round(ratio, 6) if measure_ppl else "")
+
+    def _reference_rows() -> list[dict]:
+        wnorm = float(torch.linalg.norm(weight)) or 1.0
+        out: list[dict] = []
+
+        cached = ref_cache[KIND_TN_D0]
+        if cached is not None:
+            cached["kind"] = KIND_TN_D0
+            out.append(cached)
+        else:
+            res0 = disentangle(
+                weight, gate_size=gate_sizes[0], depth=0, target_chi=args.target_chi,
+                target_mode=args.disentangle_target, tensorization=args.tensorization,
+                optimizer=args.optimizer, sweeps=args.disentangle_sweeps,
+                gd_steps=args.disentangle_gd_steps, gd_lr=args.disentangle_gd_lr,
+                restarts=args.restarts, seed=args.seed)
+            recon0, _ = hybrid_weight(res0, args.target_chi)
+            out.append(dict(
+                kind=KIND_TN_D0, gate_size=0, n_layers=0, d_out=d_out, d_in=d_in,
+                n_out_qubits=n_out, n_in_qubits=n_in, target_chi=args.target_chi,
+                disentangle_target=args.disentangle_target,
+                tensorization=args.tensorization, optimizer=args.optimizer,
+                accuracy=round(res0.accuracy, 6), entropy=round(res0.entropy, 6),
+                retained=round(res0.retained, 6),
+                retained_classical=round(res0.retained_classical, 6),
+                classical_params=classical_params, quantum_params=0,
+                total_params=classical_params, sweeps_run=0, seconds=0.0,
+                source=source, **_ref_ppl_fields(recon0)))
+
+        cached = ref_cache[KIND_TN_NOPAD]
+        if cached is not None:
+            cached["kind"] = KIND_TN_NOPAD
+            out.append(cached)
+        else:
+            plan_np = make_plan(weight, "balanced", 2, svd_cache=False)
+            recon_np, p_np = plan_compress(weight, plan_np, args.target_chi)
+            ret_np = float(torch.linalg.norm(recon_np)) / wnorm
+            out.append(dict(
+                kind=KIND_TN_NOPAD, gate_size=-1, n_layers=0, d_out=d_out, d_in=d_in,
+                n_out_qubits=n_out, n_in_qubits=n_in, target_chi=args.target_chi,
+                disentangle_target=args.disentangle_target,
+                tensorization="balanced(no pad)", optimizer=args.optimizer,
+                accuracy=round(ret_np, 6),
+                entropy=round(plan_bond_entropy(weight, plan_np), 6),
+                retained=round(ret_np, 6), retained_classical=round(ret_np, 6),
+                classical_params=p_np, quantum_params=0, total_params=p_np,
+                sweeps_run=0, seconds=0.0, source=source,
+                **_ref_ppl_fields(recon_np)))
+        return out
+
+    ref_rows = _reference_rows()
+
     rows: list[dict] = list(seeded)
     start = time.perf_counter()
     done = 0
     ppl_head = f"{'ppl':>9} {'x base':>7} " if measure_ppl else ""
     print(f"\n{'k':>3} {'L':>4} {'accuracy':>9} {'entropy':>9} {'retained':>9} "
           f"{'M*':>9} {ppl_head}{'sec':>6}")
+    for r in ref_rows:                                  # D=0 and unpadded-TN baselines
+        tag = "D=0" if r["kind"] == KIND_TN_D0 else "TN0"
+        pstr = ""
+        if measure_ppl and _is_finite(r.get("ppl_ratio")):
+            pstr = f"{float(r['perplexity']):>9.4f} {float(r['ppl_ratio']):>7.4f} "
+        print(f"{tag:>3} {'-':>4} {float(r['accuracy']):>9.4f} "
+              f"{float(r['entropy']):>9.4f} {float(r['retained']):>9.4f} "
+              f"{int(float(r['total_params'])):>9} {pstr}{'':>6}")
     for k in gate_sizes:
         for L in layers:
             if (k, L) in done_points:
@@ -484,14 +619,11 @@ def main(argv=None) -> int:
                 # Swap in the disentangled layer at the target bond dimension,
                 # score the full model, then restore the dense weight.
                 approx, _params = hybrid_weight(res, args.target_chi)
-                with torch.no_grad():
-                    param.copy_(approx.to(dtype=param.dtype, device=param.device))
-                ppl = evaluate()
-                with torch.no_grad():
-                    param.copy_(orig.to(dtype=param.dtype, device=param.device))
+                ppl = _ppl_of(approx)
             ratio = ppl / baseline if measure_ppl and baseline else float("nan")
             cparams, qparams, tparams = _params_for(k, L)
             rows.append(dict(
+                kind=KIND_SWEEP,
                 gate_size=k, n_layers=L, d_out=d_out, d_in=d_in,
                 n_out_qubits=n_out, n_in_qubits=n_in, target_chi=args.target_chi,
                 disentangle_target=args.disentangle_target,
@@ -510,12 +642,9 @@ def main(argv=None) -> int:
             ppl_str = f"{ppl:>9.4f} {ratio:>7.4f} " if measure_ppl else ""
             print(f"{k:>3} {L:>4} {res.accuracy:>9.4f} {res.entropy:>9.4f} "
                   f"{res.retained:>9.4f} {tparams:>9} {ppl_str}{res.seconds:>6.1f}")
-            _write(rows)                                # checkpoint after each point
+            _write(rows + ref_rows)                     # checkpoint after each point
 
-    if not existing and not rows:                      # nothing done, nothing cached
-        _write(rows)
-    elif reused and not done:                          # fully resumed: rewrite as-is
-        _write(rows)
+    _write(rows + ref_rows)             # persist references (and any resumed rows)
 
     if measure_ppl and orig is not None:               # ensure the model is pristine
         with torch.no_grad():
@@ -524,6 +653,20 @@ def main(argv=None) -> int:
     elapsed = time.perf_counter() - start
     ran_msg = f"{done} run" + (f" + {reused} reused" if reused else "")
     print(f"\n{ran_msg} = {reused + done}/{total} points in {elapsed:.0f}s. CSV: {path}")
+
+    # Reference lines (D=0 and unpadded TN) alongside the per-k swept trends.
+    def _ref_note(kind: str, label: str) -> None:
+        r = next((x for x in ref_rows if x.get("kind") == kind), None)
+        if r is None:
+            return
+        line = (f"  {label}: accuracy {float(r['accuracy']):.4f}, "
+                f"M* {int(float(r['total_params']))} params")
+        if measure_ppl and _is_finite(r.get("ppl_ratio")):
+            line += f", perplexity/base {float(r['ppl_ratio']):.4f}"
+        print(line)
+    _ref_note(KIND_TN_D0, "D=0 (TN only, padded)")
+    _ref_note(KIND_TN_NOPAD, "TN only, no padding")
+
     for k in gate_sizes:
         ka = sorted([r for r in rows if int(r["gate_size"]) == k],
                     key=lambda r: int(r["n_layers"]))
@@ -541,7 +684,7 @@ def main(argv=None) -> int:
                          f"{float(hi['ppl_ratio']):.4f}")
             print(line)
     if not args.no_plots:
-        plot_scaling(rows, out_dir, args.target_chi)
+        plot_scaling(rows, out_dir, args.target_chi, ref_rows)
     return 0
 
 
