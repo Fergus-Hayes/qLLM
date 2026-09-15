@@ -407,4 +407,32 @@ assert tensorizations_in(mixed) == ["balanced", "qubit"]        # {} -> balanced
 assert len(filter_rows_by_tensorization(mixed, "qubit")) == 1
 print("  geometries land in separate files; mixed-CSV rows are detectable")
 
+# --------------------------------------------------------------------------- #
+# 8. Fig. 3 reproduction CLI: disentangling accuracy vs. number of layers
+# --------------------------------------------------------------------------- #
+print("\n=== 8. Disentangling accuracy vs. layers (Fig. 3 CLI) ===")
+from qllm.disentangle_scaling_cli import main as scaling_main, log_spaced_layers
+
+assert log_spaced_layers(35, 5)[0] == 1 and log_spaced_layers(35, 5)[-1] == 35
+shutil.rmtree(SCRATCH + "-fig3", ignore_errors=True)
+rc = scaling_main([
+    "--shape", "16x64", "--gate-sizes", "2", "--layers", "1", "4", "12",
+    "--target-chi", "1", "--disentangle-sweeps", "20",
+    "--results-dir", SCRATCH + "-fig3", "--no-plots",
+])
+assert rc == 0
+import csv as _csv
+from pathlib import Path as _Path
+fig3_csv = _Path(SCRATCH + "-fig3") / "synthetic" / "disentangle_scaling" / "disentangle_scaling.csv"
+with fig3_csv.open() as f:
+    scan = sorted(_csv.DictReader(f), key=lambda r: int(r["n_layers"]))
+accs = [float(r["accuracy"]) for r in scan]
+assert accs[-1] > accs[0], f"accuracy should rise with L: {accs}"
+assert all(r["target_chi"] == "1" and r["tensorization"] == "qubit" for r in scan)
+print(f"  accuracy(Eq.4) rises with L for k=2: {accs[0]:.4f} (L=1) -> {accs[-1]:.4f} "
+      f"(L={scan[-1]['n_layers']})")
+# k>2 refused, and it runs offline from a synthetic shape (no model needed)
+assert scaling_main(["--shape", "8x8", "--gate-sizes", "4"]) == 2
+print("  runs offline on a synthetic shape; rejects k>2")
+
 print("\nALL HYBRID SMOKE STAGES PASSED")

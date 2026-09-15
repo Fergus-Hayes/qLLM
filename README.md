@@ -659,6 +659,34 @@ at any `MODEL_ID`, block, or layer type to compare a different layer. Because
 this build's gates are `k <= 2`, the disentangling is weaker than the paper's
 wide-gate circuits -- which is exactly what `M*/N*` at `w > 0` quantifies.
 
+### Disentangling accuracy vs. number of layers (the paper's Fig. 3)
+
+`disentangle_scaling.py` (module `qllm.disentangle_scaling_cli`) reproduces the
+paper's Fig. 3: it sweeps the brickwall depth `L` at a fixed disentangling target
+(`chi' = 1`) and records, per gate size, the **disentangling accuracy** `A` (its
+Eq. 4, `Tr[T1(W)^T U^T W V] / (||W|| ||T1(W)||)`) and the **mean bond entropy** of
+the disentangled operator. For two-qubit gates the accuracy rises -- roughly
+logarithmically, saturating -- as `L` grows, the paper's headline observation.
+
+```bash
+# The paper's layer (SmolLM2 block 10 v_proj), k=2, L = 1..35 (needs HF)
+python disentangle_scaling.py HuggingFaceTB/SmolLM2-135M \
+    --block 10 --layer-type v_proj --gate-sizes 2 --max-layers 35
+
+# Offline, on a synthetic (192,576)-shaped matrix
+python disentangle_scaling.py --shape 192x576 --gate-sizes 1 2 --max-layers 35
+```
+
+It uses the paper's **fixed** bond-1 target (`--disentangle-target fixed`) and the
+**qubit** MPO by default, writes `disentangle_scaling.csv`, and plots the two
+Fig. 3 panels (accuracy and entropy vs. `L`, log-`x`). The layer is either a real
+model weight (`--block` / `--layer-type`, needs the Hugging Face files) or a
+synthetic matrix (`--shape`, offline and reproducible). On the synthetic matrix
+the **accuracy-vs-`L` trend reproduces faithfully**; the *entropy-decreases* half
+of Fig. 3 and the exact magnitudes need the real trained layer (a random matrix
+has little to disentangle). `--optimizer gradient` runs the same sweep with the
+gradient-trained circuits.
+
 ## Use as a library
 
 ```python
@@ -704,6 +732,7 @@ qllm/
   hybrid_planner.py    # offline verdict on (k, D) from parameter counts alone
   qubit_mpo.py         # per-qubit MPO tensorization (paper geometry), both methods
   hybrid_cli.py        # hybrid-sweep CLI (+ --solve: sweep and report M*/N*)
+  disentangle_scaling_cli.py  # accuracy/entropy vs. #layers (paper Fig. 3)
   budget_frontier.py   # N*, M*, M*/N*, break-even price, Pareto front
   budget_plots.py      # figures for the budget comparison
   budget_cli.py        # budget-analysis CLI
@@ -712,6 +741,7 @@ benchmark_llm.py       # thin entry point for the benchmark CLI
 analyze_layers.py      # thin entry point for the layer-analysis CLI
 compactify.py          # thin entry point for the CompactifAI sweep
 hybridize.py           # thin entry point for the hybrid PQC+TN sweep
+disentangle_scaling.py # thin entry point for the Fig. 3 accuracy-vs-layers sweep
 analyze_budget.py      # thin entry point for the budget comparison
 analyze_compressibility.py  # thin entry point for the metrics correlation
 tests/                 # offline smoke tests (real torch, stubbed network I/O)

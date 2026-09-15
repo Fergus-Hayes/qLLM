@@ -238,8 +238,9 @@ def apply_gate(tensor: torch.Tensor, gate: torch.Tensor, start: int, k: int,
 
     The local action of the quantum gate: qubit ``0`` is the most significant bit,
     so a contiguous block of qubits is a contiguous stride of the flat index and
-    the gate is one reshape into ``(left, 2^k, rest)`` and a batched matmul. Used
-    inside the environment sweep, where a single gate is peeled at a time.
+    the gate is one reshape into ``(left, 2^k, rest)`` and a batched matmul -- no
+    copy of the big tensor and, crucially, no ``2^n x 2^n`` register unitary.
+    Differentiable in the gate matrix.
     """
     left = 1 << start
     mid = 1 << k
@@ -250,20 +251,29 @@ def apply_gate(tensor: torch.Tensor, gate: torch.Tensor, start: int, k: int,
 
 def apply_circuit(gates: list[Gate], tensor: torch.Tensor, n_qubits: int,
                   transpose: bool = False) -> torch.Tensor:
-    """``C X`` (or ``C^T X``): the PennyLane circuit acting on the row index."""
-    if not gates:
-        return tensor
-    unitary = circuit_unitary(gates, n_qubits)
-    return (unitary.T if transpose else unitary) @ tensor
+    """``C X`` (or ``C^T X``): the circuit applied to the row index, gate by gate.
+
+    Gates are applied one at a time (the way a state-vector simulator runs a
+    circuit -- PennyLane's own ``default.qubit`` never builds the full register
+    unitary either), so cost is ``O(#gates)`` local contractions, not the
+    exponential ``qml.matrix`` composition. Differentiable in the gate matrices,
+    so this carries the gradient scheme's autograd too. Use :func:`circuit_unitary`
+    when the explicit ``2^n x 2^n`` operator is actually wanted (export, small
+    circuits, verification).
+    """
+    out = tensor
+    for g in (reversed(gates) if transpose else gates):
+        mat = g.matrix.T if transpose else g.matrix
+        out = apply_gate(out, mat, g.start, g.k, n_qubits)
+    return out
 
 
 def apply_right(gates: list[Gate], tensor: torch.Tensor, n_qubits: int,
                 transpose: bool = False) -> torch.Tensor:
     """``X C^T`` (or ``X C``): the circuit acting on the *column* index of ``X``."""
-    if not gates:
-        return tensor
-    unitary = circuit_unitary(gates, n_qubits)
-    return tensor @ (unitary if transpose else unitary.T)
+    moved = apply_circuit(gates, tensor.transpose(0, 1).contiguous(), n_qubits,
+                          transpose=transpose)
+    return moved.transpose(0, 1).contiguous()
 
 
 def _environment(left: torch.Tensor, right: torch.Tensor, start: int, k: int) -> torch.Tensor:
