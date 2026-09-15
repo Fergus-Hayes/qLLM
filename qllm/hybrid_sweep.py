@@ -50,6 +50,7 @@ from .compactifai_sweep import (
     compactifai_dir,
     evenly_spaced,
     select_layers,
+    tensorized_name,
 )
 from .disentangler import disentangle, hybrid_weight, n_qubits_for
 from .qubit_mpo import make_plan, plan_compress
@@ -107,6 +108,7 @@ class HybridRow:
     layer_type: str
     depth: int                 # decoder block index
     method: str                # 'classical' | 'hybrid'
+    tensorization: str         # 'balanced' | 'qubit' -- the MPO geometry
     chi: int                   # bond dimension (chi for classical, chi' for hybrid)
     circuit_depth: int         # D (-1 for classical rows)
     gate_size: int
@@ -135,7 +137,8 @@ class HybridRow:
 
 
 def hybrid_csv_path(config: HybridConfig) -> Path:
-    return compactifai_dir(config) / config.hybrid_csv_name
+    return compactifai_dir(config) / tensorized_name(
+        config.hybrid_csv_name, config.tensorization)
 
 
 def default_depths(max_depth: int = 8, count: int = 4) -> list[int]:
@@ -236,7 +239,7 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
 
     path = hybrid_csv_path(config)
     existing = [] if config.force_recompute else _read_rows(path)
-    rows_by_key = {(r.get("param_name"), r.get("method"), str(r.get("chi")),
+    rows_by_key = {(r.get("param_name"), r.get("method"), (r.get("tensorization") or "balanced"), str(r.get("chi")),
                     str(r.get("circuit_depth")), str(r.get("gate_size"))): r
                    for r in existing}
 
@@ -252,7 +255,7 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
             exact = full_rank_chi(classical_plans[name].out_dims,
                                   classical_plans[name].in_dims)
             for chi in sorted({min(int(c), exact) for c in chis}):
-                key = (name, "classical", str(chi), "-1", "0")
+                key = (name, "classical", config.tensorization, str(chi), "-1", "0")
                 if key not in rows_by_key:
                     todo.append(("classical", name, param, chi, -1))
     hybrid_jobs = []
@@ -269,8 +272,8 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
                     continue
                 seen.add((k_row, d))
                 missing = [c for c in hybrid_chis
-                           if (name, "hybrid", str(c), str(d), str(k_row))
-                           not in rows_by_key]
+                           if (name, "hybrid", config.tensorization, str(c),
+                               str(d), str(k_row)) not in rows_by_key]
                 if missing:
                     hybrid_jobs.append((name, param, d, k_eff, k_row, missing))
 
@@ -293,7 +296,7 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
         _write_rows(path, ordered, field_names)
 
     def record(row: HybridRow):
-        rows_by_key[(row.param_name, row.method, str(row.chi),
+        rows_by_key[(row.param_name, row.method, row.tensorization, str(row.chi),
                      str(row.circuit_depth), str(row.gate_size))] = asdict(row)
         checkpoint()
 
@@ -317,7 +320,8 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
         record(HybridRow(
             timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
             model_id=config.model_id, param_name=name, layer_type=layer_type,
-            depth=block, method="classical", chi=chi, circuit_depth=-1,
+            depth=block, method="classical",
+            tensorization=config.tensorization, chi=chi, circuit_depth=-1,
             gate_size=0, rows=int(orig.shape[0]), cols=int(orig.shape[1]),
             padded_rows=int(orig.shape[0]), padded_cols=int(orig.shape[1]),
             n_out_qubits=0, n_in_qubits=0, params_original=plan.dense_params,
@@ -371,7 +375,8 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
             record(HybridRow(
                 timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 model_id=config.model_id, param_name=name, layer_type=layer_type,
-                depth=block, method="hybrid", chi=chi, circuit_depth=d,
+                depth=block, method="hybrid",
+                tensorization=config.tensorization, chi=chi, circuit_depth=d,
                 gate_size=k_row,
                 rows=int(orig.shape[0]), cols=int(orig.shape[1]),
                 padded_rows=res.padded_shape[0], padded_cols=res.padded_shape[1],

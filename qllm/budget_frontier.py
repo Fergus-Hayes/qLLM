@@ -60,6 +60,26 @@ def read_rows(path: str | Path) -> list[dict]:
         return list(csv.DictReader(f))
 
 
+def row_tensorization(row: dict) -> str:
+    """The MPO geometry a row was measured under (legacy rows -> 'balanced')."""
+    return row.get("tensorization") or "balanced"
+
+
+def tensorizations_in(rows: list[dict]) -> list[str]:
+    """Distinct MPO geometries present in a set of rows."""
+    return sorted({row_tensorization(r) for r in rows})
+
+
+def filter_rows_by_tensorization(rows: list[dict], tensorization: str) -> list[dict]:
+    """Keep only rows measured under ``tensorization``.
+
+    ``C(chi)`` differs between geometries (36 vs 672 at chi=1 for the paper's
+    layer), so mixing them in one N*/M* comparison is meaningless -- this makes
+    the geometry an explicit, single choice.
+    """
+    return [r for r in rows if row_tensorization(r) == tensorization]
+
+
 # --------------------------------------------------------------------------- #
 # Curves
 # --------------------------------------------------------------------------- #

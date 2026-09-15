@@ -344,8 +344,21 @@ qcfg = H.HybridConfig(
     max_length=64, stride=64, per_layer_stride=64,
     per_layer_eval_tokens=256, ppl_batch_size=4,
     results_dir=SCRATCH + "-qubit", make_plots=False)
-qrows = H._read_rows(H.run_hybrid_sweep(qcfg))
+qpath = H.run_hybrid_sweep(qcfg)
+qrows = H._read_rows(qpath)
 assert qrows and {r["method"] for r in qrows} == {"classical", "hybrid"}
+assert {r["tensorization"] for r in qrows} == {"qubit"}, "rows must record the geometry"
 print(f"  hybrid sweep ran in qubit mode: {len(qrows)} rows, both surfaces")
+
+# The two geometries must never share a checkpoint file (else one masks the
+# other's points and the solver mixes non-comparable C(chi)).
+from qllm.budget_frontier import filter_rows_by_tensorization, tensorizations_in
+bpath = H.hybrid_csv_path(H.HybridConfig(model_id="tiny-gpt2", tensorization="balanced",
+                                         results_dir=SCRATCH + "-qubit"))
+assert bpath != qpath and "qubit" in qpath.name and "qubit" not in bpath.name
+mixed = [{"tensorization": "balanced"}, {"tensorization": "qubit"}, {}]
+assert tensorizations_in(mixed) == ["balanced", "qubit"]        # {} -> balanced
+assert len(filter_rows_by_tensorization(mixed, "qubit")) == 1
+print("  geometries land in separate files; mixed-CSV rows are detectable")
 
 print("\nALL HYBRID SMOKE STAGES PASSED")

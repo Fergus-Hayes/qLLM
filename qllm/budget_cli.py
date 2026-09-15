@@ -28,7 +28,9 @@ from pathlib import Path
 
 from .budget_frontier import (
     _median,
+    filter_rows_by_tensorization,
     group_summary,
+    tensorizations_in,
     load_curves,
     print_pareto,
     print_report,
@@ -62,6 +64,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="Also report the verdict at these prices.")
     parser.add_argument("--layer-types", nargs="+", default=None,
                         help="Restrict to layer types containing these strings.")
+    parser.add_argument("--tensorization", default=None,
+                        choices=["balanced", "qubit"],
+                        help="Report only rows measured under this MPO geometry "
+                             "(required if the CSV mixes geometries).")
     parser.add_argument("--attention-only", action="store_true")
     parser.add_argument("--mlp-only", action="store_true")
     parser.add_argument("--pareto-limit", type=int, default=6,
@@ -122,9 +128,24 @@ def report_curves(curves: dict, budgets, q_weights, *, pareto: bool = True,
 def main(argv=None) -> int:
     args = parse_args(argv)
     csv_path = Path(args.hybrid_csv)
-    curves = load_curves(read_rows(csv_path))
+    rows = read_rows(csv_path)
 
-    curves = filter_curves(curves, layer_types=_filters(args))
+    # C(chi) is not comparable across MPO geometries, so a mixed CSV must be
+    # disambiguated rather than reported as one table.
+    present = tensorizations_in(rows)
+    if args.tensorization:
+        rows = filter_rows_by_tensorization(rows, args.tensorization)
+        if not rows:
+            print(f"No '{args.tensorization}' rows in {csv_path}; "
+                  f"it has: {', '.join(present)}.")
+            return 1
+    elif len(present) > 1:
+        print(f"error: {csv_path} mixes tensorizations ({', '.join(present)}); "
+              f"pass --tensorization to pick one -- C(chi) is not comparable "
+              f"across geometries.")
+        return 1
+
+    curves = filter_curves(load_curves(rows), layer_types=_filters(args))
     if not curves:
         print("No layers left after filtering.")
         return 1

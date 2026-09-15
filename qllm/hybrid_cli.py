@@ -262,9 +262,16 @@ def main(argv=None) -> int:
 
     if args.solve:
         from .budget_cli import filter_curves, report_curves
-        from .budget_frontier import load_curves, read_rows
+        from .budget_frontier import (
+            filter_rows_by_tensorization,
+            load_curves,
+            read_rows,
+        )
+        # Report only rows of this run's geometry -- C(chi) is not comparable
+        # across tensorizations, so never mix them in one N*/M* table.
+        rows = filter_rows_by_tensorization(read_rows(path), config.tensorization)
         curves = filter_curves(
-            load_curves(read_rows(path)),
+            load_curves(rows),
             layer_types=args.layer_types, depths=args.profile_depths)
         if not curves:
             print("\n(--solve: no layers to report after filtering.)")

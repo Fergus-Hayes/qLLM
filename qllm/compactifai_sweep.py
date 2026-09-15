@@ -237,24 +237,37 @@ def _migrate_legacy(old_path: Path, new_path: Path) -> None:
         print(f"Migrated {old_path} -> {new_path}")
 
 
+def tensorized_name(name: str, tensorization: str) -> str:
+    """Insert a non-default tensorization into a CSV name so geometries never
+    share a checkpoint file (``compactifai_per_layer.csv`` ->
+    ``compactifai_per_layer_qubit.csv``). ``balanced`` keeps the plain name."""
+    if tensorization == "balanced":
+        return name
+    stem, dot, ext = name.rpartition(".")
+    return f"{stem}_{tensorization}{dot}{ext}" if dot else f"{name}_{tensorization}"
+
+
 def sweep_csv_path(config: CompactifaiConfig) -> Path:
     name = config.model_id.rstrip("/").split("/")[-1]
     base = Path(config.results_dir) / name
-    new_path = compactifai_dir(config) / config.csv_name
-    _migrate_legacy(base / config.csv_name, new_path)
+    fname = tensorized_name(config.csv_name, config.tensorization)
+    new_path = compactifai_dir(config) / fname
+    _migrate_legacy(base / fname, new_path)
     return new_path
 
 
 def layer_csv_path(config: CompactifaiConfig) -> Path:
     name = config.model_id.rstrip("/").split("/")[-1]
     base = Path(config.results_dir) / name
-    new_path = compactifai_dir(config) / config.layer_csv_name
-    _migrate_legacy(base / config.layer_csv_name, new_path)
+    fname = tensorized_name(config.layer_csv_name, config.tensorization)
+    new_path = compactifai_dir(config) / fname
+    _migrate_legacy(base / fname, new_path)
     return new_path
 
 
 def per_layer_csv_path(config: CompactifaiConfig) -> Path:
-    return compactifai_dir(config) / config.per_layer_csv_name
+    return compactifai_dir(config) / tensorized_name(
+        config.per_layer_csv_name, config.tensorization)
 
 
 def evenly_spaced(values: list[int], count: int) -> list[int]:
