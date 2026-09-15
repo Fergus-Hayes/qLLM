@@ -18,6 +18,13 @@ This CLI sweeps L (= the brickwall depth D) at a fixed target bond dimension
 
 It writes a CSV and, if matplotlib is present, the two Fig. 3 panels.
 
+The CSV is a checkpoint: a re-run reuses every (gate size, L) point already in
+it for the same configuration -- and, on the model path, the cached baseline
+perplexity -- so an interrupted sweep resumes where it stopped and extra L
+values only cost the new points. A run whose configuration (layer, MPO
+geometry, optimizer, target chi', disentangle target) differs from the CSV is
+refused; pass ``--recompute`` to overwrite it or ``--csv-name`` to keep both.
+
 The layer is either a real model weight (``MODEL --block B --layer-type T``,
 needs the Hugging Face files) or a synthetic matrix of a given shape
 (``--shape 192x576``), which runs offline and is reproducible.
@@ -106,10 +113,19 @@ def load_model_layer(args):
 
 
 ROW_FIELDS = ["gate_size", "n_layers", "d_out", "d_in", "n_out_qubits",
-              "n_in_qubits", "target_chi", "tensorization", "optimizer",
+              "n_in_qubits", "target_chi", "disentangle_target",
+              "tensorization", "optimizer",
               "accuracy", "entropy", "retained", "retained_classical",
               "perplexity", "ppl_baseline", "ppl_ratio",
               "sweeps_run", "seconds", "source"]
+
+
+def _read_rows(path: Path) -> list[dict]:
+    """Existing checkpoint rows (empty if the CSV does not exist yet)."""
+    if not path.exists():
+        return []
+    with path.open(newline="") as f:
+        return list(csv.DictReader(f))
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -179,6 +195,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="Tokens per perplexity evaluation (one per L point).")
     p.add_argument("--ppl-batch-size", type=int, default=8)
 
+    p.add_argument("--recompute", action="store_true",
+                   help="Ignore any existing CSV and recompute every point from "
+                        "scratch (default: resume, skipping points already done "
+                        "and reusing the cached baseline perplexity).")
     p.add_argument("--results-dir", default="results/llms")
     p.add_argument("--csv-name", default="disentangle_scaling.csv")
     p.add_argument("--out-dir", default=None,
@@ -324,22 +344,82 @@ def main(argv=None) -> int:
             progress=False)
         return ppl
 
-    if measure_ppl:
-        from .benchmark import BenchmarkConfig, tokenize_corpus
-        load_cfg = BenchmarkConfig(
-            model_id=args.model, device=args.device, dtype=args.dtype,
-            trust_remote_code=args.trust_remote_code, revision=args.revision,
-            dataset=args.dataset, dataset_config=args.dataset_config,
-            split=args.split, text_column=args.text_column)
-        input_ids = tokenize_corpus(tokenizer, load_cfg)
-        print(f"\nBaseline (dense) perplexity on {args.eval_tokens} tokens ...")
-        baseline = evaluate()
-        print(f"Baseline perplexity = {baseline:.4f}")
-
     out_dir = _out_dir(args)
     path = out_dir / args.csv_name
-    rows: list[dict] = []
-    total = len(gate_sizes) * len(layers)
+
+    def _write(rows: list[dict]) -> None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        with path.open("w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=ROW_FIELDS, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(rows)
+
+    # --- resume: reuse points already checkpointed for this same configuration.
+    cur_cfg = (source, args.tensorization, args.optimizer,
+               str(args.target_chi), args.disentangle_target)
+
+    def _row_cfg(r: dict) -> tuple:
+        # disentangle_target is a newer column; when absent assume the current one.
+        return (str(r.get("source", "")), str(r.get("tensorization", "")),
+                str(r.get("optimizer", "")), str(r.get("target_chi", "")),
+                str(r.get("disentangle_target") or args.disentangle_target))
+
+    existing = [] if args.recompute else _read_rows(path)
+    conflict = next((r for r in existing if _row_cfg(r) != cur_cfg), None)
+    if conflict is not None:
+        print(f"error: {path} holds rows from a different configuration "
+              f"({_row_cfg(conflict)} vs {cur_cfg}). Re-run with --recompute to "
+              f"overwrite it, or --csv-name to write to a separate file.")
+        return 2
+
+    # A checkpointed point is "done" only if it also carries the perplexity we
+    # are asking for now, so a --no-perplexity run can be extended with it later.
+    seeded: list[dict] = []
+    done_points: set[tuple[int, int]] = set()
+    for r in existing:
+        try:
+            rk, rl = int(r["gate_size"]), int(r["n_layers"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        if not measure_ppl or _is_finite(r.get("ppl_ratio")):
+            r["disentangle_target"] = r.get("disentangle_target") or args.disentangle_target
+            seeded.append(r)
+            done_points.add((rk, rl))
+
+    cached_baseline = float("nan")
+    if measure_ppl and not args.recompute:
+        for r in existing:
+            if _is_finite(r.get("ppl_baseline")):
+                cached_baseline = float(r["ppl_baseline"])
+                break
+
+    grid = [(k, L) for k in gate_sizes for L in layers]
+    total = len(grid)
+    reused = sum(1 for kl in grid if kl in done_points)
+    to_run = total - reused
+    if reused:
+        print(f"Resuming: {reused}/{total} grid points already in {path.name}; "
+              f"{to_run} to run.")
+
+    # --- baseline perplexity: reuse the checkpoint's value, else measure once.
+    if measure_ppl:
+        if math.isfinite(cached_baseline):
+            baseline = cached_baseline
+            print(f"\nBaseline (dense) perplexity from checkpoint = {baseline:.4f}")
+        if to_run:
+            from .benchmark import BenchmarkConfig, tokenize_corpus
+            load_cfg = BenchmarkConfig(
+                model_id=args.model, device=args.device, dtype=args.dtype,
+                trust_remote_code=args.trust_remote_code, revision=args.revision,
+                dataset=args.dataset, dataset_config=args.dataset_config,
+                split=args.split, text_column=args.text_column)
+            input_ids = tokenize_corpus(tokenizer, load_cfg)
+            if not math.isfinite(baseline):
+                print(f"\nBaseline (dense) perplexity on {args.eval_tokens} tokens ...")
+                baseline = evaluate()
+                print(f"Baseline perplexity = {baseline:.4f}")
+
+    rows: list[dict] = list(seeded)
     start = time.perf_counter()
     done = 0
     ppl_head = f"{'ppl':>9} {'x base':>7} " if measure_ppl else ""
@@ -347,6 +427,8 @@ def main(argv=None) -> int:
           f"{ppl_head}{'sec':>6}")
     for k in gate_sizes:
         for L in layers:
+            if (k, L) in done_points:
+                continue
             res = disentangle(
                 weight, gate_size=k, depth=L, target_chi=args.target_chi,
                 target_mode=args.disentangle_target, tensorization=args.tensorization,
@@ -367,6 +449,7 @@ def main(argv=None) -> int:
             rows.append(dict(
                 gate_size=k, n_layers=L, d_out=d_out, d_in=d_in,
                 n_out_qubits=n_out, n_in_qubits=n_in, target_chi=args.target_chi,
+                disentangle_target=args.disentangle_target,
                 tensorization=args.tensorization, optimizer=args.optimizer,
                 accuracy=round(res.accuracy, 6), entropy=round(res.entropy, 6),
                 retained=round(res.retained, 6),
@@ -380,27 +463,30 @@ def main(argv=None) -> int:
             ppl_str = f"{ppl:>9.4f} {ratio:>7.4f} " if measure_ppl else ""
             print(f"{k:>3} {L:>4} {res.accuracy:>9.4f} {res.entropy:>9.4f} "
                   f"{res.retained:>9.4f} {ppl_str}{res.seconds:>6.1f}")
-            out_dir.mkdir(parents=True, exist_ok=True)
-            with path.open("w", newline="") as f:      # checkpoint after each point
-                w = csv.DictWriter(f, fieldnames=ROW_FIELDS)
-                w.writeheader()
-                w.writerows(rows)
+            _write(rows)                                # checkpoint after each point
+
+    if not existing and not rows:                      # nothing done, nothing cached
+        _write(rows)
+    elif reused and not done:                          # fully resumed: rewrite as-is
+        _write(rows)
 
     if measure_ppl and orig is not None:               # ensure the model is pristine
         with torch.no_grad():
             param.copy_(orig.to(dtype=param.dtype, device=param.device))
 
     elapsed = time.perf_counter() - start
-    print(f"\n{done}/{total} points in {elapsed:.0f}s. CSV: {path}")
+    ran_msg = f"{done} run" + (f" + {reused} reused" if reused else "")
+    print(f"\n{ran_msg} = {reused + done}/{total} points in {elapsed:.0f}s. CSV: {path}")
     for k in gate_sizes:
-        ka = sorted([r for r in rows if r["gate_size"] == k],
+        ka = sorted([r for r in rows if int(r["gate_size"]) == k],
                     key=lambda r: int(r["n_layers"]))
         if len(ka) >= 2:
             lo, hi = ka[0], ka[-1]
-            trend = "increases" if hi["accuracy"] > lo["accuracy"] else "flat/decreases"
-            line = (f"  k={k}: accuracy {lo['accuracy']:.4f} (L={lo['n_layers']}) -> "
-                    f"{hi['accuracy']:.4f} (L={hi['n_layers']})  [{trend} with L]")
-            if measure_ppl:
+            lo_a, hi_a = float(lo["accuracy"]), float(hi["accuracy"])
+            trend = "increases" if hi_a > lo_a else "flat/decreases"
+            line = (f"  k={k}: accuracy {lo_a:.4f} (L={lo['n_layers']}) -> "
+                    f"{hi_a:.4f} (L={hi['n_layers']})  [{trend} with L]")
+            if measure_ppl and _is_finite(lo.get("ppl_ratio")) and _is_finite(hi.get("ppl_ratio")):
                 line += (f";  perplexity/base {float(lo['ppl_ratio']):.4f} -> "
                          f"{float(hi['ppl_ratio']):.4f}")
             print(line)

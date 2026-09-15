@@ -454,4 +454,47 @@ assert prows and all(float(r["ppl_ratio"]) > 0 and r["perplexity"] for r in prow
 print(f"  model path adds perplexity vs L: x{float(prows[0]['ppl_ratio']):.4f} -> "
       f"x{float(prows[-1]['ppl_ratio']):.4f} baseline")
 
+# Resume: re-running with an extra L reuses the finished points and the cached
+# baseline (no re-evaluation) instead of recomputing from scratch.
+import io as _io
+import contextlib as _ctx
+prev_base = prows[0]["ppl_baseline"]
+buf = _io.StringIO()
+with _ctx.redirect_stdout(buf):
+    rc = scaling_main([
+        "tiny-gpt2", "--block", "0", "--layer-type", "c_proj", "--gate-sizes", "2",
+        "--layers", "1", "4", "8", "--target-chi", "1", "--disentangle-sweeps", "12",
+        "--max-length", "64", "--stride", "64", "--eval-tokens", "256",
+        "--ppl-batch-size", "4", "--results-dir", SCRATCH + "-fig3ppl", "--no-plots",
+    ])
+out = buf.getvalue()
+assert rc == 0
+assert "from checkpoint" in out, "baseline should be reused from the checkpoint CSV"
+assert "Resuming: 2/3" in out, f"two of three points should be reused:\n{out}"
+with ppl_csv.open() as f:
+    prows2 = {int(r["n_layers"]): r for r in _csv.DictReader(f)}
+assert set(prows2) == {1, 4, 8}, "added L=4 without dropping the finished points"
+assert all(prows2[L]["ppl_baseline"] == prev_base for L in prows2), \
+    "the reused baseline must match the checkpointed one"
+assert prows2[1]["accuracy"] == prows[0]["accuracy"], "finished rows kept verbatim"
+print(f"  resume: reused 2/3 points + cached baseline {prev_base}, ran only L=4")
+
+# A conflicting configuration is refused; --recompute overwrites it.
+assert scaling_main([
+    "tiny-gpt2", "--block", "0", "--layer-type", "c_proj", "--gate-sizes", "2",
+    "--layers", "1", "--optimizer", "gradient", "--disentangle-gd-steps", "2",
+    "--max-length", "64", "--stride", "64", "--eval-tokens", "256",
+    "--ppl-batch-size", "4", "--results-dir", SCRATCH + "-fig3ppl", "--no-plots",
+]) == 2
+rc = scaling_main([
+    "tiny-gpt2", "--block", "0", "--layer-type", "c_proj", "--gate-sizes", "2",
+    "--layers", "1", "--recompute", "--disentangle-sweeps", "12",
+    "--max-length", "64", "--stride", "64", "--eval-tokens", "256",
+    "--ppl-batch-size", "4", "--results-dir", SCRATCH + "-fig3ppl", "--no-plots",
+])
+assert rc == 0
+with ppl_csv.open() as f:
+    assert len(list(_csv.DictReader(f))) == 1, "--recompute rewrites the CSV fresh"
+print("  refuses a conflicting config; --recompute overwrites")
+
 print("\nALL HYBRID SMOKE STAGES PASSED")

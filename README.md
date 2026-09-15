@@ -688,6 +688,14 @@ The perplexity probe is controlled by `--dataset` / `--eval-tokens` /
 `--max-length` / `--stride` / `--ppl-batch-size`, and skipped with
 `--no-perplexity` (it is unavailable with `--shape`, which has no model).
 
+The CSV **checkpoints**: a re-run reuses every `(gate size, L)` point already in
+it (and, on the model path, the cached baseline perplexity), so an interrupted
+sweep resumes and adding more `L` values only pays for the new points -- the same
+resume behaviour as the CompactifAI and hybrid sweeps. A run whose configuration
+(layer, MPO geometry, optimizer, target `chi'`, disentangle target) differs from
+the CSV is refused; pass `--recompute` to recompute from scratch or `--csv-name`
+to write a separate file.
+
 The layer is either a real model weight (`--block` / `--layer-type`, needs the
 Hugging Face files) or a synthetic matrix (`--shape`, offline and reproducible).
 On the synthetic matrix the **accuracy-vs-`L` trend reproduces faithfully**; the
