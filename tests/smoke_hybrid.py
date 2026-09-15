@@ -42,6 +42,15 @@ from qllm.disentangler import (
 from qllm.compactifai import build_plan, compress_weight, full_rank_chi
 
 print("=== 1. Circuit algebra ===")
+# The gates are genuine PennyLane circuits (qml.QubitUnitary on brickwall wires).
+import pennylane as qml
+from qllm.disentangler import circuit_ops, circuit_unitary
+_ops = circuit_ops(build_circuit(6, 2, 2, init="random",
+                                 generator=torch.Generator().manual_seed(1)))
+assert _ops and all(isinstance(o, qml.QubitUnitary) for o in _ops), \
+    "disentangler gates must be PennyLane QubitUnitary ops"
+print(f"  gates are PennyLane ops: {type(_ops[0]).__name__} on wires "
+      f"{_ops[0].wires.tolist()} (x{len(_ops)})")
 for n, k, D in [(6, 2, 3), (5, 2, 4), (8, 3, 2), (4, 4, 1)]:
     gates = build_circuit(n, k, D, init="random",
                           generator=torch.Generator().manual_seed(1))
@@ -49,6 +58,8 @@ for n, k, D in [(6, 2, 3), (5, 2, 4), (8, 3, 2), (4, 4, 1)]:
     Y = apply_circuit(gates, X, n)
     assert torch.allclose(apply_circuit(gates, Y, n, transpose=True), X, atol=1e-5)
     U = apply_circuit(gates, torch.eye(1 << n), n)          # explicit matrix
+    # The PennyLane-composed register unitary equals the applied circuit.
+    assert torch.allclose(circuit_unitary(gates, n), U, atol=1e-5)
     assert torch.allclose(U @ U.T, torch.eye(1 << n), atol=1e-5), "not orthogonal"
     assert torch.allclose(U @ X, Y, atol=1e-5), "circuit != matrix product"
     R = torch.randn(9, 1 << n)

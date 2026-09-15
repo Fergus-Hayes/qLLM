@@ -34,6 +34,8 @@ from .compactifai_sweep import CompactifaiConfig, run_sweep
 from .compressibility_metrics import correlate as correlate_compressibility
 from .disentangler import (
     DisentangleResult,
+    circuit_ops,
+    circuit_unitary,
     disentangle,
     hybrid_weight,
     quantum_param_count,
@@ -73,6 +75,8 @@ __all__ = [
     "qubit_mpo_dims",
     "correlate_compressibility",
     "DisentangleResult",
+    "circuit_ops",
+    "circuit_unitary",
     "disentangle",
     "hybrid_weight",
     "quantum_param_count",

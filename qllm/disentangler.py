@@ -21,33 +21,40 @@ and columns never carry signal) but it *does* enlarge the residual MPO, which is
 why :func:`disentangle` also supports ``depth=0`` -- the circuits are then the
 identity and the run measures the padding overhead alone.
 
-Optimization
-------------
-The objective is the one the disentangling accuracy of the paper measures, in
-its error form:
+Quantum circuits (PennyLane)
+----------------------------
+The disentanglers are genuine **PennyLane** circuits: each few-qubit gate is a
+``qml.QubitUnitary`` placed on its brickwall wires, and the operator a circuit
+applies is realized by ``qml.matrix`` (see :func:`circuit_unitary`). Every
+full-circuit application here -- forming ``MPO_new = U^T W_pad V`` and rebuilding
+the layer in :func:`hybrid_weight` -- runs through that PennyLane matrix, and the
+gate list can be handed to hardware/transpilation via :func:`circuit_ops`.
+
+Training (the paper's explicit disentangling algorithm)
+-------------------------------------------------------
+The parameters are the gate unitaries, trained by the environment / SVD sweep of
+Appendix A -- *not* by gradient descent, parameter-shift, or a device. The
+objective is the disentangling accuracy in its error form,
 
     minimize_{U, V}  || U^T W V  -  T_chi(U^T W V) ||_F ,
 
-with ``T_chi`` the MPO truncation at the target bond dimension. It is optimized
-by alternation, exactly as in Appendix A of the paper:
+optimized by alternation:
 
 1. **Target step** -- ``M <- T_chi(U^T W V)``: the truncation is the best bond-chi
    approximation of the current disentangled operator.
 2. **Gate sweeps** -- with ``M`` fixed, maximize the overlap ``<W, U M V^T>``.
    The overlap is *linear* in every individual gate, so for gate ``g`` it reads
    ``<g, E_g>`` with ``E_g`` the environment tensor (the network with ``g``
-   removed). The maximizer over the orthogonal group is the polar factor of the
-   environment: ``E_g = P S Q  ->  g <- P Q``.
+   removed). The paper's update sets the gate to the polar factor of the
+   environment, ``E_g = A S B -> g <- A B`` (Eq. A4), the exact maximizer of
+   ``<g, E_g>`` over the orthogonal group.
 
 Because ``U`` and ``V`` are orthogonal, ``||W - U M V^T|| = ||U^T W V - M||``, so
 step 1 and step 2 both decrease the *same* error and the iteration is monotone --
-:func:`disentangle` asserts this and reports the retained weight per sweep.
-
-Sweeping costs no extra memory: the gates are orthogonal, so the partial product
-to the right of the current gate is recovered from the running one by applying
-the *old* gate transposed, and the partial product to the left is accumulated
-from the freshly updated gates. One sweep therefore costs O(#gates) applications
-of a gate to the padded matrix and stores O(1) of them.
+:func:`disentangle` asserts this and reports the retained weight per sweep. The
+environment sweep applies one gate at a time to the operator (the quantum gate's
+local action on two qubits); the closed-form SVD update makes each gate optimal
+given the rest.
 """
 
 from __future__ import annotations
@@ -56,6 +63,8 @@ import math
 import time
 from dataclasses import dataclass, field
 
+import numpy as np
+import pennylane as qml
 import torch
 
 from .compactifai import MPOPlan, mpo_param_count
@@ -84,10 +93,24 @@ def pad_to_qubits(weight: torch.Tensor) -> tuple[torch.Tensor, int, int]:
 # --------------------------------------------------------------------------- #
 @dataclass
 class Gate:
-    """One few-qubit gate: a real orthogonal matrix on qubits ``[start, start+k)``."""
+    """One few-qubit gate: a real orthogonal matrix on qubits ``[start, start+k)``.
+
+    Realized as a ``qml.QubitUnitary`` on :attr:`wires`; ``matrix`` is the current
+    unitary, the trainable parameter the environment-SVD sweep updates in place.
+    """
     start: int
     k: int
     matrix: torch.Tensor
+
+    @property
+    def wires(self) -> list[int]:
+        return list(range(self.start, self.start + self.k))
+
+    def op(self) -> "qml.operation.Operator":
+        """This gate as a PennyLane operation (for simulation / transpilation)."""
+        return qml.QubitUnitary(
+            self.matrix.detach().to(torch.float64).cpu().numpy(),
+            wires=self.wires, unitary_check=False)
 
 
 def gate_positions(n_qubits: int, gate_size: int, depth: int) -> list[tuple[int, int]]:
@@ -170,16 +193,43 @@ def build_circuit(n_qubits: int, gate_size: int, depth: int, init: str = "identi
 
 
 # --------------------------------------------------------------------------- #
-# Applying gates / circuits
+# Applying gates / circuits -- realized by PennyLane
 # --------------------------------------------------------------------------- #
+def circuit_ops(gates: list[Gate]) -> list["qml.operation.Operator"]:
+    """The brickwall as a list of PennyLane operations (queue these in a QNode)."""
+    return [g.op() for g in gates]
+
+
+def circuit_unitary(gates: list[Gate], n_qubits: int) -> torch.Tensor:
+    """The register unitary of the brickwall, composed by PennyLane.
+
+    Each :class:`Gate` becomes a ``qml.QubitUnitary`` on its wires and ``qml.matrix``
+    contracts them into the ``2^n x 2^n`` operator the circuit applies -- wire 0 is
+    the most significant bit, matching the qubit embedding. This is how the
+    disentangler circuits are *run*: the full-circuit applications below and the
+    reconstruction in :func:`hybrid_weight` all go through this matrix.
+    """
+    if not gates:
+        return torch.eye(1 << n_qubits, dtype=torch.float32)
+
+    def _qfunc():
+        # Construct each gate inside the circuit so PennyLane queues it in order.
+        for g in gates:
+            qml.QubitUnitary(g.matrix.detach().to(torch.float64).cpu().numpy(),
+                             wires=g.wires, unitary_check=False)
+
+    mat = qml.matrix(_qfunc, wire_order=list(range(n_qubits)))()
+    return torch.as_tensor(np.real(np.asarray(mat)), dtype=torch.float32)
+
+
 def apply_gate(tensor: torch.Tensor, gate: torch.Tensor, start: int, k: int,
                n_qubits: int) -> torch.Tensor:
-    """Apply a ``k``-qubit gate to the row index of ``tensor`` (shape ``(2^n, C)``).
+    """Apply one ``k``-qubit gate's unitary to the row index of ``tensor``.
 
-    Qubit ``0`` is the most significant bit of the row index, so a *contiguous*
-    block of qubits is already a contiguous stride of the flat index: the
-    operation is a reshape into ``(left, 2^k, rest)`` and one batched matmul --
-    no permutation or copy of the big tensor.
+    The local action of the quantum gate: qubit ``0`` is the most significant bit,
+    so a contiguous block of qubits is a contiguous stride of the flat index and
+    the gate is one reshape into ``(left, 2^k, rest)`` and a batched matmul. Used
+    inside the environment sweep, where a single gate is peeled at a time.
     """
     left = 1 << start
     mid = 1 << k
@@ -190,20 +240,20 @@ def apply_gate(tensor: torch.Tensor, gate: torch.Tensor, start: int, k: int,
 
 def apply_circuit(gates: list[Gate], tensor: torch.Tensor, n_qubits: int,
                   transpose: bool = False) -> torch.Tensor:
-    """``C X`` (or ``C^T X``) for ``C = G_last ... G_first``."""
-    out = tensor
-    order = reversed(gates) if transpose else gates
-    for g in order:
-        mat = g.matrix.T if transpose else g.matrix
-        out = apply_gate(out, mat, g.start, g.k, n_qubits)
-    return out
+    """``C X`` (or ``C^T X``): the PennyLane circuit acting on the row index."""
+    if not gates:
+        return tensor
+    unitary = circuit_unitary(gates, n_qubits)
+    return (unitary.T if transpose else unitary) @ tensor
 
 
 def apply_right(gates: list[Gate], tensor: torch.Tensor, n_qubits: int,
                 transpose: bool = False) -> torch.Tensor:
     """``X C^T`` (or ``X C``): the circuit acting on the *column* index of ``X``."""
-    moved = apply_circuit(gates, tensor.T.contiguous(), n_qubits, transpose=transpose)
-    return moved.T.contiguous()
+    if not gates:
+        return tensor
+    unitary = circuit_unitary(gates, n_qubits)
+    return tensor @ (unitary if transpose else unitary.T)
 
 
 def _environment(left: torch.Tensor, right: torch.Tensor, start: int, k: int) -> torch.Tensor:
@@ -216,7 +266,13 @@ def _environment(left: torch.Tensor, right: torch.Tensor, start: int, k: int) ->
 
 
 def _polar(matrix: torch.Tensor) -> torch.Tensor:
-    """Orthogonal factor of ``E``: the maximizer of ``<g, E>`` over ``O(m)``."""
+    """Paper's Eq. (A4) gate update: the polar factor of the environment.
+
+    For ``E = A S B`` (SVD) the maximizer of ``<g, E>`` over the orthogonal group
+    is ``A B`` -- the paper writes the conjugate ``B^dagger A^dagger`` for the
+    gate as it enters ``U^dagger``; here the gate enters as ``U`` so the factor is
+    ``A B``. This is a closed-form optimal step, not a gradient update.
+    """
     p, _s, q = torch.linalg.svd(matrix, full_matrices=False)
     return p @ q
 
