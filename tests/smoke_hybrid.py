@@ -429,10 +429,29 @@ with fig3_csv.open() as f:
 accs = [float(r["accuracy"]) for r in scan]
 assert accs[-1] > accs[0], f"accuracy should rise with L: {accs}"
 assert all(r["target_chi"] == "1" and r["tensorization"] == "qubit" for r in scan)
+assert all(r["ppl_ratio"] in ("", "nan") for r in scan), "no perplexity without a model"
 print(f"  accuracy(Eq.4) rises with L for k=2: {accs[0]:.4f} (L=1) -> {accs[-1]:.4f} "
       f"(L={scan[-1]['n_layers']})")
 # k>2 refused, and it runs offline from a synthetic shape (no model needed)
 assert scaling_main(["--shape", "8x8", "--gate-sizes", "4"]) == 2
 print("  runs offline on a synthetic shape; rejects k>2")
+
+# On the model path it additionally measures the perplexity-vs-L curve (the
+# target layer swapped for its disentangled chi'=1 reconstruction at each L).
+shutil.rmtree(SCRATCH + "-fig3ppl", ignore_errors=True)
+rc = scaling_main([
+    "tiny-gpt2", "--block", "0", "--layer-type", "c_proj", "--gate-sizes", "2",
+    "--layers", "1", "8", "--target-chi", "1", "--disentangle-sweeps", "12",
+    "--max-length", "64", "--stride", "64", "--eval-tokens", "256",
+    "--ppl-batch-size", "4", "--results-dir", SCRATCH + "-fig3ppl", "--no-plots",
+])
+assert rc == 0
+ppl_csv = _Path(SCRATCH + "-fig3ppl") / "tiny-gpt2" / "disentangle_scaling" / "disentangle_scaling.csv"
+with ppl_csv.open() as f:
+    prows = list(_csv.DictReader(f))
+assert prows and all(float(r["ppl_ratio"]) > 0 and r["perplexity"] for r in prows), \
+    "model path must record a finite perplexity per L"
+print(f"  model path adds perplexity vs L: x{float(prows[0]['ppl_ratio']):.4f} -> "
+      f"x{float(prows[-1]['ppl_ratio']):.4f} baseline")
 
 print("\nALL HYBRID SMOKE STAGES PASSED")

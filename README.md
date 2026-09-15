@@ -678,14 +678,23 @@ python disentangle_scaling.py --shape 192x576 --gate-sizes 1 2 --max-layers 35
 ```
 
 It uses the paper's **fixed** bond-1 target (`--disentangle-target fixed`) and the
-**qubit** MPO by default, writes `disentangle_scaling.csv`, and plots the two
-Fig. 3 panels (accuracy and entropy vs. `L`, log-`x`). The layer is either a real
-model weight (`--block` / `--layer-type`, needs the Hugging Face files) or a
-synthetic matrix (`--shape`, offline and reproducible). On the synthetic matrix
-the **accuracy-vs-`L` trend reproduces faithfully**; the *entropy-decreases* half
-of Fig. 3 and the exact magnitudes need the real trained layer (a random matrix
-has little to disentangle). `--optimizer gradient` runs the same sweep with the
-gradient-trained circuits.
+**qubit** MPO by default, writes `disentangle_scaling.csv`, and plots the Fig. 3
+panels (accuracy and entropy vs. `L`, log-`x`). On the **model path** it adds a
+third **perplexity-vs-`L`** curve: at each `L` the target layer is swapped for its
+disentangled `chi'`-truncated reconstruction (`U T_{chi'}(MPO_new) V^T`), the full
+model is re-scored, and `perplexity / baseline` is plotted against `L` -- so you
+see the accuracy gain turn into a shrinking perplexity cost as layers are added.
+The perplexity probe is controlled by `--dataset` / `--eval-tokens` /
+`--max-length` / `--stride` / `--ppl-batch-size`, and skipped with
+`--no-perplexity` (it is unavailable with `--shape`, which has no model).
+
+The layer is either a real model weight (`--block` / `--layer-type`, needs the
+Hugging Face files) or a synthetic matrix (`--shape`, offline and reproducible).
+On the synthetic matrix the **accuracy-vs-`L` trend reproduces faithfully**; the
+*entropy-decreases* half of Fig. 3, the perplexity curve, and the exact
+magnitudes need the real trained layer (a random matrix has little to
+disentangle, and perplexity needs a model). `--optimizer gradient` runs the same
+sweep with the gradient-trained circuits.
 
 ## Use as a library
 
