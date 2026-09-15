@@ -208,18 +208,28 @@ def circuit_unitary(gates: list[Gate], n_qubits: int) -> torch.Tensor:
     the most significant bit, matching the qubit embedding. This is how the
     disentangler circuits are *run*: the full-circuit applications below and the
     reconstruction in :func:`hybrid_weight` all go through this matrix.
+
+    The gate matrices are passed as torch tensors (PennyLane's torch interface),
+    so ``qml.matrix`` keeps the autograd graph -- when the gates depend on
+    trainable angles the returned unitary is differentiable, which is how the
+    gradient scheme optimizes the circuit directly through PennyLane.
     """
     if not gates:
         return torch.eye(1 << n_qubits, dtype=torch.float32)
 
     def _qfunc():
-        # Construct each gate inside the circuit so PennyLane queues it in order.
+        # Construct each gate inside the circuit so PennyLane queues it in order,
+        # keeping the torch tensor (do not detach) so gradients flow through.
         for g in gates:
-            qml.QubitUnitary(g.matrix.detach().to(torch.float64).cpu().numpy(),
-                             wires=g.wires, unitary_check=False)
+            qml.QubitUnitary(g.matrix.to(torch.float64), wires=g.wires,
+                             unitary_check=False)
 
-    mat = qml.matrix(_qfunc, wire_order=list(range(n_qubits)))()
-    return torch.as_tensor(np.real(np.asarray(mat)), dtype=torch.float32)
+    u = qml.matrix(_qfunc, wire_order=list(range(n_qubits)))()
+    if not torch.is_tensor(u):                       # numpy fallback (no torch inputs)
+        u = torch.as_tensor(np.asarray(u))
+    if torch.is_complex(u):
+        u = u.real
+    return u.to(torch.float32)
 
 
 def apply_gate(tensor: torch.Tensor, gate: torch.Tensor, start: int, k: int,
@@ -373,17 +383,11 @@ def _gate_from_angles(theta: torch.Tensor, k: int) -> torch.Tensor:
     return torch.linalg.matrix_exp(_skew(theta, 1 << k))
 
 
-def _register_unitary_torch(gate_mats: list[torch.Tensor],
-                            positions: list[tuple[int, int]], n: int) -> torch.Tensor:
-    """Differentiable register unitary from gate matrices (torch, for autograd).
-
-    Mirrors :func:`circuit_unitary` but built in torch so gradients flow to the
-    gate angles; the trained gates are re-materialized as PennyLane ops afterward.
-    """
-    u = torch.eye(1 << n, dtype=gate_mats[0].dtype if gate_mats else torch.float32)
-    for (start, k), g in zip(positions, gate_mats):
-        u = apply_gate(u, g, start, k, n)
-    return u
+def _gates_from_angles(thetas: list[torch.Tensor],
+                       positions: list[tuple[int, int]]) -> list[Gate]:
+    """Build :class:`Gate` objects (differentiable matrices) from angle tensors."""
+    return [Gate(s, k, _gate_from_angles(t, k))
+            for t, (s, k) in zip(thetas, positions)]
 
 
 def disentangle_loss(current: torch.Tensor, out_dims: list[int], in_dims: list[int],
@@ -443,10 +447,11 @@ def _train_gradient(padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
     opt = torch.optim.Adam(params, lr=lr)
     for step in range(max(1, steps)):
         opt.zero_grad()
-        gu = [_gate_from_angles(t, k) for t, (_s, k) in zip(theta_u, pos_u)]
-        gv = [_gate_from_angles(t, k) for t, (_s, k) in zip(theta_v, pos_v)]
-        u = _register_unitary_torch(gu, pos_u, n_out)
-        v = _register_unitary_torch(gv, pos_v, n_in)
+        # Build the circuits from the current angles and get their unitaries
+        # THROUGH PennyLane (circuit_unitary, torch interface) -- autograd flows
+        # from the loss back to the angles via the PennyLane circuit itself.
+        u = circuit_unitary(_gates_from_angles(theta_u, pos_u), n_out)
+        v = circuit_unitary(_gates_from_angles(theta_v, pos_v), n_in)
         current = u.transpose(0, 1) @ padded @ v
         loss = disentangle_loss(current, out_dims, in_dims, n_sites, target_chi)
         loss.backward()
