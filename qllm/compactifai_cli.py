@@ -70,9 +70,19 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="CPU threads for torch intra-op parallelism.")
 
     # Compression / bond dimension.
+    parser.add_argument("--tensorization", default="balanced",
+                        choices=["balanced", "qubit"],
+                        help="MPO geometry: 'balanced' (2-site, one cached SVD, "
+                             "the default) or 'qubit' (one dim-2 site per qubit, "
+                             "the paper's geometry -- 36 params at chi=1 for the "
+                             "(576,192) layer, at the cost of no SVD cache).")
+    parser.add_argument("--qubit-align", default="msb", choices=["msb", "lsb"],
+                        help="Qubit MPO only: pair the leading ('msb') or "
+                             "trailing ('lsb') qubits when the two indices need "
+                             "a different qubit count.")
     parser.add_argument("--mpo-sites", type=int, default=2,
-                        help="Number of MPO tensors per weight matrix "
-                             "(2 = one SVD, enables the cached fast path).")
+                        help="Number of MPO tensors per weight matrix for the "
+                             "'balanced' tensorization (2 = one SVD, cached).")
     parser.add_argument("--chi-min", type=int, default=2,
                         help="Smallest bond dimension in the sweep.")
     parser.add_argument("--chi-max", type=int, default=None,
@@ -207,6 +217,8 @@ def main(argv=None) -> int:
         dtype=args.dtype,
         trust_remote_code=args.trust_remote_code,
         revision=args.revision,
+        tensorization=args.tensorization,
+        qubit_align=args.qubit_align,
         mpo_sites=args.mpo_sites,
         chi_min=args.chi_min,
         chi_max=args.chi_max,

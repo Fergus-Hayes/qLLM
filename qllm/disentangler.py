@@ -58,7 +58,8 @@ from dataclasses import dataclass, field
 
 import torch
 
-from .compactifai import MPOPlan, build_plan, compress_weight, mpo_param_count
+from .compactifai import MPOPlan, mpo_param_count
+from .qubit_mpo import make_plan, plan_bond_entropy, plan_compress
 
 
 # --------------------------------------------------------------------------- #
@@ -299,7 +300,8 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
                       target_chi: int = 1, n_sites: int = 2, sweeps: int = 12,
                       tol: float = 1e-6, init: str = "identity", seed: int = 0,
                       param_counting: str = "manifold",
-                      target_mode: str = "adaptive",
+                      target_mode: str = "adaptive", tensorization: str = "balanced",
+                      qubit_align: str = "msb",
                       log: bool = False) -> DisentangleResult:
     """Disentangle ``W`` into ``U MPO_new V^T`` with brickwall circuits of depth ``D``.
 
@@ -325,9 +327,12 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
     u_gates = build_circuit(n_out, gate_size, depth, init, generator)
     v_gates = build_circuit(n_in, gate_size, depth, init, generator)
 
+    def _plan(op):
+        return make_plan(op, tensorization, n_sites, svd_cache=True, align=qubit_align)
+
     # Classical reference: the same truncation with the circuits switched off.
-    plan_pad = build_plan(padded, n_sites, cache=True)
-    trunc_pad, _ = compress_weight(padded, plan_pad, target_chi)
+    plan_pad = _plan(padded)
+    trunc_pad, _ = plan_compress(padded, plan_pad, target_chi)
     retained_classical = float(torch.linalg.norm(trunc_pad)) / norm if norm else 0.0
     target_ref = trunc_pad                       # MPO_target of the paper's Eq. (4)
     ref_norm = float(torch.linalg.norm(target_ref))
@@ -338,8 +343,8 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
     sweeps_run = 0
     for sweep in range(max(1, sweeps)):
         # Where the circuits stand now: the weight the truncation keeps.
-        plan = build_plan(current, n_sites, cache=True)
-        truncated, _ = compress_weight(current, plan, target_chi)
+        plan = _plan(current)
+        truncated, _ = plan_compress(current, plan, target_chi)
         retained = float(torch.linalg.norm(truncated)) / norm if norm else 0.0
         history.append(retained)
         if not u_gates and not v_gates:
@@ -366,8 +371,8 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
             break                                # the gate sweeps have converged
         score = new_score
 
-    plan = build_plan(current, n_sites, cache=True)
-    final_target, _ = compress_weight(current, plan, target_chi)
+    plan = _plan(current)
+    final_target, _ = plan_compress(current, plan, target_chi)
     retained = float(torch.linalg.norm(final_target)) / norm if norm else 0.0
     history.append(retained)
     accuracy = (float((target_ref * current).sum()) / (norm * ref_norm)
@@ -381,7 +386,7 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
         quantum_params=quantum_param_count(n_out, n_in, gate_size, depth,
                                            param_counting),
         target_chi=target_chi, accuracy=accuracy,
-        entropy=bond_entropy(current, plan), retained=retained,
+        entropy=plan_bond_entropy(current, plan), retained=retained,
         retained_classical=retained_classical, sweeps_run=sweeps_run,
         seconds=time.perf_counter() - t0, history=history,
     )
@@ -396,7 +401,7 @@ def hybrid_weight(result: DisentangleResult, chi: int) -> tuple[torch.Tensor, in
     plan's full rank this reproduces ``W`` exactly, because ``U`` and ``V`` are
     orthogonal and the padding carries no signal.
     """
-    truncated, params = compress_weight(result.operator, result.plan, chi)
+    truncated, params = plan_compress(result.operator, result.plan, chi)
     dense = apply_right(result.v_gates,
                         apply_circuit(result.u_gates, truncated, result.n_out_qubits),
                         result.n_in_qubits)
@@ -413,6 +418,7 @@ def disentangle(weight: torch.Tensor, gate_size: int, depth: int,
                 target_chi: int = 1, n_sites: int = 2, sweeps: int = 12,
                 tol: float = 1e-6, init: str = "identity", seed: int = 0,
                 param_counting: str = "manifold", target_mode: str = "adaptive",
+                tensorization: str = "balanced", qubit_align: str = "msb",
                 restarts: int = 1, log: bool = False) -> DisentangleResult:
     """Disentangle ``W``, keeping the best of ``restarts`` initializations.
 
@@ -426,12 +432,12 @@ def disentangle(weight: torch.Tensor, gate_size: int, depth: int,
     """
     best = _disentangle_once(weight, gate_size, depth, target_chi, n_sites,
                              sweeps, tol, init, seed, param_counting,
-                             target_mode, log)
+                             target_mode, tensorization, qubit_align, log)
     for extra in range(1, max(1, restarts)):
         candidate = _disentangle_once(weight, gate_size, depth, target_chi,
                                       n_sites, sweeps, tol, "random",
                                       seed + extra, param_counting, target_mode,
-                                      log)
+                                      tensorization, qubit_align, log)
         if candidate.retained > best.retained:
             best = candidate
     return best

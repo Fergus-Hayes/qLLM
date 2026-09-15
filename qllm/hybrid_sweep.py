@@ -39,8 +39,6 @@ from .benchmark import (
     tokenize_corpus,
 )
 from .compactifai import (
-    build_plan,
-    compress_weight,
     full_rank_chi,
     log_spaced_ints,
     relative_error,
@@ -54,6 +52,7 @@ from .compactifai_sweep import (
     select_layers,
 )
 from .disentangler import disentangle, hybrid_weight, n_qubits_for
+from .qubit_mpo import make_plan, plan_compress
 from .layer_analysis import parse_layer_info
 
 # The circuits are restricted to at most two-qubit gates. This is the
@@ -208,8 +207,9 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
     originals = {name: p.detach().to("cpu", copy=True) for name, p in layers}
 
     # Classical plans (one cached SVD per layer, reused across chi).
-    classical_plans = {name: build_plan(originals[name], config.mpo_sites,
-                                        cache=config.svd_cache)
+    classical_plans = {name: make_plan(originals[name], config.tensorization,
+                                       config.mpo_sites, svd_cache=config.svd_cache,
+                                       align=config.qubit_align)
                        for name, _ in layers}
 
     auto_max = max(plan.max_chi for plan in classical_plans.values())
@@ -305,7 +305,7 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
     for _kind, name, param, chi, _d in todo:
         plan = classical_plans[name]
         orig = originals[name]
-        approx, params_mpo = compress_weight(orig, plan, chi)
+        approx, params_mpo = plan_compress(orig, plan, chi)
         err = relative_error(orig, approx)
         with torch.no_grad():
             param.copy_(approx.to(dtype=param.dtype, device=param.device))
@@ -344,6 +344,7 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
         print(f"  disentangling {layer_type} d{block} D={d} k={k_eff} ...")
         res = disentangle(
             orig, gate_size=k_eff, depth=d,
+            tensorization=config.tensorization, qubit_align=config.qubit_align,
             target_chi=config.disentangle_target_chi, n_sites=config.mpo_sites,
             sweeps=config.disentangle_sweeps, tol=config.disentangle_tol,
             init=config.disentangle_init, seed=config.disentangle_seed,

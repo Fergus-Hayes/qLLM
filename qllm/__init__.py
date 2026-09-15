@@ -23,6 +23,13 @@ from .compactifai import (
     compress_weight,
     mpo_param_count,
 )
+from .qubit_mpo import (
+    build_qubit_plan,
+    compress_weight_qubit,
+    make_plan,
+    plan_compress,
+    qubit_mpo_dims,
+)
 from .compactifai_sweep import CompactifaiConfig, run_sweep
 from .compressibility_metrics import correlate as correlate_compressibility
 from .disentangler import (
@@ -59,6 +66,11 @@ __all__ = [
     "build_plan",
     "compress_weight",
     "mpo_param_count",
+    "build_qubit_plan",
+    "compress_weight_qubit",
+    "make_plan",
+    "plan_compress",
+    "qubit_mpo_dims",
     "correlate_compressibility",
     "DisentangleResult",
     "disentangle",

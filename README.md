@@ -472,6 +472,38 @@ disentangling optimization is reused across the whole `chi'` grid (its SVD is
 cached), exactly as the classical sweep reuses one SVD per layer, so the heavy
 term is the perplexity probe: one evaluation per measured point.
 
+### Tensorization: `balanced` (2-site) vs. `qubit` (the paper's geometry)
+
+`--tensorization` (on both `compactify.py` and `hybridize.py`) chooses how the
+MPO factorizes a weight matrix. It applies to **both** curves -- the classical
+`C(chi)` and the hybrid `C(chi')` -- so the comparison stays apples-to-apples.
+
+| | `balanced` (default) | `qubit` |
+| --- | --- | --- |
+| **split** | each index into two coarse factors (`576 -> [24, 24]`) | each index into `log2` dim-2 legs, one MPO site per qubit |
+| **`C(chi=1)` for `(576,192)`** | 672 | **36** (matches the paper's Table I: 36, 132, 696, …) |
+| **SVDs** | one, cached and re-truncated across the whole sweep | `max(n_out, n_in)` sequential per bond dimension (no cache) |
+| **use it for** | fast sweeps, cross-layer scans | matching the paper's parameter counts; the finest compression |
+
+The `qubit` tensorization is exactly the paper's: for the `(192, 576)` layer it
+gives 10 sites (8 paired `(2,2)` sites plus 2 input-only `(1,2)` sites at the
+tail), storing `36` parameters at bond 1 and `132` at bond 2 -- reproducing
+Table I to the integer. Where the two indices need a different qubit count,
+`--qubit-align` decides whether the leading (`msb`, default) or trailing (`lsb`)
+qubits pair up. It is slower (no single-SVD cache) and the qubit padding is a
+real cost the `D=0` row still exposes, but the parameter counts are now the
+paper's.
+
+```bash
+# Classical CompactifAI sweep with the paper's per-qubit MPO
+python compactify.py --mode per-layer --tensorization qubit --layer-types v_proj
+
+# The full M*/N* comparison, both curves on the qubit geometry
+python hybridize.py MODEL_ID --profile-depths 10 --layer-types v_proj \
+    --tensorization qubit --gate-sizes 2 --circuit-depths 0 1 2 4 8 \
+    --solve --budgets 1.003 --q-weights 0 1
+```
+
 ### Prune the grid first (no model, no tokens)
 
 Whether the hybrid *can* win is settled by arithmetic before any token is
@@ -611,7 +643,8 @@ python hybridize.py HuggingFaceTB/SmolLM2-135M \
 
 `--profile-depths 10` picks block 10, `--layer-types v_proj` its `(576, 192)`
 projection (`k_proj` is the same shape), and `--budgets 1.003` is the paper's
-headline tolerance for that layer (`+0.3%` perplexity). Point the same command
+headline tolerance for that layer (`+0.3%` perplexity). Add `--tensorization
+qubit` to match the paper's parameter counts exactly (36 at `chi'=1`, 132 at 2). Point the same command
 at any `MODEL_ID`, block, or layer type to compare a different layer. Because
 this build's gates are `k <= 2`, the disentangling is weaker than the paper's
 wide-gate circuits -- which is exactly what `M*/N*` at `w > 0` quantifies.
@@ -659,6 +692,7 @@ qllm/
   disentangler.py      # PQC disentanglers: brickwall circuits + environment sweeps
   hybrid_sweep.py      # PPL(chi) and PPL(chi', D, k) on the same probe tokens
   hybrid_planner.py    # offline verdict on (k, D) from parameter counts alone
+  qubit_mpo.py         # per-qubit MPO tensorization (paper geometry), both methods
   hybrid_cli.py        # hybrid-sweep CLI (+ --solve: sweep and report M*/N*)
   budget_frontier.py   # N*, M*, M*/N*, break-even price, Pareto front
   budget_plots.py      # figures for the budget comparison

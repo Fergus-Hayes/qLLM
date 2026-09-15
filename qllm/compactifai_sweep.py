@@ -43,8 +43,6 @@ from .benchmark import (
     tokenize_corpus,
 )
 from .compactifai import (
-    build_plan,
-    compress_weight,
     full_rank_chi,
     log_spaced_ints,
     mpo_bond_dims,
@@ -53,6 +51,7 @@ from .compactifai import (
 )
 from .compactifai_heal import heal_layer, make_heal_batches
 from .layer_analysis import parse_layer_info
+from .qubit_mpo import make_plan, plan_compress
 
 # Default targets: the Self-Attention and MLP sub-modules inside decoder blocks,
 # which is exactly the set CompactifAI tensorizes (embeddings / head excluded).
@@ -74,6 +73,8 @@ class CompactifaiConfig:
     revision: str | None = None
 
     # Compression.
+    tensorization: str = "balanced"     # "balanced" (2-site) or "qubit" (paper geometry)
+    qubit_align: str = "msb"            # qubit MPO: pair leading ("msb") or trailing ("lsb")
     mpo_sites: int = 2
     chi_min: int = 2
     chi_max: int | None = None          # None -> auto (largest useful chi)
@@ -327,7 +328,8 @@ def run_sweep(config: CompactifaiConfig) -> Path:
 
     def _build(item):
         name, param = item
-        plan = build_plan(originals[name], config.mpo_sites, cache=config.svd_cache)
+        plan = make_plan(originals[name], config.tensorization, config.mpo_sites,
+                         svd_cache=config.svd_cache, align=config.qubit_align)
         plans[name] = plan
         done["n"] += 1
         if done["n"] % max(1, len(layers) // 10) == 0 or done["n"] == len(layers):
@@ -424,7 +426,7 @@ def run_sweep(config: CompactifaiConfig) -> Path:
             layer_type, depth = parse_layer_info(name)
 
             if beneficial or config.force_all:
-                approx, params_mpo = compress_weight(orig, plan, chi)
+                approx, params_mpo = plan_compress(orig, plan, chi)
                 err = relative_error(orig, approx)
                 with torch.no_grad():
                     param.copy_(approx.to(dtype=param.dtype, device=param.device))
@@ -600,7 +602,8 @@ def run_per_layer_sweep(config: CompactifaiConfig) -> Path:
     t0 = time.perf_counter()
     plans = {}
     for i, (name, _) in enumerate(layers, start=1):
-        plans[name] = build_plan(originals[name], config.mpo_sites, cache=config.svd_cache)
+        plans[name] = make_plan(originals[name], config.tensorization, config.mpo_sites,
+                                svd_cache=config.svd_cache, align=config.qubit_align)
         if i % max(1, len(layers) // 10) == 0 or i == len(layers):
             print(f"    plans {i}/{len(layers)} ({time.perf_counter() - t0:.0f}s)")
 
@@ -689,7 +692,7 @@ def run_per_layer_sweep(config: CompactifaiConfig) -> Path:
     for i, (name, param, chi) in enumerate(todo, start=1):
         plan = plans[name]
         orig = originals[name]
-        approx, params_mpo = compress_weight(orig, plan, chi)
+        approx, params_mpo = plan_compress(orig, plan, chi)
         err = relative_error(orig, approx)
         with torch.no_grad():
             param.copy_(approx.to(dtype=param.dtype, device=param.device))

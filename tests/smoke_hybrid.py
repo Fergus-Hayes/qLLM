@@ -300,4 +300,52 @@ rc_bad = hybridize_main(["tiny-gpt2", "--gate-sizes", "4"])
 assert rc_bad == 2, "hybridize should reject k>2"
 print("  hybridize --solve ran a targeted run end-to-end and rejected k>2")
 
+# --------------------------------------------------------------------------- #
+# 7. Qubit-level MPO tensorization (the paper's geometry), both methods
+# --------------------------------------------------------------------------- #
+print("\n=== 7. Qubit MPO tensorization ===")
+from qllm.qubit_mpo import build_qubit_plan, compress_weight_qubit
+from qllm.compactifai import mpo_param_count, full_rank_chi as _frc
+
+# Parameter counts must match arXiv:2410.17397 Table I for the (192,576) layer.
+Wp = torch.randn(192, 576)
+qplan = build_qubit_plan(Wp)
+paper = {1: 36, 2: 132, 5: 696, 10: 2356, 50: 36948}
+for chi, want in paper.items():
+    got = mpo_param_count(qplan.out_dims, qplan.in_dims, chi)
+    assert got == want, f"qubit MPO chi={chi}: {got} != paper {want}"
+print("  param counts match paper Table I: "
+      + ", ".join(f"chi={c}->{v}" for c, v in paper.items()))
+# Exact at full rank, monotone in chi.
+errs = [float((Wp - compress_weight_qubit(Wp, qplan, c)[0]).norm() / Wp.norm())
+        for c in (1, 2, 8, _frc(qplan.out_dims, qplan.in_dims))]
+assert errs[0] >= errs[1] >= errs[2] >= errs[3] and errs[-1] < 1e-4, errs
+print(f"  monotone in chi, exact at full rank (err {errs[-1]:.1e})")
+
+# The disentangler and both sweep curves accept tensorization="qubit".
+r0 = disentangle(Wp, gate_size=2, depth=0, target_chi=1, tensorization="qubit")
+assert type(r0.plan).__name__ == "QubitMPOPlan"
+c1, cp = compress_weight_qubit(Wp, qplan, 1)
+h1, hp = hybrid_weight(r0, 1)
+assert (cp, hp) == (36, 36) and torch.allclose(c1, h1, atol=1e-5), \
+    "D=0 hybrid must equal the classical qubit MPO"
+r2 = disentangle(Wp, gate_size=2, depth=2, target_chi=1, tensorization="qubit", sweeps=6)
+assert float((Wp - hybrid_weight(r2, _frc(r2.plan.out_dims, r2.plan.in_dims))[0]).norm()
+             / Wp.norm()) < 1e-4
+print("  disentangler + hybrid_weight run on the qubit residual; D=0 == classical")
+
+# End-to-end sweep in qubit mode (both curves), on the tiny model.
+shutil.rmtree(SCRATCH + "-qubit", ignore_errors=True)
+qcfg = H.HybridConfig(
+    model_id="tiny-gpt2", device="cpu", dtype="float32",
+    include_pattern=r"h\.\d+\.attn\.c_proj", exclude_pattern=r"(wte|wpe|lm_head|ln|bias)",
+    tensorization="qubit", chi_min=1, chi_max=8, num_chi=3, num_depths=1,
+    circuit_depths=[0, 1], gate_sizes=[2], disentangle_sweeps=4,
+    max_length=64, stride=64, per_layer_stride=64,
+    per_layer_eval_tokens=256, ppl_batch_size=4,
+    results_dir=SCRATCH + "-qubit", make_plots=False)
+qrows = H._read_rows(H.run_hybrid_sweep(qcfg))
+assert qrows and {r["method"] for r in qrows} == {"classical", "hybrid"}
+print(f"  hybrid sweep ran in qubit mode: {len(qrows)} rows, both surfaces")
+
 print("\nALL HYBRID SMOKE STAGES PASSED")

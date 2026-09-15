@@ -65,6 +65,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--threads", type=int, default=None)
 
     # Tensor network.
+    parser.add_argument("--tensorization", default="balanced",
+                        choices=["balanced", "qubit"],
+                        help="MPO geometry for BOTH the classical and hybrid "
+                             "curves: 'balanced' (2-site, cached) or 'qubit' "
+                             "(the paper's per-qubit geometry -- 36 classical "
+                             "params at chi=1 for the (576,192) layer).")
+    parser.add_argument("--qubit-align", default="msb", choices=["msb", "lsb"])
     parser.add_argument("--mpo-sites", type=int, default=2)
     parser.add_argument("--chi-min", type=int, default=2)
     parser.add_argument("--chi-max", type=int, default=None)
@@ -214,6 +221,7 @@ def main(argv=None) -> int:
     config = HybridConfig(
         model_id=args.model, device=args.device, dtype=args.dtype,
         trust_remote_code=args.trust_remote_code, revision=args.revision,
+        tensorization=args.tensorization, qubit_align=args.qubit_align,
         mpo_sites=args.mpo_sites, chi_min=args.chi_min, chi_max=args.chi_max,
         num_chi=args.num_chi, chi_values=args.chi,
         include_pattern=args.include, exclude_pattern=args.exclude,
