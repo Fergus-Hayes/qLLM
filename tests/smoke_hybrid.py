@@ -416,7 +416,7 @@ from qllm.disentangle_scaling_cli import main as scaling_main, log_spaced_layers
 assert log_spaced_layers(35, 5)[0] == 1 and log_spaced_layers(35, 5)[-1] == 35
 shutil.rmtree(SCRATCH + "-fig3", ignore_errors=True)
 rc = scaling_main([
-    "--shape", "16x64", "--gate-sizes", "2", "--layers", "1", "4", "12",
+    "--shape", "16x64", "--gate-sizes", "2", "--layers", "0", "1", "4", "12",
     "--target-chi", "1", "--disentangle-sweeps", "20",
     "--results-dir", SCRATCH + "-fig3", "--no-plots",
 ])
@@ -431,8 +431,14 @@ accs = [float(r["accuracy"]) for r in scan]
 assert accs[-1] > accs[0], f"accuracy should rise with L: {accs}"
 assert all(r["target_chi"] == "1" and r["tensorization"] == "qubit" for r in scan)
 assert all(r["ppl_ratio"] in ("", "nan") for r in scan), "no perplexity without a model"
-print(f"  accuracy(Eq.4) rises with L for k=2: {accs[0]:.4f} (L=1) -> {accs[-1]:.4f} "
-      f"(L={scan[-1]['n_layers']})")
+print(f"  accuracy(Eq.4) rises with L for k=2: {accs[0]:.4f} (L={scan[0]['n_layers']}) -> "
+      f"{accs[-1]:.4f} (L={scan[-1]['n_layers']})")
+# D=0 is an ordinary sweep point (no circuits): Q=0, M* = C(chi'), the left end
+# of the curve, and its accuracy == the classical retained fraction.
+d0 = next(r for r in scan if int(r["n_layers"]) == 0)
+assert int(d0["gate_size"]) == 2 and int(d0["quantum_params"]) == 0, "D=0 has no circuits"
+assert int(d0["total_params"]) == int(d0["classical_params"]), "D=0 M* = C(chi')"
+assert float(d0["accuracy"]) == float(d0["retained_classical"]), "D=0 accuracy == retained_classical"
 # M* = C(chi') + Q(D): classical part constant, total grows with L (more layers)
 assert all(int(r["total_params"]) == int(r["classical_params"]) + int(r["quantum_params"])
            for r in scan), "total_params must equal classical + quantum"
@@ -441,19 +447,15 @@ for gk in {int(r["gate_size"]) for r in scan}:
     assert len({int(r["classical_params"]) for r in ks}) == 1, "C(chi') is fixed across L"
     assert int(ks[-1]["total_params"]) > int(ks[0]["total_params"]), "M* grows with L"
 m_lo, m_hi = int(scan[0]["total_params"]), int(sorted(scan, key=lambda r: int(r["total_params"]))[-1]["total_params"])
-print(f"  M* = C(chi')+Q(D) recorded and grows with L: {m_lo} -> {m_hi} params")
-# Reference rows: D=0 hybrid (identity circuits == padded TN) and the unpadded TN.
-refs = {r["kind"]: r for r in all_rows if r["kind"] in ("tn_d0", "tn_nopad")}
-assert set(refs) == {"tn_d0", "tn_nopad"}, "both reference rows must be written"
-d0, nopad = refs["tn_d0"], refs["tn_nopad"]
-assert int(d0["quantum_params"]) == 0 and int(nopad["quantum_params"]) == 0, "references have Q=0"
-assert d0["tensorization"] == "qubit" and int(d0["n_layers"]) == 0, "D=0 is the padded TN"
-assert int(d0["total_params"]) == int(d0["classical_params"]), "D=0 M* = C(chi')"
-assert int(d0["total_params"]) == int(scan[0]["classical_params"]), "D=0 == the swept C(chi')"
+print(f"  D=0 is a regular point: acc={float(d0['accuracy']):.4f}, M*=C(chi')={d0['total_params']}; "
+      f"M* grows {m_lo} -> {m_hi}")
+# Reference row: the plain TN on the *unpadded* matrix (D=0 is no longer one).
+refs = {r["kind"]: r for r in all_rows if r["kind"].startswith("tn_")}
+assert set(refs) == {"tn_nopad"}, f"only the unpadded-TN reference remains: {set(refs)}"
+nopad = refs["tn_nopad"]
+assert int(nopad["quantum_params"]) == 0, "reference has Q=0"
 assert nopad["tensorization"] == "balanced(no pad)", "unpadded TN uses the raw-dims MPO"
-assert float(d0["accuracy"]) == float(d0["retained_classical"]), "D=0 accuracy == retained_classical"
-print(f"  references: D=0 (padded TN) acc={float(d0['accuracy']):.4f} M*={d0['total_params']}; "
-      f"TN-no-pad acc={float(nopad['accuracy']):.4f} M*={nopad['total_params']}")
+print(f"  TN-no-pad reference: acc={float(nopad['accuracy']):.4f} M*={nopad['total_params']}")
 # k>2 refused, and it runs offline from a synthetic shape (no model needed)
 assert scaling_main(["--shape", "8x8", "--gate-sizes", "4"]) == 2
 print("  runs offline on a synthetic shape; rejects k>2")
@@ -473,14 +475,14 @@ with ppl_csv.open() as f:
     prows = [r for r in _csv.DictReader(f) if r["kind"] == "sweep"]
 assert prows and all(float(r["ppl_ratio"]) > 0 and r["perplexity"] for r in prows), \
     "model path must record a finite perplexity per L"
-# The references get their perplexity swapped in on the model path too.
+# The unpadded-TN reference gets its perplexity swapped in on the model path too.
 with ppl_csv.open() as f:
     prefs = {r["kind"]: r for r in _csv.DictReader(f) if r["kind"].startswith("tn_")}
-assert set(prefs) == {"tn_d0", "tn_nopad"} and all(float(r["ppl_ratio"]) > 0 for r in prefs.values()), \
-    "reference rows must carry a perplexity ratio on the model path"
+assert set(prefs) == {"tn_nopad"} and all(float(r["ppl_ratio"]) > 0 for r in prefs.values()), \
+    "the unpadded-TN reference must carry a perplexity ratio on the model path"
 print(f"  model path adds perplexity vs L: x{float(prows[0]['ppl_ratio']):.4f} -> "
       f"x{float(prows[-1]['ppl_ratio']):.4f} baseline; "
-      f"D=0 x{float(prefs['tn_d0']['ppl_ratio']):.4f}, TN-no-pad x{float(prefs['tn_nopad']['ppl_ratio']):.4f}")
+      f"TN-no-pad x{float(prefs['tn_nopad']['ppl_ratio']):.4f}")
 
 # Resume: re-running with an extra L reuses the finished points and the cached
 # baseline (no re-evaluation) instead of recomputing from scratch.
@@ -524,8 +526,8 @@ assert rc == 0
 with ppl_csv.open() as f:
     fresh = list(_csv.DictReader(f))
 assert sum(1 for r in fresh if r["kind"] == "sweep") == 1, "--recompute rewrites the CSV fresh"
-assert {r["kind"] for r in fresh if r["kind"].startswith("tn_")} == {"tn_d0", "tn_nopad"}, \
-    "--recompute recomputes the references too"
+assert {r["kind"] for r in fresh if r["kind"].startswith("tn_")} == {"tn_nopad"}, \
+    "--recompute recomputes the unpadded-TN reference too"
 print("  refuses a conflicting config; --recompute overwrites")
 
 print("\nALL HYBRID SMOKE STAGES PASSED")

@@ -686,17 +686,20 @@ parameters `C(chi')` (constant, since `chi'` and the tensorization are fixed --
 grows with the brickwall depth. The `classical_params` / `quantum_params` /
 `total_params` columns hold the numbers.
 
-Every panel also draws two **tensor-network-only reference lines** (both with
-`Q(D)=0`, so they do not depend on `L`), written to the CSV as marked rows
-(`kind` column) alongside the swept circuits:
+The sweep includes **`L = 0`** as an ordinary point -- the left end of every
+curve. Zero circuit depth means identity circuits, which collapse the hybrid to
+the plain `chi'`-truncated MPO on the *padded* qubit geometry, at `M* = C(chi')`
+and `Q(D) = 0` (`36` for the paper's qubit MPO at `chi'=1`). It is the floor the
+circuits lift off from; pass `--no-d0` to drop it. Because `L=0` cannot sit on a
+log axis, the plot's x-axis switches to symlog (linear through `0`, log beyond)
+when the point is present.
 
-* **`D=0` (TN only, padded)** -- the hybrid with zero circuit depth, i.e. the
-  identity circuits, which collapses to the plain `chi'`-truncated MPO on the
-  *padded* qubit geometry. This is the floor the circuits lift off from, at
-  `M* = C(chi')` (dashed line; `36` for the paper's qubit MPO at `chi'=1`).
+Every panel also draws one **tensor-network-only reference line** (`Q(D)=0`, so
+it does not depend on `L`), written to the CSV as a marked row (`kind` column):
+
 * **`TN only, no padding`** -- plain CompactifAI: the balanced 2-site MPO on the
   layer's *raw* dimensions, with no power-of-two padding (dash-dot line). It
-  usually retains more of the layer than the padded `D=0` truncation but costs
+  usually retains more of the layer than the padded `L=0` truncation but costs
   more parameters, so it is the classical baseline the padded hybrid undercuts.
 
 On the **model path** it adds a further **perplexity-vs-`L`** curve: at
@@ -704,9 +707,14 @@ each `L` the target layer is swapped for its
 disentangled `chi'`-truncated reconstruction (`U T_{chi'}(MPO_new) V^T`), the full
 model is re-scored, and `perplexity / baseline` is plotted against `L` -- so you
 see the accuracy gain turn into a shrinking perplexity cost as layers are added.
-The perplexity probe is controlled by `--dataset` / `--eval-tokens` /
-`--max-length` / `--stride` / `--ppl-batch-size`, and skipped with
-`--no-perplexity` (it is unavailable with `--shape`, which has no model).
+This perplexity is measured **without healing**: the compressed layer is swapped
+in cold and the rest of the model is *not* fine-tuned afterward, so the curve is
+the raw cost of the compression (the only optimization is the per-layer
+disentangling that fits the circuits + MPO to the original weight). CompactifAI's
+retraining-based healing lives in `compactifai_heal.py` / the `--heal*` options of
+the CompactifAI sweep, not here. The perplexity probe is controlled by
+`--dataset` / `--eval-tokens` / `--max-length` / `--stride` / `--ppl-batch-size`,
+and skipped with `--no-perplexity` (unavailable with `--shape`, which has no model).
 
 The CSV **checkpoints**: a re-run reuses every `(gate size, L)` point already in
 it (and, on the model path, the cached baseline perplexity), so an interrupted
