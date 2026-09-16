@@ -19,6 +19,11 @@ Examples
     python hybridize.py MODEL_ID --profile-depths 10 --layer-types v_proj \
         --gate-sizes 2 --circuit-depths 0 1 2 4 8 --solve --budgets 1.003
 
+    # Heal every point to minimise PPL (chi sweep + chi'xD grid), 32768 tokens
+    python hybridize.py MODEL_ID --profile-depths 10 --layer-types v_proj \
+        --tensorization qubit --gate-sizes 2 --chi 1 2 4 8 --circuit-depths 0 1 2 4 8 \
+        --heal --heal-mode full --per-layer-eval-tokens 32768
+
     # e.g. arXiv:2410.17397v2's layer is just those arguments on SmolLM2:
     #   MODEL_ID = HuggingFaceTB/SmolLM2-135M, --profile-depths 10,
     #   --layer-types v_proj  (its (576,192) self-attention projection)
@@ -144,6 +149,25 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--split", default="test")
     parser.add_argument("--text-column", default="text")
 
+    # Healing: brief LM-loss retraining of the swapped-in layer (all others dense)
+    # to minimize the perplexity of each (chi) and (chi', D) point.
+    parser.add_argument("--heal", action="store_true",
+                        help="Retrain each compressed point against the LM loss "
+                             "and record its healed perplexity. Classical rows "
+                             "heal the MPO bond; hybrid rows heal per --heal-mode.")
+    parser.add_argument("--heal-mode", default="full", choices=["core", "full"],
+                        help="Hybrid healing: 'core' = chi' bond only; 'full' = "
+                             "bond + U/V circuits (M* params, default).")
+    parser.add_argument("--heal-steps", type=int, default=40)
+    parser.add_argument("--heal-lr", type=float, default=1e-3)
+    parser.add_argument("--heal-tokens", type=int, default=16384,
+                        help="Calibration tokens for healing (disjoint split).")
+    parser.add_argument("--heal-batch", type=int, default=2)
+    parser.add_argument("--heal-split", default="train",
+                        help="Split for the healing calibration set (default: train).")
+    parser.add_argument("--heal-dataset", default=None,
+                        help="Healing dataset (default: same as --dataset).")
+
     parser.add_argument("--solve", action="store_true",
                         help="After the sweep, solve the memory budget on the "
                              "just-measured layers and print N*, M* and M*/N* "
@@ -228,6 +252,12 @@ def main(argv=None) -> int:
     if args.shapes:
         return _run_plan(args, [parse_shape(s) for s in args.shapes])
 
+    # Healing (minimizing PPL per point) needs a trustworthy perplexity, so when
+    # a heal run does not set the probe size, use a high default (32768 tokens).
+    if args.heal and not args.per_layer_eval_tokens:
+        args.per_layer_eval_tokens = 32768
+        print("(--heal: defaulting --per-layer-eval-tokens to 32768.)")
+
     config = HybridConfig(
         model_id=args.model, device=args.device, dtype=args.dtype,
         trust_remote_code=args.trust_remote_code, revision=args.revision,
@@ -258,6 +288,9 @@ def main(argv=None) -> int:
         quantum_param_counting=args.quantum_param_counting,
         max_qubits=args.max_qubits,
         run_classical=not args.no_classical,
+        heal=args.heal, heal_mode=args.heal_mode, heal_steps=args.heal_steps,
+        heal_lr=args.heal_lr, heal_tokens=args.heal_tokens, heal_batch=args.heal_batch,
+        heal_split=args.heal_split, heal_dataset=args.heal_dataset,
         results_dir=args.results_dir, hybrid_csv_name=args.csv_name,
         force_recompute=args.recompute,
     )

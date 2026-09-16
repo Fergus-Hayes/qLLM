@@ -41,6 +41,14 @@ from qllm.disentangler import (
 )
 from qllm.compactifai import build_plan, compress_weight, full_rank_chi
 
+def _isfinite(x):
+    import math as _m
+    try:
+        return _m.isfinite(float(x))
+    except (TypeError, ValueError):
+        return False
+
+
 print("=== 1. Circuit algebra ===")
 # The gates are genuine PennyLane circuits (qml.QubitUnitary on brickwall wires).
 import pennylane as qml
@@ -360,6 +368,40 @@ qrows = H._read_rows(qpath)
 assert qrows and {r["method"] for r in qrows} == {"classical", "hybrid"}
 assert {r["tensorization"] for r in qrows} == {"qubit"}, "rows must record the geometry"
 print(f"  hybrid sweep ran in qubit mode: {len(qrows)} rows, both surfaces")
+
+# Healing in the hybrid sweep: classical rows heal the MPO bond, hybrid rows heal
+# bond + circuits (full). Both record a healed PPL; checkpoint counts a point done
+# only when its healed column is present, and D=0 hybrid healing == classical.
+shutil.rmtree(SCRATCH + "-heal-sweep", ignore_errors=True)
+hheal = H.HybridConfig(
+    model_id="tiny-gpt2", device="cpu", dtype="float32",
+    include_pattern=r"h\.0\.attn\.c_proj", exclude_pattern=r"(wte|wpe|lm_head|ln|bias)",
+    tensorization="qubit", chi_values=[1, 2], circuit_depths=[0, 2], gate_sizes=[2],
+    num_depths=1, disentangle_sweeps=4, max_length=64, stride=64, per_layer_stride=64,
+    per_layer_eval_tokens=256, ppl_batch_size=4,
+    heal=True, heal_mode="full", heal_steps=4, heal_lr=0.02, heal_tokens=256,
+    heal_batch=2, heal_split="train", results_dir=SCRATCH + "-heal-sweep", make_plots=False)
+hpath = H.run_hybrid_sweep(hheal)
+hrows = H._read_rows(hpath)
+assert hrows and all(_isfinite(r["ppl_ratio_healed"]) for r in hrows), \
+    "every point must carry a healed perplexity"
+assert {r["heal_mode"] for r in hrows if r["method"] == "classical"} == {"core"}
+assert {r["heal_mode"] for r in hrows if r["method"] == "hybrid"} == {"full"}
+# D=0 hybrid full healing coincides with the classical MPO-bond healing at each chi.
+_cl = {r["chi"]: r["ppl_ratio_healed"] for r in hrows if r["method"] == "classical"}
+_d0 = {r["chi"]: r["ppl_ratio_healed"] for r in hrows
+       if r["method"] == "hybrid" and r["circuit_depth"] == "0"}
+assert _cl == _d0, "D=0 hybrid healing must equal classical bond healing"
+# Resume: everything is done AND the baseline is reused from the checkpoint.
+import io as _io2, contextlib as _ctx2
+_b = _io2.StringIO()
+with _ctx2.redirect_stdout(_b):
+    H.run_hybrid_sweep(hheal)
+_out = _b.getvalue()
+assert "from checkpoint" in _out and "points to run: 0" in _out, \
+    "heal resume must skip done points and reuse the baseline"
+print(f"  healing in the sweep: {len(hrows)} healed rows (classical->core, hybrid->full); "
+      f"D=0 == classical; resume skips all")
 
 # --- gradient ("implicit") training scheme, alongside the explicit env-SVD one
 Wg = (torch.randn(64, 32) @ torch.randn(32, 48) / 32 + 0.2 * torch.randn(64, 48))

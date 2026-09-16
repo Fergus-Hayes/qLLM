@@ -19,6 +19,15 @@ residual operator is disentangled once per ``(layer, D)`` and its cached SVD is
 truncated at each bond dimension, mirroring how the classical sweep reuses one
 SVD per layer. The heavy term is therefore the perplexity probe, one evaluation
 per row, and everything is checkpointed per row so an interrupted sweep resumes.
+
+With ``config.heal`` each point is additionally healed -- briefly retrained
+against the LM loss (all other layers dense) to minimise its perplexity -- and
+the healed perplexity recorded. Classical rows heal the MPO bond (via
+:func:`~qllm.compactifai_heal.heal_layer` for the balanced geometry, or the
+depth-0 hybrid adapter for the qubit geometry); hybrid rows heal per
+``config.heal_mode`` (``core`` = the chi' bond, ``full`` = bond + U/V circuits)
+through :func:`~qllm.hybrid_heal.heal_hybrid`. The dense baseline is cached in
+the checkpoint, and a point counts as done only once it carries a healed value.
 """
 
 from __future__ import annotations
@@ -55,6 +64,8 @@ from .compactifai_sweep import (
 from .disentangler import disentangle, hybrid_weight, n_qubits_for
 from .qubit_mpo import make_plan, plan_compress
 from .layer_analysis import parse_layer_info
+from .compactifai_heal import heal_layer, make_heal_batches
+from .hybrid_heal import heal_hybrid
 
 # The circuits are restricted to at most two-qubit gates. This is the
 # hardware-realistic regime -- the paper runs only its two-qubit-gate
@@ -100,6 +111,7 @@ class HybridConfig(CompactifaiConfig):
     max_qubits: int = 13                       # skip layers needing a bigger register
     run_classical: bool = True                 # also record the pure-TN curve
     hybrid_csv_name: str = "hybrid_per_layer.csv"
+    heal_mode: str = "full"                    # hybrid healing: "core" (chi' bond) or "full" (+U/V circuits)
 
 
 @dataclass
@@ -138,6 +150,22 @@ class HybridRow:
     disentangle_seconds: float
     eval_tokens: int
     eval_seconds: float
+    # Healing (optional): brief LM-loss retraining of the swapped-in layer.
+    heal_mode: str = "-"
+    perplexity_healed: float = float("nan")
+    ppl_ratio_healed: float = float("nan")
+    heal_recovered_frac: float = float("nan")
+    heal_final_loss: float = float("nan")
+    heal_seconds: float = 0.0
+
+
+def _heal_cols(mode, ppl_h, ratio_h, recovered, loss, secs) -> dict:
+    """Assemble the six healing CSV columns (nan-safe rounding)."""
+    def _r(x, n):
+        return round(x, n) if isinstance(x, float) and x == x else x
+    return dict(heal_mode=mode, perplexity_healed=_r(ppl_h, 4),
+                ppl_ratio_healed=_r(ratio_h, 6), heal_recovered_frac=_r(recovered, 4),
+                heal_final_loss=_r(loss, 4), heal_seconds=round(secs, 2))
 
 
 def hybrid_csv_path(config: HybridConfig) -> Path:
@@ -255,9 +283,81 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
                     str(r.get("circuit_depth")), str(r.get("gate_size"))): r
                    for r in existing}
 
-    print(f"\nBaseline (all layers dense) perplexity on {budget} tokens ...")
-    baseline, eval_tokens, _ = evaluate()
-    print(f"Baseline perplexity = {baseline:.4f}")
+    def _present(key):
+        r = rows_by_key.get(key)
+        if r is None:
+            return False
+        if not config.heal:
+            return True
+        try:
+            return math.isfinite(float(r.get("ppl_ratio_healed", "nan")))
+        except (TypeError, ValueError):
+            return False
+
+    baseline = float("nan")
+    if not config.force_recompute:
+        for _r in existing:
+            try:
+                baseline = float(_r["ppl_baseline"]); break
+            except (KeyError, ValueError, TypeError):
+                continue
+    if not math.isfinite(baseline):
+        print(f"\nBaseline (all layers dense) perplexity on {budget} tokens ...")
+        baseline, eval_tokens, _ = evaluate()
+        print(f"Baseline perplexity = {baseline:.4f}")
+    else:
+        eval_tokens = budget or input_ids.size(1)
+        print(f"\nBaseline perplexity from checkpoint = {baseline:.4f}")
+
+    # ---- Healing calibration set (disjoint split), tokenized once and reused.
+    heal_batches: list = []
+    _res0: dict = {}
+    if config.heal:
+        heal_cfg = BenchmarkConfig(
+            model_id=config.model_id, device=config.device, dtype=config.dtype,
+            trust_remote_code=config.trust_remote_code, revision=config.revision,
+            dataset=config.heal_dataset or config.dataset,
+            dataset_config=config.dataset_config, split=config.heal_split,
+            text_column=config.text_column)
+        heal_ids = tokenize_corpus(tokenizer, heal_cfg)
+        heal_batches = make_heal_batches(heal_ids, config.max_length,
+                                         config.heal_batch, config.heal_tokens)
+        print(f"Healing on: {config.heal_steps} Adam steps @ lr {config.heal_lr} | "
+              f"{config.heal_tokens} tok from '{config.heal_dataset or config.dataset}:"
+              f"{config.heal_split}' ({len(heal_batches)} batches) | "
+              f"classical -> MPO bond, hybrid -> {config.heal_mode}.")
+
+    def _res0_for(name, orig):
+        """A depth-0 disentangle (identity circuits) for qubit-geometry MPO-bond healing."""
+        r = _res0.get(name)
+        if r is None:
+            r = disentangle(orig, gate_size=1, depth=0, tensorization=config.tensorization,
+                            qubit_align=config.qubit_align, n_sites=config.mpo_sites,
+                            target_chi=config.disentangle_target_chi, seed=config.disentangle_seed)
+            _res0[name] = r
+        return r
+
+    def _recovered(ppl_cold, ppl_healed):
+        damage = ppl_cold - baseline
+        if damage <= 1e-9:
+            return 1.0
+        return max(0.0, min(1.0, (ppl_cold - ppl_healed) / damage))
+
+    def _heal_and_eval(name, param, orig, chi, mode, *, plan=None, res=None):
+        """Heal the swapped-in layer, score PPL, restore. Returns (ppl, loss, secs)."""
+        t0 = time.perf_counter()
+        if res is not None:
+            healed, _n, loss = heal_hybrid(model, name, res, chi, mode, heal_batches,
+                                           device, config.heal_steps, config.heal_lr)
+        else:
+            healed, _n, loss = heal_layer(model, name, plan, chi, heal_batches, device,
+                                          steps=config.heal_steps, lr=config.heal_lr)
+        with torch.no_grad():
+            param.copy_(healed.to(dtype=param.dtype, device=param.device))
+        ppl_h, _tok, _secs = evaluate()
+        with torch.no_grad():
+            param.copy_(orig.to(dtype=param.dtype, device=param.device))
+        return ppl_h, float(loss), time.perf_counter() - t0
 
     # Enumerate the work: classical points first (cheap, no optimization), then
     # the hybrid grid grouped by (layer, D) so one disentangling serves all chi'.
@@ -268,7 +368,7 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
                                   classical_plans[name].in_dims)
             for chi in sorted({min(int(c), exact) for c in chis}):
                 key = (name, "classical", config.tensorization, str(chi), "-1", "0")
-                if key not in rows_by_key:
+                if not _present(key):
                     todo.append(("classical", name, param, chi, -1))
     hybrid_jobs = []
     for name, param in layers:
@@ -284,8 +384,8 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
                     continue
                 seen.add((k_row, d))
                 missing = [c for c in hybrid_chis
-                           if (name, "hybrid", config.tensorization, str(c),
-                               str(d), str(k_row)) not in rows_by_key]
+                           if not _present((name, "hybrid", config.tensorization, str(c),
+                                            str(d), str(k_row)))]
                 if missing:
                     hybrid_jobs.append((name, param, d, k_eff, k_row, missing))
 
@@ -328,6 +428,15 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
         with torch.no_grad():
             param.copy_(orig.to(dtype=param.dtype, device=param.device))
         layer_type, block = parse_layer_info(name)
+        hmode, ph, pr, frac, hloss, hsec = "-", float("nan"), float("nan"), float("nan"), float("nan"), 0.0
+        if config.heal and heal_batches:
+            if config.tensorization == "balanced":
+                ph, hloss, hsec = _heal_and_eval(name, param, orig, chi, "core", plan=plan)
+            else:
+                ph, hloss, hsec = _heal_and_eval(name, param, orig, chi, "core",
+                                                 res=_res0_for(name, orig))
+            pr = ph / baseline if baseline else float("nan")
+            frac = _recovered(ppl, ph); hmode = "core"
         done += 1
         record(HybridRow(
             timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -346,12 +455,14 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
             disentangle_retained=float("nan"), disentangle_sweeps=0,
             disentangle_seconds=0.0, eval_tokens=eval_tokens,
             eval_seconds=round(secs, 2),
+            **_heal_cols(hmode, ph, pr, frac, hloss, hsec),
         ))
         elapsed = time.perf_counter() - start
         print(f"  [{done}/{total_points}] classical {layer_type} d{block} "
               f"chi={chi:<4} C={params_mpo:<8,} rel.err={err:.4f} "
-              f"ppl={ppl:.4f} (x{ppl / baseline:.4f})  "
-              f"elapsed={elapsed:.0f}s eta={elapsed / done * (total_points - done):.0f}s")
+              f"ppl={ppl:.4f} (x{ppl / baseline:.4f})"
+              + (f" heal x{pr:.4f}" if config.heal and pr == pr else "")
+              + f"  elapsed={elapsed:.0f}s eta={elapsed / done * (total_points - done):.0f}s")
 
     # ---- Hybrid surface: PPL(chi', D) with the disentangling circuits in place.
     for name, param, d, k_eff, k_row, missing in hybrid_jobs:
@@ -385,6 +496,11 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
                 param.copy_(orig.to(dtype=param.dtype, device=param.device))
             q_params = res.quantum_params
             dense = int(orig.shape[0]) * int(orig.shape[1])
+            hmode, ph, pr, frac, hloss, hsec = "-", float("nan"), float("nan"), float("nan"), float("nan"), 0.0
+            if config.heal and heal_batches:
+                ph, hloss, hsec = _heal_and_eval(name, param, orig, chi, config.heal_mode, res=res)
+                pr = ph / baseline if baseline else float("nan")
+                frac = _recovered(ppl, ph); hmode = config.heal_mode
             done += 1
             record(HybridRow(
                 timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -408,12 +524,14 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
                 disentangle_sweeps=res.sweeps_run,
                 disentangle_seconds=round(res.seconds, 2),
                 eval_tokens=eval_tokens, eval_seconds=round(secs, 2),
+                **_heal_cols(hmode, ph, pr, frac, hloss, hsec),
             ))
             elapsed = time.perf_counter() - start
             print(f"  [{done}/{total_points}] hybrid    {layer_type} d{block} "
                   f"k={k_row} D={d} chi'={chi:<4} C={c_params:<8,} Q={q_params:<8,} "
-                  f"rel.err={err:.4f} ppl={ppl:.4f} (x{ppl / baseline:.4f})  "
-                  f"elapsed={elapsed:.0f}s "
+                  f"rel.err={err:.4f} ppl={ppl:.4f} (x{ppl / baseline:.4f})"
+                  + (f" heal x{pr:.4f}" if config.heal and pr == pr else "")
+                  + f"  elapsed={elapsed:.0f}s "
                   f"eta={elapsed / done * (total_points - done):.0f}s")
 
     with torch.no_grad():

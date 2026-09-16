@@ -559,12 +559,55 @@ comparable never share a checkpoint or get mixed in one budget report.
 Output is `results/llms/<model>/compactifai/hybrid_per_layer.csv`, one row per
 `(layer, method, chi, D, k)` with `tensorization`, `optimizer`,
 `classical_params`, `quantum_params`,
-`perplexity`, `ppl_ratio`, and the disentangling diagnostics
+`perplexity`, `ppl_ratio` (and, with `--heal`, `perplexity_healed` / `ppl_ratio_healed`), and the disentangling diagnostics
 (`disentangle_accuracy` -- the paper's Eq. (4) -- `disentangle_entropy`, and
 `disentangle_retained`, the fraction of the layer's weight the target bond
 dimension keeps). `method=classical` rows are the pure-TN curve, measured in the
 same run so the two budgets are directly comparable. Re-running resumes from the
 checkpoint.
+
+### Heal both surfaces to minimize PPL (`--heal`)
+
+`--heal` retrains each swapped-in point against the LM loss (every other layer
+dense, the parameter count unchanged) and records its **healed** perplexity, so
+the sweep reports the best PPL each method reaches at a given cost. The classical
+`C(chi)` rows heal the MPO bond; the hybrid `C(chi'), D` rows heal per
+`--heal-mode`: `core` (the `chi'` bond only) or `full` (the bond **and** the
+`U`/`V` circuits, all `M*` parameters — the default, since that is where a
+starved small-`chi'` bond gains the most). At `D=0` the hybrid `full` point
+coincides with the classical bond healing.
+
+```bash
+# One layer: sweep chi (classical) and grid chi' x D (hybrid), healing every
+# point to minimize PPL, on 32768 eval tokens, checkpointed and resumable.
+python hybridize.py HuggingFaceTB/SmolLM2-135M \
+    --profile-depths 10 --layer-types v_proj \
+    --tensorization qubit --gate-sizes 2 \
+    --chi 1 2 4 8 16 --circuit-depths 0 1 2 4 8 16 \
+    --heal --heal-mode full \
+    --heal-steps 100 --heal-lr 1e-3 --heal-tokens 16384 --heal-split train \
+    --per-layer-eval-tokens 32768 --ppl-batch-size 32 --threads 8
+```
+
+This adds `perplexity_healed`, `ppl_ratio_healed`, `heal_mode`,
+`heal_recovered_frac` (share of the truncation damage healing recovers, in
+`[0,1]`), `heal_final_loss` and `heal_seconds` to every row. With `--heal` the
+probe defaults to **32768 tokens** if `--per-layer-eval-tokens` is not given, so
+the healed perplexities are trustworthy. Healing is checkpoint-aware: a point
+counts as done only once it carries a healed perplexity, so adding `--heal` to an
+existing cold CSV fills in just the missing healed columns, and the dense
+baseline is cached in the CSV and reused on resume.
+
+**Speed.** The perplexity probe dominates, so throughput is set by how well one
+evaluation saturates the hardware: the windows of each 32768-token probe are
+already batched into one forward pass (raise `--ppl-batch-size` until they fit in
+one or two batches), `--threads N` pins the CPU intra-op pool, and one
+disentangling optimization is reused across the whole `chi'` column while the
+classical SVD is cached across `chi`. On a GPU add `--device cuda` (and
+`--dtype bfloat16` for a further ~2x on the probe). Every point is checkpointed,
+so an interrupted or extended run never repeats finished work. Healing multiplies
+the per-point cost by one short fine-tune plus one extra evaluation, so keep
+`--heal-steps` modest and let the checkpoint accumulate results across runs.
 
 ### Solve the budget
 
