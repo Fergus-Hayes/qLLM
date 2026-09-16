@@ -612,4 +612,49 @@ assert hsweep[0]["ppl_ratio_core"] == hsweep[0]["ppl_ratio_full"], \
 print(f"  --heal core/full records healed perplexity; L=0 core==full "
       f"(x{float(hsweep[0]['ppl_ratio_core']):.4f})")
 
+
+# --------------------------------------------------------------------------- #
+# 9. Perplexity error vs. number of tokens evaluated
+# --------------------------------------------------------------------------- #
+print("\n=== 9. Perplexity error vs. tokens ===")
+import numpy as _np
+from qllm.benchmark import window_nlls as _wnll, perplexity_over_ids as _pov
+from qllm.ppl_error_cli import analyze as _analyze, _fit_power, main as _pe_main
+
+_ids = torch.randint(0, 512, (1, 8192))
+_ppl_ref, _ntok_ref, _ = _pov(model, _ids, "cpu", 64, 64, batch_size=8, progress=False)
+_nll, _nt = _wnll(model, _ids, "cpu", 64, 64, batch_size=8, progress=False)
+assert abs(_np.exp(_nll.sum() / _nt.sum()) - _ppl_ref) < 1e-2, "window_nlls must reproduce the PPL"
+assert int(_nt.sum()) == _ntok_ref, "window token counts must match"
+_budgets = [512, 1024, 2048, 4096, int(_nt.sum())]
+_rows, _full, _sigma = _analyze(_nll, _nt, _budgets, 300, _np.random.default_rng(0))
+_re = [r["ppl_rel_err"] for r in _rows]
+assert _re[0] > _re[-1] > 0, f"relative error must fall with tokens: {_re}"
+_C, _p = _fit_power([r["tokens"] for r in _rows], _re)
+assert -0.75 < _p < -0.25, f"error should scale ~N^-0.5, got exponent {_p:.3f}"
+# bootstrap and i.i.d.-ideal estimates agree to a small factor on ~i.i.d. tokens
+_ratio = _rows[-1]["ppl_rel_err"] / _rows[-1]["iid_rel_err"]
+assert 0.5 < _ratio < 2.0, f"bootstrap vs i.i.d. mismatch: {_ratio}"
+print(f"  window_nlls reproduces PPL; rel_err ~ {_C:.3g} * N^{_p:.3f} "
+      f"(N^-0.5 ideal); falls {_re[0]:.4f} -> {_re[-1]:.4f}")
+
+# the full CLI writes a CSV + solves target-token budgets (paired mode too)
+import qllm.benchmark as _B
+_orig_tok = _B.tokenize_corpus
+_B.tokenize_corpus = lambda t, c: torch.randint(0, 512, (1, 6144))
+try:
+    _rc = _pe_main(["tiny-gpt2", "--max-length", "64", "--stride", "64",
+                    "--max-eval-tokens", "6144", "--ppl-batch-size", "8",
+                    "--num-budgets", "6", "--bootstrap", "200",
+                    "--compare-chi", "2", "--block", "0", "--layer-type", "c_proj",
+                    "--tensorization", "qubit", "--out-dir", SCRATCH + "-ppl-err",
+                    "--no-plots"])
+finally:
+    _B.tokenize_corpus = _orig_tok
+assert _rc == 0
+_pe_csv = _Path(SCRATCH + "-ppl-err") / "perplexity_error.csv"
+_pe_rows = list(_csv.DictReader(_pe_csv.open()))
+assert _pe_rows and "ratio_rel_err" in _pe_rows[0], "paired ratio columns must be written"
+print(f"  ppl_error CLI: {len(_pe_rows)} budgets + paired ratio error, CSV written")
+
 print("\nALL HYBRID SMOKE STAGES PASSED")

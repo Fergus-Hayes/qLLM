@@ -10,6 +10,7 @@ from .benchmark import (
     BenchmarkConfig,
     BenchmarkResult,
     run_benchmark,
+    window_nlls,
     write_result_csv,
 )
 from .layer_analysis import (
@@ -60,6 +61,7 @@ __all__ = [
     "BenchmarkConfig",
     "BenchmarkResult",
     "run_benchmark",
+    "window_nlls",
     "write_result_csv",
     "LayerAnalysisConfig",
     "LayerResult",

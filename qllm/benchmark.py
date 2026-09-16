@@ -306,6 +306,90 @@ def perplexity_over_ids(
 
 
 @torch.no_grad()
+def window_nlls(
+    model,
+    input_ids_full: torch.Tensor,
+    device: str,
+    max_length: int,
+    stride: int,
+    batch_size: int = 4,
+    max_eval_tokens: int | None = None,
+    progress: bool = True,
+) -> tuple["object", "object"]:
+    """Per-window ``(nll_sum, n_tokens)`` sufficient statistics, in corpus order.
+
+    Same sliding-window scoring and "only newly revealed tokens" masking as
+    :func:`perplexity_over_ids` -- so ``exp(sum(nll)/sum(ntok))`` reproduces its
+    perplexity -- but the summed NLL and token count are returned **per window**
+    (natural log). These are the blocks a convergence / error analysis resamples:
+    the scored tokens are disjoint across windows, while adjacent windows share
+    context, so the window is the right unit for a block bootstrap.
+
+    Returns two ``numpy`` arrays (``nll_per_window``, ``ntok_per_window``).
+    """
+    import numpy as np
+    import torch.nn.functional as F
+
+    seq_len = input_ids_full.size(1)
+    if max_eval_tokens is not None:
+        seq_len = min(seq_len, max_eval_tokens)
+    specs = []
+    prev_end = 0
+    for begin in range(0, seq_len, stride):
+        end = min(begin + max_length, seq_len)
+        specs.append((begin, end, end - prev_end))
+        prev_end = end
+        if end == seq_len:
+            break
+
+    batch_size = max(1, batch_size)
+    total_windows = len(specs)
+    nll_list: list[float] = []
+    ntok_list: list[int] = []
+    start_time = time.perf_counter()
+    processed = last_print = 0
+
+    i = 0
+    while i < total_windows:
+        window_len = specs[i][1] - specs[i][0]
+        batch = []
+        while (i < total_windows and len(batch) < batch_size
+               and (specs[i][1] - specs[i][0]) == window_len):
+            batch.append(specs[i])
+            i += 1
+
+        input_ids = torch.stack(
+            [input_ids_full[0, b:e] for (b, e, _) in batch]).to(device)   # [B, L]
+        target_ids = input_ids.clone()
+        for r, (_, _, target_len) in enumerate(batch):
+            target_ids[r, :window_len - target_len] = -100
+
+        logits = model(input_ids).logits                       # [B, L, V]
+        shift_logits = logits[:, :-1, :]
+        shift_labels = target_ids[:, 1:]
+        # Per row (window) to keep the cross-entropy's memory to one window at a time.
+        for r in range(shift_logits.size(0)):
+            ce = F.cross_entropy(shift_logits[r].float(), shift_labels[r],
+                                 ignore_index=-100, reduction="sum")
+            valid = int((shift_labels[r] != -100).sum().item())
+            nll_list.append(float(ce.detach().cpu()))
+            ntok_list.append(valid)
+        processed += len(batch)
+
+        if progress and (processed - last_print >= max(batch_size, total_windows // 20)
+                         or processed == total_windows):
+            last_print = processed
+            elapsed = time.perf_counter() - start_time
+            tok = max(1, sum(ntok_list))
+            running_ppl = float(np.exp(sum(nll_list) / tok))
+            eta = elapsed / processed * (total_windows - processed)
+            print(f"    window {processed}/{total_windows}  running_ppl={running_ppl:.4f}  "
+                  f"elapsed={elapsed:.0f}s  eta={eta:.0f}s")
+
+    return np.asarray(nll_list, dtype=np.float64), np.asarray(ntok_list, dtype=np.int64)
+
+
+@torch.no_grad()
 def compute_perplexity(
     model,
     tokenizer,

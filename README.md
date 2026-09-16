@@ -126,6 +126,49 @@ Appended to summary  results/llms/summary.csv
 > Absolute numbers depend on hardware, dtype, and evaluation settings; the
 > perplexity figure is deterministic for a given window/stride/dataset.
 
+## Perplexity error vs. number of tokens
+
+`perplexity_error.py` (module `qllm.ppl_error_cli`) measures how the **sampling
+error** of a perplexity estimate shrinks as more tokens are scored — the question
+"how many tokens do I need for a trustworthy PPL?".
+
+Perplexity is `PPL = exp(mean NLL)`, so estimating it on `N` tokens is estimating
+a mean; by the delta method its *relative* error equals the standard error of the
+mean NLL, which for text falls as `~ C · N^(-1/2)` (quadruple the tokens → halve
+the error). The constant `C` and the **effective** sample size (smaller than `N`,
+because tokens in a window share context) are model- and corpus-specific, so the
+tool measures them rather than assuming them.
+
+It scores a long corpus **once**, keeping the per-window `(nll_sum, n_tokens)`
+sufficient statistics (`qllm.window_nlls`), then reports:
+
+- the **running** perplexity vs. tokens (a convergence trace);
+- the **relative error vs. `N`**, from a block bootstrap over windows *and* from
+  direct disjoint `N`-token chunks (two independent standard-error estimates),
+  against the i.i.d.-token ideal `∝ N^(-1/2)`;
+- a fit `rel_err ≈ C · N^p` (with `p ≈ -0.5`), the **variance-inflation** over
+  i.i.d. (the cost of within-window correlation), and the **tokens required** for
+  target errors (e.g. 1%, 0.5%, 0.1%).
+
+```bash
+# Dense-model PPL error vs. tokens (score up to 131072 tokens once) + plots + CSV
+python perplexity_error.py HuggingFaceTB/SmolLM2-135M --max-eval-tokens 131072
+
+# Also the PAIRED ratio error for one compressed layer — the quantity a
+# compression sweep actually compares (its shared corpus noise cancels)
+python perplexity_error.py HuggingFaceTB/SmolLM2-135M --max-eval-tokens 131072 \
+    --compare-chi 8 --block 10 --layer-type v_proj --tensorization qubit
+```
+
+The paired mode scores the model with one layer MPO-compressed on the **same**
+windows and reports the error of the perplexity *ratio* (compressed / dense).
+Because a sweep compares that ratio, and the dense and compressed NLLs are
+strongly correlated per token, the ratio's error is what should be compared
+against the differences you care about (e.g. the ~0.001 gaps between healed and
+cold `ppl_ratio`) when choosing `--per-layer-eval-tokens` / `--max-eval-tokens`.
+Output is `results/llms/<model>/perplexity_error/` (`perplexity_error.csv` +
+`perplexity_error.png`).
+
 ## Per-layer analysis: entropy, spectrum & sensitivity vs. depth
 
 `analyze_layers.py` (module `qllm.layer_analysis`) inspects **every 2-D weight
