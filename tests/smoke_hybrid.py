@@ -530,4 +530,44 @@ assert {r["kind"] for r in fresh if r["kind"].startswith("tn_")} == {"tn_nopad"}
     "--recompute recomputes the unpadded-TN reference too"
 print("  refuses a conflicting config; --recompute overwrites")
 
+# Healing: both core (chi' bond only) and full (bond + U/V circuits) modes add a
+# healed perplexity column; the un-healed adapter reproduces the cold weight.
+from qllm.disentangler import disentangle as _dis, hybrid_weight as _hw
+from qllm.hybrid_heal import HybridAdapter as _HA
+_res = _dis(torch.randn(32, 48, generator=torch.Generator().manual_seed(0)),
+            gate_size=2, depth=3, target_chi=1, tensorization="qubit", sweeps=6, seed=0)
+_cold, _C = _hw(_res, 1)
+import torch.nn as _nn
+_lin = _nn.Linear(48, 32, bias=False)
+with torch.no_grad():
+    _lin.weight.copy_(torch.randn(32, 48, generator=torch.Generator().manual_seed(0)))
+_a_core, _a_full = _HA(_lin, _res, 1, "core"), _HA(_lin, _res, 1, "full")
+for _a in (_a_core, _a_full):
+    assert float(torch.linalg.norm(_a.effective_weight() - _cold)) < 1e-4, \
+        "healing adapter must start at the cold reconstruction"
+assert _a_core.n_params == _C, "core adapter trains exactly C(chi') params"
+assert _a_full.n_params > _a_core.n_params, "full adapter adds the Q(D) circuit params"
+print(f"  heal adapter: core trains {_a_core.n_params} params (=C), "
+      f"full trains {_a_full.n_params} (=M*)")
+
+shutil.rmtree(SCRATCH + "-heal", ignore_errors=True)
+rc = scaling_main([
+    "tiny-gpt2", "--block", "0", "--layer-type", "c_proj", "--gate-sizes", "2",
+    "--layers", "0", "2", "--target-chi", "1", "--disentangle-sweeps", "8",
+    "--max-length", "64", "--stride", "64", "--eval-tokens", "256", "--ppl-batch-size", "4",
+    "--heal", "core", "full", "--heal-steps", "6", "--heal-lr", "0.02",
+    "--heal-tokens", "256", "--heal-batch-size", "2", "--heal-window", "32",
+    "--results-dir", SCRATCH + "-heal", "--no-plots",
+])
+assert rc == 0
+heal_csv = _Path(SCRATCH + "-heal") / "tiny-gpt2" / "disentangle_scaling" / "disentangle_scaling.csv"
+with heal_csv.open() as f:
+    hsweep = {int(r["n_layers"]): r for r in _csv.DictReader(f) if r["kind"] == "sweep"}
+assert hsweep and all(float(r["ppl_ratio_core"]) > 0 and float(r["ppl_ratio_full"]) > 0
+                      for r in hsweep.values()), "core and full healed perplexity must be recorded"
+assert hsweep[0]["ppl_ratio_core"] == hsweep[0]["ppl_ratio_full"], \
+    "at L=0 (no circuits) full healing == core healing"
+print(f"  --heal core/full records healed perplexity; L=0 core==full "
+      f"(x{float(hsweep[0]['ppl_ratio_core']):.4f})")
+
 print("\nALL HYBRID SMOKE STAGES PASSED")

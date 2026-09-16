@@ -47,6 +47,7 @@ from .hybrid_sweep import (
     run_hybrid_sweep,
     validate_gate_sizes,
 )
+from .hybrid_heal import HybridAdapter, heal_hybrid
 from .budget_frontier import (
     LayerSolution,
     load_curves,
@@ -86,6 +87,8 @@ __all__ = [
     "MAX_GATE_SIZE",
     "run_hybrid_sweep",
     "validate_gate_sizes",
+    "HybridAdapter",
+    "heal_hybrid",
     "LayerSolution",
     "load_curves",
     "pareto_front",

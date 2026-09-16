@@ -32,6 +32,13 @@ column, ``Q(D)=0``), drawn as a horizontal reference line:
 It writes a CSV and, if matplotlib is present, the Fig. 3 panels (accuracy,
 entropy, M*, and -- on the model path -- perplexity vs. L).
 
+On the model path ``--heal {core,full}`` adds healed perplexity curves: after
+swapping in the compressed layer, briefly retrain it against the LM loss (every
+other layer dense) and record the recovered perplexity. ``core`` retrains only
+the chi' MPO bond (``C(chi')`` params); ``full`` retrains the bond **and** the
+U/V circuits (``M*`` params) -- give both to see how much the circuits' extra
+task-trainable degrees of freedom recover beyond the starved small-chi' bond.
+
 The CSV is a checkpoint: a re-run reuses every (gate size, L) point already in
 it for the same configuration -- and, on the model path, the cached baseline
 perplexity -- so an interrupted sweep resumes where it stopped and extra L
@@ -68,6 +75,7 @@ from .disentangler import (
     n_qubits_for,
     quantum_param_count,
 )
+from .hybrid_heal import heal_hybrid, make_heal_batches
 from .hybrid_sweep import MAX_GATE_SIZE, validate_gate_sizes
 from .layer_analysis import parse_layer_info
 from .qubit_mpo import make_plan, plan_bond_entropy, plan_compress
@@ -139,6 +147,7 @@ ROW_FIELDS = ["kind", "gate_size", "n_layers", "d_out", "d_in", "n_out_qubits",
               "accuracy", "entropy", "retained", "retained_classical",
               "classical_params", "quantum_params", "total_params",
               "perplexity", "ppl_baseline", "ppl_ratio",
+              "ppl_core", "ppl_ratio_core", "ppl_full", "ppl_ratio_full",
               "sweeps_run", "seconds", "source"]
 
 # Reference rows carried alongside the swept (D>=1) circuits: the depth-0 hybrid
@@ -226,6 +235,25 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="Tokens per perplexity evaluation (one per L point).")
     p.add_argument("--ppl-batch-size", type=int, default=8)
 
+    # Healing (model path only): after swapping in the compressed layer, briefly
+    # retrain it against the LM loss and record the healed perplexity per L.
+    p.add_argument("--heal", nargs="+", default=["none"],
+                   choices=["none", "core", "full"],
+                   help="Healed perplexity curves to add (model path). 'core' "
+                        "retrains only the chi' MPO bond; 'full' retrains the bond "
+                        "AND the U/V circuits (M* params). Give both to compare.")
+    p.add_argument("--heal-steps", type=int, default=100,
+                   help="Adam steps per healed point (per mode).")
+    p.add_argument("--heal-lr", type=float, default=0.02)
+    p.add_argument("--heal-tokens", type=int, default=4096,
+                   help="Calibration tokens used for healing.")
+    p.add_argument("--heal-batch-size", type=int, default=2)
+    p.add_argument("--heal-window", type=int, default=None,
+                   help="Healing sequence length (default: --max-length).")
+    p.add_argument("--heal-split", default="train",
+                   help="Dataset split for the healing calibration set "
+                        "(default: train -- disjoint from the eval split).")
+
     p.add_argument("--recompute", action="store_true",
                    help="Ignore any existing CSV and recompute every point from "
                         "scratch (default: resume, skipping points already done "
@@ -299,6 +327,13 @@ def plot_scaling(rows: list[dict], out_dir: Path, target_chi: int,
               if _is_finite(r.get(key))]
         return [x for x, _ in xy], [y for _, y in xy]
 
+    # Healed perplexity curves, when present (cold = solid; core = dashed;
+    # full = dotted), so a single per-k colour carries all three.
+    heal_curves = [(m, key, style) for m, key, style in
+                   (("core", "ppl_ratio_core", (0, (5, 2))),
+                    ("full", "ppl_ratio_full", (0, (1, 1))))
+                   if _finite(rows, key)]
+
     for i, k in enumerate(ks):
         col = cmap(i / max(1, len(ks) - 1))
         lab = f"{k}q gates"
@@ -307,7 +342,11 @@ def plot_scaling(rows: list[dict], out_dir: Path, target_chi: int,
         if ax_m is not None:
             ax_m.plot(*_pts(k, "total_params"), marker="D", color=col, label=lab)
         if ax_p is not None:
-            ax_p.plot(*_pts(k, "ppl_ratio"), marker="^", color=col, label=lab)
+            plab = f"{lab} (cold)" if heal_curves else lab
+            ax_p.plot(*_pts(k, "ppl_ratio"), marker="^", color=col, label=plab)
+            for mode, key, style in heal_curves:
+                ax_p.plot(*_pts(k, key), marker="v", color=col, ls=style,
+                          label=f"{lab} (+heal {mode})")
 
     # Horizontal reference line: the plain TN on the *unpadded* matrix (does not
     # depend on L). The D=0 point is drawn as an ordinary point on each curve.
@@ -374,6 +413,9 @@ def main(argv=None) -> int:
     except ValueError as exc:
         print(f"error: {exc}")
         return 2
+
+    # Requested healing modes, in a stable order ("core" before "full").
+    heal_modes = [m for m in ("core", "full") if m in set(args.heal)]
 
     # --- weight source, and (model path only) the live layer + a perplexity probe
     model = tokenizer = device = param = orig = None
@@ -478,7 +520,15 @@ def main(argv=None) -> int:
         return 2
 
     # A checkpointed point is "done" only if it also carries the perplexity we
-    # are asking for now, so a --no-perplexity run can be extended with it later.
+    # are asking for now (cold, plus each requested heal mode), so a run can be
+    # extended later with perplexity or a new heal mode.
+    def _row_done(r: dict) -> bool:
+        if not measure_ppl:
+            return True
+        if not _is_finite(r.get("ppl_ratio")):
+            return False
+        return all(_is_finite(r.get(f"ppl_ratio_{m}")) for m in heal_modes)
+
     seeded: list[dict] = []
     done_points: set[tuple[int, int]] = set()
     for r in sweep_existing:
@@ -486,7 +536,7 @@ def main(argv=None) -> int:
             rk, rl = int(r["gate_size"]), int(r["n_layers"])
         except (KeyError, ValueError, TypeError):
             continue
-        if not measure_ppl or _is_finite(r.get("ppl_ratio")):
+        if _row_done(r):
             r["kind"] = KIND_SWEEP
             r["disentangle_target"] = r.get("disentangle_target") or args.disentangle_target
             if not _is_finite(r.get("total_params")):    # backfill pre-M* rows
@@ -547,6 +597,38 @@ def main(argv=None) -> int:
                 print(f"\nBaseline (dense) perplexity on {args.eval_tokens} tokens ...")
                 baseline = evaluate()
                 print(f"Baseline perplexity = {baseline:.4f}")
+
+    # --- healing calibration set (model path, only when a heal mode is requested
+    #     and there is work to do). Uses a disjoint split from the eval corpus.
+    heal_batches: list = []
+    if measure_ppl and heal_modes and to_run:
+        from .benchmark import BenchmarkConfig, tokenize_corpus
+        heal_cfg = BenchmarkConfig(
+            model_id=args.model, device=args.device, dtype=args.dtype,
+            trust_remote_code=args.trust_remote_code, revision=args.revision,
+            dataset=args.dataset, dataset_config=args.dataset_config,
+            split=args.heal_split, text_column=args.text_column)
+        heal_ids = tokenize_corpus(tokenizer, heal_cfg)
+        heal_window = args.heal_window or args.max_length
+        heal_batches = make_heal_batches(heal_ids, heal_window,
+                                         args.heal_batch_size, args.heal_tokens)
+        print(f"Healing: modes {heal_modes} | {len(heal_batches)} calib batches "
+              f"(<= {args.heal_tokens} tok, window {heal_window}) | "
+              f"{args.heal_steps} Adam steps @ lr {args.heal_lr} "
+              f"(split '{args.heal_split}')")
+
+    def _heal_ppls(res) -> dict:
+        """Healed perplexity + ratio columns for a disentangled point (per mode)."""
+        cols: dict = {}
+        for mode in heal_modes:
+            healed, _n, _loss = heal_hybrid(
+                model, name, res, args.target_chi, mode, heal_batches, device,
+                steps=args.heal_steps, lr=args.heal_lr)
+            hppl = _ppl_of(healed)
+            hratio = hppl / baseline if baseline else float("nan")
+            cols[f"ppl_{mode}"] = round(hppl, 4)
+            cols[f"ppl_ratio_{mode}"] = round(hratio, 6)
+        return cols
 
     # --- reference row: the plain TN on the *unpadded* matrix (Q(D)=0). Computed
     #     once, up front, so every checkpoint carries it. (The D=0 point is an
@@ -609,11 +691,14 @@ def main(argv=None) -> int:
                 gd_steps=args.disentangle_gd_steps, gd_lr=args.disentangle_gd_lr,
                 restarts=args.restarts, seed=args.seed)
             ppl = float("nan")
+            heal_cols: dict = {}
             if measure_ppl:
                 # Swap in the disentangled layer at the target bond dimension,
                 # score the full model, then restore the dense weight.
                 approx, _params = hybrid_weight(res, args.target_chi)
                 ppl = _ppl_of(approx)
+                if heal_modes:
+                    heal_cols = _heal_ppls(res)
             ratio = ppl / baseline if measure_ppl and baseline else float("nan")
             cparams, qparams, tparams = _params_for(k, L)
             rows.append(dict(
@@ -631,11 +716,14 @@ def main(argv=None) -> int:
                 ppl_baseline=round(baseline, 4) if measure_ppl else "",
                 ppl_ratio=round(ratio, 6) if measure_ppl else "",
                 sweeps_run=res.sweeps_run, seconds=round(res.seconds, 2),
-                source=source))
+                source=source, **heal_cols))
             done += 1
             ppl_str = f"{ppl:>9.4f} {ratio:>7.4f} " if measure_ppl else ""
+            heal_str = "".join(
+                f" {m[:4]}:{float(heal_cols[f'ppl_ratio_{m}']):.4f}" for m in heal_modes
+            ) if heal_cols else ""
             print(f"{k:>3} {L:>4} {res.accuracy:>9.4f} {res.entropy:>9.4f} "
-                  f"{res.retained:>9.4f} {tparams:>9} {ppl_str}{res.seconds:>6.1f}")
+                  f"{res.retained:>9.4f} {tparams:>9} {ppl_str}{res.seconds:>6.1f}{heal_str}")
             _write(rows + ref_rows)                     # checkpoint after each point
 
     _write(rows + ref_rows)             # persist references (and any resumed rows)
@@ -676,6 +764,11 @@ def main(argv=None) -> int:
                 line += (f";  perplexity/base {float(lo['ppl_ratio']):.4f} -> "
                          f"{float(hi['ppl_ratio']):.4f}")
             print(line)
+            for mode in heal_modes:
+                key = f"ppl_ratio_{mode}"
+                if _is_finite(lo.get(key)) and _is_finite(hi.get(key)):
+                    print(f"       +heal({mode}): perplexity/base "
+                          f"{float(lo[key]):.4f} -> {float(hi[key]):.4f}")
     if not args.no_plots:
         plot_scaling(rows, out_dir, args.target_chi, ref_rows)
     return 0

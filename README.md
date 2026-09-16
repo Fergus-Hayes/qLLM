@@ -707,14 +707,36 @@ each `L` the target layer is swapped for its
 disentangled `chi'`-truncated reconstruction (`U T_{chi'}(MPO_new) V^T`), the full
 model is re-scored, and `perplexity / baseline` is plotted against `L` -- so you
 see the accuracy gain turn into a shrinking perplexity cost as layers are added.
-This perplexity is measured **without healing**: the compressed layer is swapped
-in cold and the rest of the model is *not* fine-tuned afterward, so the curve is
-the raw cost of the compression (the only optimization is the per-layer
-disentangling that fits the circuits + MPO to the original weight). CompactifAI's
-retraining-based healing lives in `compactifai_heal.py` / the `--heal*` options of
-the CompactifAI sweep, not here. The perplexity probe is controlled by
-`--dataset` / `--eval-tokens` / `--max-length` / `--stride` / `--ppl-batch-size`,
-and skipped with `--no-perplexity` (unavailable with `--shape`, which has no model).
+By default this perplexity is the **cold** cost of the compression: the layer is
+swapped in and the model is *not* fine-tuned, so it reflects the raw truncation
+(the only optimization is the per-layer disentangling that fits the circuits +
+MPO to the original weight). The perplexity probe is controlled by `--dataset` /
+`--eval-tokens` / `--max-length` / `--stride` / `--ppl-batch-size`, and skipped
+with `--no-perplexity` (unavailable with `--shape`, which has no model).
+
+**Healing** (`--heal core full`, model path) adds recovered-perplexity curves: at
+each `L` the swapped-in layer is briefly retrained against the LM loss on a
+calibration split (every other layer dense, parameter count unchanged), then
+re-scored. Two granularities, compared side by side:
+
+* **`core`** retrains only the `chi'` MPO bond -- `C(chi')` trainable parameters,
+  the direct analogue of CompactifAI healing;
+* **`full`** retrains the bond **and** the `U`/`V` gates (the gates stay
+  orthogonal, optimized on the Lie algebra `g = g0 · expm(skew(θ))`), so it
+  trains all `M* = C(chi') + Q(D)` parameters. This gives a starved small-`chi'`
+  bond the circuits' extra task-trainable degrees of freedom, which is where
+  perplexity actually starts to fall with depth.
+
+Both start exactly at the cold reconstruction (step 0 reproduces the swapped-in
+weight) and are recorded as `ppl_core` / `ppl_ratio_core` and `ppl_full` /
+`ppl_ratio_full`, drawn on the perplexity panel (cold solid, core dashed, full
+dotted). Healing is controlled by `--heal-steps` / `--heal-lr` / `--heal-tokens`
+/ `--heal-batch-size` / `--heal-window` / `--heal-split` (default `train`, disjoint
+from the eval split). It reuses the same `heal_hybrid` machinery as
+`compactifai_heal.py`; at `L=0` (no circuits) `full` coincides with `core`. Note
+the healed perplexity depends on the reachable `chi'`: at a `chi'` where the cold
+swap already destroys the layer, even full healing has limited room -- raise
+`--target-chi` in tandem.
 
 The CSV **checkpoints**: a re-run reuses every `(gate size, L)` point already in
 it (and, on the model path, the cached baseline perplexity), so an interrupted
