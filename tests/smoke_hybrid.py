@@ -172,6 +172,10 @@ class ByteTok:
         ids = torch.tensor([[b % cfg.vocab_size for b in text.encode()[:5000]]])
         return BatchEncoding({"input_ids": ids, "attention_mask": torch.ones_like(ids)})
 
+    def decode(self, ids):
+        seq = ids.tolist() if hasattr(ids, "tolist") else list(ids)
+        return bytes(int(i) % 256 for i in seq).decode("latin-1", "ignore")
+
 
 class FakeDS:
     def __init__(self):
@@ -286,18 +290,20 @@ except Exception as exc:                            # noqa: BLE001
 # --------------------------------------------------------------------------- #
 # 6. Two-qubit-gate restriction and the general "sweep + solve" CLI
 # --------------------------------------------------------------------------- #
-print("\n=== 6. k<=2 restriction and hybridize.py --solve ===")
-from qllm.hybrid_sweep import MAX_GATE_SIZE, validate_gate_sizes
+print("\n=== 6. gate-size range (no cap) and hybridize.py --solve ===")
+from qllm.hybrid_sweep import DEFAULT_GATE_SIZE, validate_gate_sizes
 
 assert validate_gate_sizes([2]) == [2] and validate_gate_sizes([1, 2]) == [1, 2]
-for bad in ([0], [3], [2, 4]):
-    try:
-        validate_gate_sizes(bad)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError(f"gate sizes {bad} should have been rejected")
-print(f"  gate sizes capped at k = {MAX_GATE_SIZE}; k=0 and k>2 rejected")
+assert validate_gate_sizes(None) == [DEFAULT_GATE_SIZE], "default gate size is 2"
+assert validate_gate_sizes([0]) == [0], "k=0 (register-wide) must be allowed"
+assert validate_gate_sizes([2, 8, 10]) == [2, 8, 10], "no upper cap on gate size"
+try:
+    validate_gate_sizes([-1])
+except ValueError:
+    pass
+else:
+    raise AssertionError("negative gate size should have been rejected")
+print(f"  default k={DEFAULT_GATE_SIZE}, no upper cap (k=0 = register-wide); negatives rejected")
 
 from qllm.hybrid_cli import main as hybridize_main
 
@@ -315,9 +321,9 @@ rc = hybridize_main([
 ])
 assert rc == 0, f"hybridize --solve returned {rc}"
 # It must refuse a gate size the build does not allow.
-rc_bad = hybridize_main(["tiny-gpt2", "--gate-sizes", "4"])
-assert rc_bad == 2, "hybridize should reject k>2"
-print("  hybridize --solve ran a targeted run end-to-end and rejected k>2")
+rc_bad = hybridize_main(["tiny-gpt2", "--gate-sizes", "-1"])
+assert rc_bad == 2, "hybridize should reject negative gate sizes"
+print("  hybridize --solve ran a targeted run end-to-end; negative k rejected")
 
 # --------------------------------------------------------------------------- #
 # 7. Qubit-level MPO tensorization (the paper's geometry), both methods
@@ -498,9 +504,9 @@ nopad = refs["tn_nopad"]
 assert int(nopad["quantum_params"]) == 0, "reference has Q=0"
 assert nopad["tensorization"] == "balanced(no pad)", "unpadded TN uses the raw-dims MPO"
 print(f"  TN-no-pad reference: acc={float(nopad['accuracy']):.4f} M*={nopad['total_params']}")
-# k>2 refused, and it runs offline from a synthetic shape (no model needed)
-assert scaling_main(["--shape", "8x8", "--gate-sizes", "4"]) == 2
-print("  runs offline on a synthetic shape; rejects k>2")
+# no upper cap now; negative k refused; runs offline from a synthetic shape
+assert scaling_main(["--shape", "8x8", "--gate-sizes", "-1"]) == 2
+print("  runs offline on a synthetic shape; negative k rejected")
 
 # On the model path it additionally measures the perplexity-vs-L curve (the
 # target layer swapped for its disentangled chi'=1 reconstruction at each L).
@@ -656,5 +662,44 @@ _pe_csv = _Path(SCRATCH + "-ppl-err") / "perplexity_error.csv"
 _pe_rows = list(_csv.DictReader(_pe_csv.open()))
 assert _pe_rows and "ratio_rel_err" in _pe_rows[0], "paired ratio columns must be written"
 print(f"  ppl_error CLI: {len(_pe_rows)} budgets + paired ratio error, CSV written")
+
+
+# --------------------------------------------------------------------------- #
+# 10. Register-wide gates + word-level PPL (Table I mechanism)
+# --------------------------------------------------------------------------- #
+print("\n=== 10. Register-wide gates + word-level PPL (Table I) ===")
+import math as _m10
+_g10 = torch.Generator().manual_seed(0)
+_W10 = ((torch.randn(96, 20, generator=_g10) @ torch.randn(20, 48, generator=_g10))
+        / _m10.sqrt(20) + 0.3 * torch.randn(96, 48, generator=_g10))
+_r2 = disentangle(_W10, gate_size=2, depth=1, target_chi=1, tensorization="qubit", sweeps=20)
+_rw = disentangle(_W10, gate_size=16, depth=1, target_chi=1, tensorization="qubit", sweeps=20)
+assert _rw.retained > 3 * _r2.retained, "register-wide must disentangle far more than k=2"
+assert _rw.entropy < _r2.entropy - 0.5, "register-wide must collapse the entropy"
+print(f"  register-wide D=1 concentrates entanglement: retained {_r2.retained:.3f} (k=2) -> "
+      f"{_rw.retained:.3f}; entropy {_r2.entropy:.3f} -> {_rw.entropy:.3f}")
+
+def _wsweep(word, tag):
+    shutil.rmtree(SCRATCH + tag, ignore_errors=True)
+    cfg = H.HybridConfig(
+        model_id="tiny-gpt2", device="cpu", dtype="float32",
+        include_pattern=r"h\.0\.attn\.c_proj", exclude_pattern=r"(wte|wpe|lm_head|ln|bias)",
+        tensorization="qubit", chi_values=[1, 2], circuit_depths=[1], gate_sizes=[0],
+        num_depths=1, disentangle_sweeps=6, max_length=64, stride=64, per_layer_stride=64,
+        per_layer_eval_tokens=256, ppl_batch_size=4, run_classical=False,
+        word_level=word, results_dir=SCRATCH + tag, make_plots=False)
+    return H._read_rows(H.run_hybrid_sweep(cfg))
+
+_wr = _wsweep(True, "-word")
+_tr = _wsweep(False, "-word-tok")
+assert _wr and all(r["ppl_unit"] == "word" for r in _wr), "rows must be tagged word-level"
+assert all(r["ppl_unit"] == "token" for r in _tr), "token run must be tagged token"
+# --gate-sizes 0 becomes the register-wide gate width (> 2), not 0
+assert all(int(r["gate_size"]) > 2 for r in _wr), "register-wide gate width recorded"
+_w = {r["chi"]: float(r["perplexity"]) for r in _wr}
+_t = {r["chi"]: float(r["perplexity"]) for r in _tr}
+assert any(abs(_w[c] - _t[c]) > 1e-3 for c in _w), "word-level PPL must differ from token-level"
+print(f"  hybrid sweep: --gate-sizes 0 -> register-wide (k={_wr[0]['gate_size']}); "
+      f"--word-level tags ppl_unit=word and rescales PPL")
 
 print("\nALL HYBRID SMOKE STAGES PASSED")

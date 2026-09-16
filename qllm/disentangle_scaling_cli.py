@@ -76,7 +76,7 @@ from .disentangler import (
     quantum_param_count,
 )
 from .hybrid_heal import heal_hybrid, make_heal_batches
-from .hybrid_sweep import MAX_GATE_SIZE, validate_gate_sizes
+from .hybrid_sweep import DEFAULT_GATE_SIZE, validate_gate_sizes
 from .layer_analysis import parse_layer_info
 from .qubit_mpo import make_plan, plan_bond_entropy, plan_compress
 
@@ -185,7 +185,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--revision", default=None)
 
     p.add_argument("--gate-sizes", type=int, nargs="+", default=[2],
-                   help=f"Qubits per gate k (default: 2; 1..{MAX_GATE_SIZE}).")
+                   help=f"Qubits per gate k (default: {DEFAULT_GATE_SIZE}; no "
+                        f"upper cap, k=0 = register-wide gate).")
     p.add_argument("--layers", type=int, nargs="+", default=None,
                    help="Explicit brickwall depths L to sweep (overrides "
                         "--max-layers/--num-points). L=0 is allowed: it is the "

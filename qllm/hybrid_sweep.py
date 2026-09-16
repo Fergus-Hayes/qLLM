@@ -67,27 +67,30 @@ from .layer_analysis import parse_layer_info
 from .compactifai_heal import heal_layer, make_heal_batches
 from .hybrid_heal import heal_hybrid
 
-# The circuits are restricted to at most two-qubit gates. This is the
-# hardware-realistic regime -- the paper runs only its two-qubit-gate
-# disentanglers on a real QPU (its "ku = kv = 2" configuration), transpiling
-# wider gates is what blows up the physical depth -- and it is where the
-# quantum parameter count Q ~ 4^k per gate stays affordable against the layer.
-MAX_GATE_SIZE = 2
+# Gates default to two qubits -- the hardware-realistic regime the paper runs on
+# a QPU, where the quantum parameter count Q ~ 4^k per gate stays affordable.
+# There is no upper cap: wider gates, up to a single register-wide gate (k=0),
+# are allowed so the paper's Table I "10qU, 8qV, L=1" register-wide configuration
+# is reachable. Wider gates disentangle in fewer layers but blow up the physical
+# depth once transpiled to hardware-native gates -- a deliberate trade-off.
+DEFAULT_GATE_SIZE = 2
+MAX_GATE_SIZE = DEFAULT_GATE_SIZE          # backward-compatible alias (the default)
 
 
 def validate_gate_sizes(gate_sizes) -> list[int]:
-    """Keep the requested gate sizes, rejecting anything wider than two qubits.
+    """Normalise the requested gate sizes -- no upper cap.
 
-    ``k = 0`` (one gate spanning the whole register) and ``k > 2`` are refused:
-    both leave the two-qubit-gate regime this build is restricted to.
+    ``k >= 1`` is a ``k``-qubit gate; ``k = 0`` is a single gate spanning the
+    whole register (the paper's register-wide configuration). When none are
+    given the default is a single two-qubit gate. Only negative widths are
+    refused.
     """
-    sizes = sorted({int(k) for k in (gate_sizes or [MAX_GATE_SIZE])})
-    bad = [k for k in sizes if k < 1 or k > MAX_GATE_SIZE]
+    sizes = sorted({int(k) for k in (gate_sizes if gate_sizes else [DEFAULT_GATE_SIZE])})
+    bad = [k for k in sizes if k < 0]
     if bad:
         raise ValueError(
-            f"gate size(s) {bad} are outside the allowed 1..{MAX_GATE_SIZE} "
-            f"qubits; this build considers only k <= {MAX_GATE_SIZE} "
-            f"(two-qubit gates). Drop k=0 (whole register) and k>2.")
+            f"gate size(s) {bad} are negative; use k>=1 for a k-qubit gate or "
+            f"k=0 for a single register-wide gate.")
     return sizes
 
 
@@ -112,6 +115,7 @@ class HybridConfig(CompactifaiConfig):
     run_classical: bool = True                 # also record the pure-TN curve
     hybrid_csv_name: str = "hybrid_per_layer.csv"
     heal_mode: str = "full"                    # hybrid healing: "core" (chi' bond) or "full" (+U/V circuits)
+    word_level: bool = False                   # report word-level PPL (Table I) instead of per-token
 
 
 @dataclass
@@ -150,6 +154,7 @@ class HybridRow:
     disentangle_seconds: float
     eval_tokens: int
     eval_seconds: float
+    ppl_unit: str = "token"                    # "token" or "word" (--word-level)
     # Healing (optional): brief LM-loss retraining of the swapped-in layer.
     heal_mode: str = "-"
     perplexity_healed: float = float("nan")
@@ -271,11 +276,28 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
     budget = config.per_layer_eval_tokens
     probe_stride = config.per_layer_stride or config.max_length
 
-    def evaluate():
+    def _token_evaluate():
         return perplexity_over_ids(
             model, input_ids, device, config.max_length, probe_stride,
             batch_size=config.ppl_batch_size, max_eval_tokens=budget, progress=False,
         )
+
+    # Word-level PPL (Table I): normalise by words, not tokens. On a fixed eval
+    # span PPL_word = PPL_token ** (scored_tokens / words), a single scalar, so
+    # wrapping evaluate() makes every downstream perplexity and ratio word-level.
+    word_scale = 1.0
+    if config.word_level:
+        span = min(budget or input_ids.size(1), input_ids.size(1))
+        try:
+            n_words = max(1, len(tokenizer.decode(input_ids[0, :span]).split()))
+        except Exception:                              # noqa: BLE001
+            n_words = span
+        word_scale = span / n_words
+        print(f"Word-level PPL: {span} tokens / {n_words} words -> exponent {word_scale:.4f}")
+
+    def evaluate():
+        ppl, tok, secs = _token_evaluate()
+        return (ppl ** word_scale if config.word_level else ppl), tok, secs
 
     path = hybrid_csv_path(config)
     existing = [] if config.force_recompute else _read_rows(path)
@@ -455,6 +477,7 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
             disentangle_retained=float("nan"), disentangle_sweeps=0,
             disentangle_seconds=0.0, eval_tokens=eval_tokens,
             eval_seconds=round(secs, 2),
+            ppl_unit="word" if config.word_level else "token",
             **_heal_cols(hmode, ph, pr, frac, hloss, hsec),
         ))
         elapsed = time.perf_counter() - start
@@ -524,6 +547,7 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
                 disentangle_sweeps=res.sweeps_run,
                 disentangle_seconds=round(res.seconds, 2),
                 eval_tokens=eval_tokens, eval_seconds=round(secs, 2),
+                ppl_unit="word" if config.word_level else "token",
                 **_heal_cols(hmode, ph, pr, frac, hloss, hsec),
             ))
             elapsed = time.perf_counter() - start

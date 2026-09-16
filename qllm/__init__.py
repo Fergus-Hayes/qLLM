@@ -43,6 +43,7 @@ from .disentangler import (
     quantum_param_count,
 )
 from .hybrid_sweep import (
+    DEFAULT_GATE_SIZE,
     HybridConfig,
     MAX_GATE_SIZE,
     run_hybrid_sweep,
@@ -86,6 +87,7 @@ __all__ = [
     "hybrid_weight",
     "quantum_param_count",
     "HybridConfig",
+    "DEFAULT_GATE_SIZE",
     "MAX_GATE_SIZE",
     "run_hybrid_sweep",
     "validate_gate_sizes",

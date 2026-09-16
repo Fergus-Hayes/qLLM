@@ -90,10 +90,11 @@ def parse_args(argv=None) -> argparse.Namespace:
                              "D=0 keeps the circuits at identity and measures "
                              "the qubit-padding overhead on its own.")
     parser.add_argument("--gate-sizes", type=int, nargs="+", default=[2],
-                        help="Qubits per gate k to try (default: 2). This build "
-                             "considers only two-qubit gates, so k must be 1 or "
-                             "2 -- the hardware-realistic regime, and the one "
-                             "where Q(D) ~ 4^k per gate stays affordable.")
+                        help="Qubits per gate k to try (default: 2, the hardware-"
+                             "realistic regime). No upper cap: k=0 is a single "
+                             "register-wide gate (the paper's Table I 10qU/8qV "
+                             "configuration); wider k disentangles in fewer "
+                             "layers but blows up transpiled circuit depth.")
     parser.add_argument("--disentangle-target-chi", type=int, default=1,
                         help="Bond dimension the circuits are optimized to "
                              "squeeze the layer into (the paper uses 1).")
@@ -167,6 +168,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="Split for the healing calibration set (default: train).")
     parser.add_argument("--heal-dataset", default=None,
                         help="Healing dataset (default: same as --dataset).")
+    parser.add_argument("--word-level", action="store_true",
+                        help="Report word-level perplexity (PPL normalised by "
+                             "words, not sub-word tokens) to match the paper's "
+                             "Table I; a ppl_unit column records the choice.")
 
     parser.add_argument("--solve", action="store_true",
                         help="After the sweep, solve the memory budget on the "
@@ -291,6 +296,7 @@ def main(argv=None) -> int:
         heal=args.heal, heal_mode=args.heal_mode, heal_steps=args.heal_steps,
         heal_lr=args.heal_lr, heal_tokens=args.heal_tokens, heal_batch=args.heal_batch,
         heal_split=args.heal_split, heal_dataset=args.heal_dataset,
+        word_level=args.word_level,
         results_dir=args.results_dir, hybrid_csv_name=args.csv_name,
         force_recompute=args.recompute,
     )

@@ -501,7 +501,7 @@ way to `chi' = 1`.
 | ingredient | how it is implemented here |
 | --- | --- |
 | **qubit embedding** | each index is zero-padded to `2^ceil(log2 d)` (the paper's `(576, 192) -> (10, 8)` qubits). The padding is exact but enlarges the residual MPO, so it is a real cost -- see `D = 0` below |
-| **circuit ansatz** | brickwall of real orthogonal `k`-qubit gates as **PennyLane `qml.QubitUnitary` operations**, depth `D`. Circuits are realized by `qml.matrix` (`qllm.disentangler.circuit_unitary`) and can be handed to hardware/transpilation via `circuit_ops`. **This build considers only `k <= 2`** (`--gate-sizes 1 2`): the hardware-realistic regime -- the paper runs only its two-qubit-gate disentanglers on a real QPU, and transpiling wider gates is what blows up the physical depth -- and the one where `Q ~ 4^k` per gate stays affordable. Depth `D` is the lever that is swept |
+| **circuit ansatz** | brickwall of real orthogonal `k`-qubit gates as **PennyLane `qml.QubitUnitary` operations**, depth `D`. Circuits are realized by `qml.matrix` (`qllm.disentangler.circuit_unitary`) and can be handed to hardware/transpilation via `circuit_ops`. Gates **default to `k = 2`** (the hardware-realistic regime -- the paper runs its two-qubit-gate disentanglers on a real QPU, and transpiling wider gates blows up the physical depth), but there is **no upper cap**: `--gate-sizes 0` is a single register-wide gate (the paper's Table I `10qU, 8qV`), and any `k` is allowed. Depth `D` is the other lever |
 | **training** (`--disentangle-optimizer`) | two schemes for the same objective. **`explicit`** (default) is the paper's disentangling algorithm (Appendix A): each gate is set to the polar factor of its environment tensor, `E = A S B -> g <- A B` (Eq. A4), a closed-form optimal step, sweeping U/V until the overlap converges. **`gradient`** optimizes the gate *angles* directly by Adam on a differentiable truncation loss (`--disentangle-gd-steps`, `--disentangle-gd-lr`): each 2-qubit gate is `expm(skew(theta))` with `theta` its `dim so(4) = 6` Lie-algebra angles, so unconstrained descent stays on the orthogonal-gate manifold. The circuit is run **through PennyLane** each step (`circuit_unitary`'s `qml.matrix` keeps the torch autograd graph), so the angles are trained on the PennyLane circuit itself -- no separate torch model. Same gates (`qml.QubitUnitary`), same objective; a closed-form vs. an iterative solver. `gradient` is much slower per optimization (it rebuilds the register unitary every step) and the explicit env-SVD sweep both converges faster and reaches a better optimum for this objective, so it stays the default |
 | **objective** | `min ||U^T W V - T_chi(U^T W V)||`. The target is re-truncated each iteration, so the alternation is **monotone** in the error the compressed layer actually incurs. `--disentangle-target fixed` freezes it at the original's truncation instead, which is the literal objective behind the paper's Eq. (4) accuracy |
 | **`Q(D, k)`** | independent gate angles, `dim O(2^k) = 2^(k-1)(2^k - 1)` per gate (`--quantum-param-counting entries` counts `4^k` matrix entries instead, the right figure if a gate is stored as a dense classical tensor) |
@@ -564,18 +564,45 @@ python hybridize.py --shapes v_proj:576x192 --gate-sizes 2 \
 
 It prints, per `(layer, k, D)`, the circuits' surcharge expressed in bond
 dimensions, the largest `chi'` still affordable, and a **VETO** when not even
-`chi' = 1` fits. `--dry-run` does the same from a real model's shapes. (The
-planner will accept `k = 0` and wider gates for a *what-if* comparison, but the
-measured sweep below is restricted to `k <= 2`.)
+`chi' = 1` fits. `--dry-run` does the same from a real model's shapes. (The planner and the
+measured sweep both accept `k = 0` and wider gates; the default is `k = 2`.)
 
 This matters because the two levers pull against each other: gate size is what
 disentangles (the paper's smallest gates barely reduce the entanglement, its
 widest ones disentangle at `L = 1`), but `Q` grows as `4^k` per gate -- for
 SmolLM2-135M a register-wide gate carries 0.5-2.6 M parameters against layers of
 0.1-0.9 M, the paper's own observation that as circuits the disentanglers "carry
-at least as many trainable parameters as `W`". Capping at `k <= 2` keeps `Q`
-small (36-66 parameters for these registers), so with two-qubit gates the useful
-lever is the brickwall **depth** `D`.
+at least as many trainable parameters as `W`". Two-qubit gates keep `Q` small
+(36-66 parameters for these registers), so the useful lever there is the
+brickwall **depth** `D`; register-wide gates (`--gate-sizes 0`) instead
+disentangle almost completely at `D = 1` -- the paper's Table I regime -- at the
+cost of a large (0.5-2.6 M) quantum-parameter count carried by the circuits.
+
+### Reproduce the paper's Table I (register-wide gates, word-level PPL)
+
+Table I truncates the *disentangled* operator of the `(10qU, 8qV, L=1)` v_proj
+layer to bond dimension `chi'` and reports the full-model **word-level** PPL. Use
+a register-wide single-layer disentangler (`--gate-sizes 0 --circuit-depths 1`),
+the `chi'` grid from the table, and `--word-level`:
+
+```bash
+python hybridize.py <PAPER_MODEL> \
+    --profile-depths 10 --layer-types v_proj \
+    --tensorization qubit --gate-sizes 0 --circuit-depths 1 \
+    --disentangle-target-chi 1 --disentangle-target fixed \
+    --disentangle-sweeps 40 --restarts 3 \
+    --chi 1 2 5 10 50 256 --no-classical --word-level \
+    --csv-name table1.csv --ppl-batch-size 32
+```
+
+`--gate-sizes 0` builds one register-wide gate per index (a 10-qubit `U` and an
+8-qubit `V` for this layer, `Q = 556,416`); `--chi 256` clamps to full rank (the
+table's `exact` row). The `MPO_new params` column (`classical_params`: 36, 132,
+696, 2,356, 36,948, 401,956) reproduces Table I exactly; `--word-level` matches
+its PPL normalisation (a `ppl_unit` column records `word` vs `token`). Omit
+`--per-layer-eval-tokens` to score the whole test set as the paper does. Match
+the paper's **model** for the absolute baseline (35.292 word-level looks like
+SmolLM-135M v1, not SmolLM2-135M); the `∆PPL%` shape reproduces regardless.
 
 ### Measure both surfaces
 
@@ -741,9 +768,10 @@ python hybridize.py HuggingFaceTB/SmolLM2-135M \
 projection (`k_proj` is the same shape), and `--budgets 1.003` is the paper's
 headline tolerance for that layer (`+0.3%` perplexity). Add `--tensorization
 qubit` to match the paper's parameter counts exactly (36 at `chi'=1`, 132 at 2). Point the same command
-at any `MODEL_ID`, block, or layer type to compare a different layer. Because
-this build's gates are `k <= 2`, the disentangling is weaker than the paper's
-wide-gate circuits -- which is exactly what `M*/N*` at `w > 0` quantifies.
+at any `MODEL_ID`, block, or layer type to compare a different layer. With the
+default `k = 2` the disentangling is weaker than the paper's wide-gate circuits
+(which is what `M*/N*` at `w > 0` quantifies); pass `--gate-sizes 0` for the
+paper's register-wide disentangler.
 
 ### Disentangling accuracy vs. number of layers (the paper's Fig. 3)
 
