@@ -36,11 +36,13 @@ the checkpoint, and a point counts as done only once it carries a healed value.
 
 from __future__ import annotations
 
+import inspect
 import math
 import multiprocessing as mp
 import os
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
@@ -223,6 +225,12 @@ def _disentangle_job(job: dict) -> tuple[int, dict, list[dict]]:
     import torch as _torch
     from .disentangler import disentangle as _disentangle, hybrid_weight as _hw
     from .compactifai import relative_error as _relerr
+
+    # Test hook: simulate a killed worker (OOM/segfault) to exercise the sequential
+    # fallback. Never set in normal use.
+    _kill = os.environ.get("QLLM_TEST_KILL_JOBS", "")
+    if _kill and str(job["idx"]) in _kill.split(","):
+        os._exit(1)
 
     _torch.set_num_threads(max(1, int(job.get("threads", 1))))
     orig = job["orig"]
@@ -696,6 +704,30 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
                   f"rel.err={err:.4f}  elapsed={elapsed:.0f}s "
                   f"eta={elapsed / done * (total_points - done):.0f}s")
 
+    def _summ_rows_from_res(orig, res, keep):
+        """Match the worker's (summary, rows) format from an in-process result."""
+        rows = [{"chi": int(c), "c_params": int(cp), "err": float(relative_error(orig, ap))}
+                for c in keep for ap, cp in [hybrid_weight(res, c)]]
+        summ = {
+            "n_out": int(res.n_out_qubits), "n_in": int(res.n_in_qubits),
+            "quantum_params": int(res.quantum_params),
+            "retained_classical": float(res.retained_classical),
+            "retained": float(res.retained), "accuracy": float(res.accuracy),
+            "entropy": float(res.entropy), "sweeps_run": int(res.sweeps_run),
+            "seconds": float(res.seconds),
+            "padded_rows": int(res.padded_shape[0]), "padded_cols": int(res.padded_shape[1]),
+            "rows_n": int(orig.shape[0]), "cols_n": int(orig.shape[1]),
+        }
+        return summ, rows
+
+    def _run_job_sequential(p):
+        """Disentangle one prepared job in this process (fallback / non-parallel)."""
+        res = _disentangle_op(p["orig"], p["k_eff"], p["d"], config.disentangle_target_chi)
+        _print_res(res)
+        summ, rows = _summ_rows_from_res(p["orig"], res, p["part"]["keep"])
+        _emit_computed(p["name"], p["layer_type"], p["block"], p["k_row"], p["d"],
+                       p["part"]["dense"], summ, rows)
+
     # Partition every job: record the over-budget chi' as NaN rows now (no compute),
     # and collect the jobs that still have work to disentangle.
     prepared = []
@@ -744,24 +776,38 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
             restarts=config.disentangle_restarts,
             fast_gradient=config.disentangle_fast_gradient,
             gradient_objective=config.disentangle_gradient_objective)
-        # Use a 'forkserver' (or 'spawn') start method, never the default 'fork':
-        # the main process holds live OpenMP/BLAS threads by now, and forking that
-        # state deadlocks the children (they inherit locks held by absent threads).
-        # forkserver's clean server process avoids the deadlock and does not re-run
-        # __main__, so it is safe from an unguarded caller too.
+        # Use 'spawn' (fully isolated fresh interpreters), never the default 'fork':
+        # by now the main process holds live OpenMP/BLAS threads, and forking that
+        # state deadlocks or crashes the children. 'spawn' inherits none of it and
+        # does not re-run an unguarded __main__ the way a bare fork of this module
+        # would; the CLI entry (hybridize.py) is __main__-guarded.
         try:
-            ctx = mp.get_context("forkserver")
-        except ValueError:                           # platform without forkserver
             ctx = mp.get_context("spawn")
+        except ValueError:                           # pragma: no cover
+            ctx = mp.get_context("forkserver")
+        # Recycle each worker after a few tasks so peak memory can't accumulate
+        # across the big high-D layers (a dead worker OOMs the whole pool otherwise).
+        pool_kwargs = {"max_workers": workers, "mp_context": ctx}
+        if "max_tasks_per_child" in inspect.signature(ProcessPoolExecutor).parameters:
+            pool_kwargs["max_tasks_per_child"] = 8   # Python >= 3.11: bound memory growth
         print(f"\nDisentangling {len(prepared)} jobs across {workers} process(es), "
-              f"{threads} torch thread(s) each ({ctx.get_start_method()}) ...")
+              f"{threads} torch thread(s) each (spawn) ...")
         payloads = [{"idx": i, "orig": p["orig"], "k_eff": p["k_eff"], "d": p["d"],
                      "keep": p["part"]["keep"], "target_chi": config.disentangle_target_chi,
                      "threads": threads, "dkw": dkw} for i, p in enumerate(prepared)]
-        with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as ex:
-            futures = [ex.submit(_disentangle_job, pl) for pl in payloads]
+        pending = set(range(len(prepared)))          # jobs not yet emitted
+        ex = ProcessPoolExecutor(**pool_kwargs)
+        try:
+            futures = {ex.submit(_disentangle_job, pl): pl["idx"] for pl in payloads}
             for fut in as_completed(futures):
-                idx, summ, rows = fut.result()
+                idx = futures[fut]
+                try:
+                    _, summ, rows = fut.result()
+                except Exception as exc:             # noqa: BLE001  (worker crash)
+                    print(f"  [warn] worker failed on job {idx} "
+                          f"({type(exc).__name__}); will finish it sequentially.")
+                    continue
+                pending.discard(idx)
                 p = prepared[idx]
                 summ["rows_n"] = int(p["orig"].shape[0])
                 summ["cols_n"] = int(p["orig"].shape[1])
@@ -772,6 +818,18 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
                       f"accuracy {summ['accuracy']:.4f} in {summ['seconds']:.1f}s")
                 _emit_computed(p["name"], p["layer_type"], p["block"], p["k_row"],
                                p["d"], p["part"]["dense"], summ, rows)
+        except BrokenProcessPool:
+            print("  [warn] the process pool died (a worker was killed -- most often "
+                  "out of memory). Finishing the remaining jobs sequentially; re-run "
+                  "with a smaller --jobs to parallelize within the memory budget.")
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
+        # Sequential fallback for anything the pool did not deliver -- guarantees the
+        # sweep completes (single-process memory is what the earlier runs used).
+        if pending:
+            print(f"  Finishing {len(pending)} job(s) sequentially ...")
+            for idx in sorted(pending):
+                _run_job_sequential(prepared[idx])
     else:
         # Sequential path: handles perplexity, healing and per-chi' re-optimization.
         for p in prepared:

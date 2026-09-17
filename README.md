@@ -708,12 +708,24 @@ processes with `--jobs N` (`--jobs 0` uses all cores). Torch threads are split
 across the workers so they don't oversubscribe the CPU. This applies only when
 there is no model in the loop -- i.e. with `--no-perplexity`, no healing and no
 `--disentangle-target-per-chi` (otherwise the run stays sequential and `--jobs`
-is ignored). Because each worker uses a different torch thread count, a parallel
-run's `relative_error` values can differ from a sequential run's at the ~1e-2
-level (threaded-SVD floating-point non-determinism in a non-convex optimization);
-the grid, parameter counts and skip decisions are identical, and every row is a
-valid measurement -- exact bit-reproducibility across `--jobs` settings is not
+is ignored). Workers are launched with the `spawn` start method (fully isolated
+fresh interpreters) -- never `fork`, which would deadlock or crash after torch
+has spun up its thread pool.
+
+Because each worker uses a different torch thread count, a parallel run's
+`relative_error` values can differ from a sequential run's at the ~1e-2 level
+(threaded-SVD floating-point non-determinism in a non-convex optimization); the
+grid, parameter counts and skip decisions are identical, and every row is a valid
+measurement -- exact bit-reproducibility across `--jobs` settings is not
 guaranteed.
+
+**Memory:** each worker holds a full padded layer operator, so `--jobs 0` on a
+grid with the large `q_proj`/`o_proj` layers at high `D` can exhaust RAM and a
+worker gets OOM-killed. That no longer aborts the run: a dead worker (or a broken
+pool) is caught and its jobs are finished **sequentially**, so the sweep always
+completes and everything is checkpointed. If you hit the warning, re-run with a
+smaller `--jobs` (e.g. `--jobs 6`) to parallelize within your memory budget --
+the checkpoint skips everything already done.
 
 ### Measure both surfaces
 

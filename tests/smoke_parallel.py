@@ -74,6 +74,19 @@ def main():
         assert int(r["total_params"]) > int(r["params_original"])
     print(f"\n  --jobs 2 grid == --jobs 1 grid ({len(par)} rows); cap=0 kept {len(kept)}, "
           f"skipped {len(skip)}")
+
+    # Fallback: kill some workers mid-run (simulated OOM) -- the sweep must still
+    # complete every point via the sequential fallback.
+    os.environ["QLLM_TEST_KILL_JOBS"] = "0,2"
+    try:
+        fb = _run(2, "-fallback")
+    finally:
+        del os.environ["QLLM_TEST_KILL_JOBS"]
+    assert {key(r) for r in fb} == {key(r) for r in seq}, "fallback lost/added grid points"
+    fb_kept = [r for r in fb if r["method"] == "hybrid" and r["relative_error"] not in ("", "nan")]
+    assert len(fb_kept) == len(kept), \
+        f"fallback did not finish every disentangle: {len(fb_kept)} vs {len(kept)}"
+    print(f"  worker-death fallback: all {len(fb)} rows completed ({len(fb_kept)} disentangled)")
     print("\nPARALLEL SMOKE PASSED")
 
 
