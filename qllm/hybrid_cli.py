@@ -172,6 +172,12 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="Report word-level perplexity (PPL normalised by "
                              "words, not sub-word tokens) to match the paper's "
                              "Table I; a ppl_unit column records the choice.")
+    parser.add_argument("--no-perplexity", action="store_true",
+                        help="Skip the model perplexity evaluation entirely and "
+                             "record only the reconstruction relative_error, the "
+                             "disentangling accuracy/entropy/retained, and the "
+                             "parameter counts. Much faster (no forward passes); "
+                             "healing and --solve are unavailable in this mode.")
 
     parser.add_argument("--solve", action="store_true",
                         help="After the sweep, solve the memory budget on the "
@@ -296,7 +302,7 @@ def main(argv=None) -> int:
         heal=args.heal, heal_mode=args.heal_mode, heal_steps=args.heal_steps,
         heal_lr=args.heal_lr, heal_tokens=args.heal_tokens, heal_batch=args.heal_batch,
         heal_split=args.heal_split, heal_dataset=args.heal_dataset,
-        word_level=args.word_level,
+        word_level=args.word_level, measure_perplexity=not args.no_perplexity,
         results_dir=args.results_dir, hybrid_csv_name=args.csv_name,
         force_recompute=args.recompute,
     )
@@ -312,7 +318,10 @@ def main(argv=None) -> int:
 
     path = run_hybrid_sweep(config)
 
-    if args.solve:
+    if args.solve and args.no_perplexity:
+        print("\n(--solve needs perplexity; skipped under --no-perplexity. "
+              "The CSV has relative_error / accuracy for every grid point.)")
+    elif args.solve:
         from .budget_cli import filter_curves, report_curves
         from .budget_frontier import (
             filter_rows_by_tensorization,

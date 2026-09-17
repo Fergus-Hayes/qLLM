@@ -604,6 +604,40 @@ its PPL normalisation (a `ppl_unit` column records `word` vs `token`). Omit
 the paper's **model** for the absolute baseline (35.292 word-level looks like
 SmolLM-135M v1, not SmolLM2-135M); the `∆PPL%` shape reproduces regardless.
 
+### Reconstruction accuracy only (`--no-perplexity`)
+
+The perplexity evaluation is the slow part of the sweep -- every grid point runs
+the model over the eval corpus. When you only need the *reconstruction* quality
+of the compression (how well `W'` approximates `W`, independent of the LM), pass
+`--no-perplexity`: the sweep still truncates / disentangles every point and
+records `relative_error` (`‖W-W'‖/‖W‖`), the disentangling `accuracy`, `entropy`,
+`retained`, and the parameter counts (`C(chi')`, `Q(D)`, `M*`), but runs **no
+forward passes** at all. The `perplexity` columns are left blank, healing is
+auto-disabled (it needs the LM loss), and the run is orders of magnitude faster.
+
+This makes it cheap to map accuracy over a large `(D, chi')` grid. To sweep `D`
+logarithmically up to depth 256, `chi'` (hybrid bond) logarithmically up to 128,
+and `chi` (classical bond) over the same grid:
+
+```bash
+python hybridize.py <MODEL> \
+    --profile-depths 10 --layer-types v_proj \
+    --tensorization qubit --gate-sizes 2 \
+    --circuit-depths 0 1 2 4 8 16 32 64 128 256 \
+    --chi 1 2 4 8 16 32 64 128 \
+    --no-perplexity \
+    --disentangle-target-chi 1 --disentangle-target fixed \
+    --disentangle-sweeps 40 --restarts 3 \
+    --csv-name accuracy_grid.csv
+```
+
+Each `D` disentangles once (at target `chi'=1`), then every `chi'` in `--chi`
+truncates that same disentangled operator, so `accuracy`/`entropy` are per-`D`
+while `relative_error`/`retained` vary per `(D, chi')`. `D=0` is the classical
+CompactifAI point (no circuits); `--chi` doubles as both the classical `chi` grid
+and the hybrid `chi'` grid. `--solve` is unavailable in this mode (it needs the
+perplexity curve) and is skipped with a note.
+
 ### Measure both surfaces
 
 ```bash

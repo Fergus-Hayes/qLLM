@@ -702,4 +702,37 @@ assert any(abs(_w[c] - _t[c]) > 1e-3 for c in _w), "word-level PPL must differ f
 print(f"  hybrid sweep: --gate-sizes 0 -> register-wide (k={_wr[0]['gate_size']}); "
       f"--word-level tags ppl_unit=word and rescales PPL")
 
+
+# --------------------------------------------------------------------------- #
+# 11. Relative-error-only mode (--no-perplexity)
+# --------------------------------------------------------------------------- #
+print("\n=== 11. Relative-error-only mode (--no-perplexity) ===")
+shutil.rmtree(SCRATCH + "-noppl", ignore_errors=True)
+# A model-eval that would blow up if it were called -- proves no forward happens.
+_bad_ppl = H.perplexity_over_ids
+H.perplexity_over_ids = lambda *a, **k: (_ for _ in ()).throw(AssertionError("PPL called!"))
+try:
+    npcfg = H.HybridConfig(
+        model_id="tiny-gpt2", device="cpu", dtype="float32",
+        include_pattern=r"h\.0\.attn\.c_proj", exclude_pattern=r"(wte|wpe|lm_head|ln|bias)",
+        tensorization="qubit", chi_values=[1, 2, 4], circuit_depths=[0, 2, 8],
+        gate_sizes=[2], num_depths=1, disentangle_sweeps=6,
+        measure_perplexity=False, heal=True,   # heal must be auto-disabled
+        results_dir=SCRATCH + "-noppl", make_plots=False)
+    nppath = H.run_hybrid_sweep(npcfg)
+finally:
+    H.perplexity_over_ids = _bad_ppl
+nprows = H._read_rows(nppath)
+assert nprows, "no-perplexity sweep wrote no rows"
+assert all(r["perplexity"] in ("", "nan") for r in nprows), "perplexity must be blank/nan"
+assert all(_isfinite(r["relative_error"]) for r in nprows), "relative_error must be recorded"
+assert all(r["ppl_ratio_healed"] in ("", "nan") for r in nprows), "healing must be off without PPL"
+# relative_error varies with chi' (truncation), accuracy is per-D (fixed target)
+_h = [r for r in nprows if r["method"] == "hybrid" and int(r["circuit_depth"]) == 8]
+_by_chi = sorted(_h, key=lambda r: int(r["chi"]))
+assert float(_by_chi[0]["relative_error"]) > float(_by_chi[-1]["relative_error"]), \
+    "relative_error should fall as chi' grows"
+assert len({r["disentangle_accuracy"] for r in _h}) == 1, "accuracy is per-D, constant across chi'"
+print(f"  --no-perplexity: {len(nprows)} rows, relative_error + accuracy only, no forward passes, heal auto-off")
+
 print("\nALL HYBRID SMOKE STAGES PASSED")

@@ -116,6 +116,7 @@ class HybridConfig(CompactifaiConfig):
     hybrid_csv_name: str = "hybrid_per_layer.csv"
     heal_mode: str = "full"                    # hybrid healing: "core" (chi' bond) or "full" (+U/V circuits)
     word_level: bool = False                   # report word-level PPL (Table I) instead of per-token
+    measure_perplexity: bool = True            # False -> relative error / accuracy only (no model eval)
 
 
 @dataclass
@@ -272,32 +273,43 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
     print(f"             bond dimensions chi = {chis}")
     print(f"             hybrid bond dimensions chi' = {hybrid_chis}")
 
-    input_ids = tokenize_corpus(tokenizer, load_cfg)
     budget = config.per_layer_eval_tokens
     probe_stride = config.per_layer_stride or config.max_length
+    measure_ppl = config.measure_perplexity
+    heal_on = config.heal and measure_ppl
+    if config.heal and not measure_ppl:
+        print("(--no-perplexity: healing is disabled -- it needs the LM loss.)")
 
-    def _token_evaluate():
-        return perplexity_over_ids(
-            model, input_ids, device, config.max_length, probe_stride,
-            batch_size=config.ppl_batch_size, max_eval_tokens=budget, progress=False,
-        )
-
-    # Word-level PPL (Table I): normalise by words, not tokens. On a fixed eval
-    # span PPL_word = PPL_token ** (scored_tokens / words), a single scalar, so
-    # wrapping evaluate() makes every downstream perplexity and ratio word-level.
+    input_ids = None
     word_scale = 1.0
-    if config.word_level:
-        span = min(budget or input_ids.size(1), input_ids.size(1))
-        try:
-            n_words = max(1, len(tokenizer.decode(input_ids[0, :span]).split()))
-        except Exception:                              # noqa: BLE001
-            n_words = span
-        word_scale = span / n_words
-        print(f"Word-level PPL: {span} tokens / {n_words} words -> exponent {word_scale:.4f}")
+    if measure_ppl:
+        input_ids = tokenize_corpus(tokenizer, load_cfg)
 
-    def evaluate():
-        ppl, tok, secs = _token_evaluate()
-        return (ppl ** word_scale if config.word_level else ppl), tok, secs
+        def _token_evaluate():
+            return perplexity_over_ids(
+                model, input_ids, device, config.max_length, probe_stride,
+                batch_size=config.ppl_batch_size, max_eval_tokens=budget, progress=False,
+            )
+
+        # Word-level PPL (Table I): PPL_word = PPL_token ** (scored_tokens/words).
+        if config.word_level:
+            span = min(budget or input_ids.size(1), input_ids.size(1))
+            try:
+                n_words = max(1, len(tokenizer.decode(input_ids[0, :span]).split()))
+            except Exception:                          # noqa: BLE001
+                n_words = span
+            word_scale = span / n_words
+            print(f"Word-level PPL: {span} tokens / {n_words} words -> exponent {word_scale:.4f}")
+
+        def evaluate():
+            ppl, tok, secs = _token_evaluate()
+            return (ppl ** word_scale if config.word_level else ppl), tok, secs
+    else:
+        print("\nPerplexity disabled (--no-perplexity): recording relative error, "
+              "disentangling accuracy, entropy and retained only.")
+
+        def evaluate():
+            return float("nan"), 0, 0.0
 
     path = hybrid_csv_path(config)
     existing = [] if config.force_recompute else _read_rows(path)
@@ -309,7 +321,7 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
         r = rows_by_key.get(key)
         if r is None:
             return False
-        if not config.heal:
+        if not heal_on:
             return True
         try:
             return math.isfinite(float(r.get("ppl_ratio_healed", "nan")))
@@ -317,24 +329,26 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
             return False
 
     baseline = float("nan")
-    if not config.force_recompute:
-        for _r in existing:
-            try:
-                baseline = float(_r["ppl_baseline"]); break
-            except (KeyError, ValueError, TypeError):
-                continue
-    if not math.isfinite(baseline):
-        print(f"\nBaseline (all layers dense) perplexity on {budget} tokens ...")
-        baseline, eval_tokens, _ = evaluate()
-        print(f"Baseline perplexity = {baseline:.4f}")
-    else:
-        eval_tokens = budget or input_ids.size(1)
-        print(f"\nBaseline perplexity from checkpoint = {baseline:.4f}")
+    eval_tokens = 0
+    if measure_ppl:
+        if not config.force_recompute:
+            for _r in existing:
+                try:
+                    baseline = float(_r["ppl_baseline"]); break
+                except (KeyError, ValueError, TypeError):
+                    continue
+        if not math.isfinite(baseline):
+            print(f"\nBaseline (all layers dense) perplexity on {budget} tokens ...")
+            baseline, eval_tokens, _ = evaluate()
+            print(f"Baseline perplexity = {baseline:.4f}")
+        else:
+            eval_tokens = budget or input_ids.size(1)
+            print(f"\nBaseline perplexity from checkpoint = {baseline:.4f}")
 
     # ---- Healing calibration set (disjoint split), tokenized once and reused.
     heal_batches: list = []
     _res0: dict = {}
-    if config.heal:
+    if heal_on:
         heal_cfg = BenchmarkConfig(
             model_id=config.model_id, device=config.device, dtype=config.dtype,
             trust_remote_code=config.trust_remote_code, revision=config.revision,
@@ -415,9 +429,12 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
     print(f"\n{len(layers)} layers | classical points to run: {len(todo)} | "
           f"hybrid points to run: {n_hybrid_points} "
           f"({len(hybrid_jobs)} disentangling optimizations)")
-    windows = max(1, math.ceil((budget or input_ids.size(1)) / probe_stride))
-    print(f"Each point = one perplexity evaluation over {budget} tokens "
-          f"({windows} windows of {config.max_length}, stride {probe_stride}).")
+    if measure_ppl:
+        windows = max(1, math.ceil((budget or input_ids.size(1)) / probe_stride))
+        print(f"Each point = one perplexity evaluation over {budget} tokens "
+              f"({windows} windows of {config.max_length}, stride {probe_stride}).")
+    else:
+        print("Each point = one MPO truncation / disentangle, no model eval.")
     print(f"Checkpoint / results CSV: {path}")
 
     field_names = [f.name for f in fields(HybridRow)]
@@ -444,14 +461,16 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
         orig = originals[name]
         approx, params_mpo = plan_compress(orig, plan, chi)
         err = relative_error(orig, approx)
-        with torch.no_grad():
-            param.copy_(approx.to(dtype=param.dtype, device=param.device))
-        ppl, eval_tokens, secs = evaluate()
-        with torch.no_grad():
-            param.copy_(orig.to(dtype=param.dtype, device=param.device))
+        ppl, secs = float("nan"), 0.0
+        if measure_ppl:
+            with torch.no_grad():
+                param.copy_(approx.to(dtype=param.dtype, device=param.device))
+            ppl, eval_tokens, secs = evaluate()
+            with torch.no_grad():
+                param.copy_(orig.to(dtype=param.dtype, device=param.device))
         layer_type, block = parse_layer_info(name)
         hmode, ph, pr, frac, hloss, hsec = "-", float("nan"), float("nan"), float("nan"), float("nan"), 0.0
-        if config.heal and heal_batches:
+        if heal_on and heal_batches:
             if config.tensorization == "balanced":
                 ph, hloss, hsec = _heal_and_eval(name, param, orig, chi, "core", plan=plan)
             else:
@@ -483,8 +502,8 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
         elapsed = time.perf_counter() - start
         print(f"  [{done}/{total_points}] classical {layer_type} d{block} "
               f"chi={chi:<4} C={params_mpo:<8,} rel.err={err:.4f} "
-              f"ppl={ppl:.4f} (x{ppl / baseline:.4f})"
-              + (f" heal x{pr:.4f}" if config.heal and pr == pr else "")
+              + (f"ppl={ppl:.4f} (x{ppl / baseline:.4f})" if measure_ppl else "")
+              + (f" heal x{pr:.4f}" if heal_on and pr == pr else "")
               + f"  elapsed={elapsed:.0f}s eta={elapsed / done * (total_points - done):.0f}s")
 
     # ---- Hybrid surface: PPL(chi', D) with the disentangling circuits in place.
@@ -512,15 +531,17 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
         for chi in sorted({min(int(c), exact) for c in missing}):
             approx, c_params = hybrid_weight(res, chi)
             err = relative_error(orig, approx)
-            with torch.no_grad():
-                param.copy_(approx.to(dtype=param.dtype, device=param.device))
-            ppl, eval_tokens, secs = evaluate()
-            with torch.no_grad():
-                param.copy_(orig.to(dtype=param.dtype, device=param.device))
+            ppl, secs = float("nan"), 0.0
+            if measure_ppl:
+                with torch.no_grad():
+                    param.copy_(approx.to(dtype=param.dtype, device=param.device))
+                ppl, eval_tokens, secs = evaluate()
+                with torch.no_grad():
+                    param.copy_(orig.to(dtype=param.dtype, device=param.device))
             q_params = res.quantum_params
             dense = int(orig.shape[0]) * int(orig.shape[1])
             hmode, ph, pr, frac, hloss, hsec = "-", float("nan"), float("nan"), float("nan"), float("nan"), 0.0
-            if config.heal and heal_batches:
+            if heal_on and heal_batches:
                 ph, hloss, hsec = _heal_and_eval(name, param, orig, chi, config.heal_mode, res=res)
                 pr = ph / baseline if baseline else float("nan")
                 frac = _recovered(ppl, ph); hmode = config.heal_mode
@@ -553,8 +574,9 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
             elapsed = time.perf_counter() - start
             print(f"  [{done}/{total_points}] hybrid    {layer_type} d{block} "
                   f"k={k_row} D={d} chi'={chi:<4} C={c_params:<8,} Q={q_params:<8,} "
-                  f"rel.err={err:.4f} ppl={ppl:.4f} (x{ppl / baseline:.4f})"
-                  + (f" heal x{pr:.4f}" if config.heal and pr == pr else "")
+                  f"rel.err={err:.4f} "
+                  + (f"ppl={ppl:.4f} (x{ppl / baseline:.4f})" if measure_ppl else "")
+                  + (f" heal x{pr:.4f}" if heal_on and pr == pr else "")
                   + f"  elapsed={elapsed:.0f}s "
                   f"eta={elapsed / done * (total_points - done):.0f}s")
 
