@@ -838,4 +838,32 @@ assert any(int(r["circuit_depth"]) == 0 and r["relative_error"] not in ("", "nan
 print(f"  cap {CAP}: {len(_kept)} computed, {len(_over)} over-budget NaN rows; "
       f"D=8 optimization skipped entirely")
 
+# --------------------------------------------------------------------------- #
+# 15. --fast-gradient: pure-torch apply_circuit matches PennyLane qml.matrix
+# --------------------------------------------------------------------------- #
+print("\n=== 15. --fast-gradient (torch apply_circuit == PennyLane qml.matrix) ===")
+torch.manual_seed(0)
+Wg = torch.randn(64, 64)
+_kw = dict(gate_size=2, depth=6, target_chi=2, tensorization="qubit",
+           optimizer="gradient", gd_steps=60, gd_lr=0.03, seed=0)
+slow = disentangle(Wg, fast_gradient=False, **_kw)
+fast = disentangle(Wg, fast_gradient=True, **_kw)
+# Same optimization, two ways of forming U^T W V -> same optimum (numerical noise).
+assert abs(slow.retained - fast.retained) < 1e-3, \
+    f"fast-gradient retained diverged: {slow.retained} vs {fast.retained}"
+a_slow, _ = hybrid_weight(slow, 2)
+a_fast, _ = hybrid_weight(fast, 2)
+assert rel(a_slow, a_fast) < 1e-2, f"fast-gradient W' diverged: {rel(a_slow, a_fast)}"
+# Circuits stay orthogonal -> exact reconstruction at full rank.
+_exg = full_rank_chi(fast.plan.out_dims, fast.plan.in_dims)
+assert rel(Wg, hybrid_weight(fast, _exg)[0]) < 1e-4, "fast-gradient broke orthogonality"
+# It also composes with the explicit+gradient polish (just must run + stay exact).
+polish = disentangle(Wg, gate_size=2, depth=4, target_chi=2, tensorization="balanced",
+                     optimizer="explicit+gradient", gd_steps=80, gd_lr=0.02, seed=0,
+                     fast_gradient=True)
+assert rel(Wg, hybrid_weight(polish, full_rank_chi(polish.plan.out_dims,
+                                                    polish.plan.in_dims))[0]) < 1e-4
+print(f"  fast==slow: retained {slow.retained:.5f} vs {fast.retained:.5f}, "
+      f"W' reldiff {rel(a_slow, a_fast):.1e}; explicit+gradient --fast-gradient exact")
+
 print("\nALL HYBRID SMOKE STAGES PASSED")

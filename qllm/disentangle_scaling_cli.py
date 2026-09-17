@@ -211,6 +211,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                    choices=["explicit", "gradient", "explicit+gradient"],
                    help="Training scheme (default: explicit, the paper's env-SVD). "
                         "'explicit+gradient' refines the sweep with Adam afterwards.")
+    p.add_argument("--fast-gradient", action="store_true",
+                   help="gradient/explicit+gradient: evaluate the loss with pure-torch "
+                        "apply_circuit contractions instead of PennyLane qml.matrix "
+                        "(same result, faster per step; no effect on explicit).")
     p.add_argument("--disentangle-sweeps", type=int, default=40,
                    help="explicit: max environment sweeps per L.")
     p.add_argument("--disentangle-gd-steps", type=int, default=200)
@@ -692,7 +696,8 @@ def main(argv=None) -> int:
                 target_mode=args.disentangle_target, tensorization=args.tensorization,
                 optimizer=args.optimizer, sweeps=args.disentangle_sweeps,
                 gd_steps=args.disentangle_gd_steps, gd_lr=args.disentangle_gd_lr,
-                restarts=args.restarts, seed=args.seed)
+                restarts=args.restarts, seed=args.seed,
+                fast_gradient=args.fast_gradient)
             ppl = float("nan")
             heal_cols: dict = {}
             if measure_ppl:

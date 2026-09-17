@@ -119,6 +119,13 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="explicit: maximum environment sweeps per optimization.")
     parser.add_argument("--disentangle-gd-steps", type=int, default=200,
                         help="gradient / explicit+gradient: Adam steps per optimization.")
+    parser.add_argument("--fast-gradient", action="store_true",
+                        help="For the gradient / explicit+gradient optimizer, evaluate "
+                             "each step's loss with the pure-torch apply_circuit "
+                             "contractions (O(#gates), no 2^n x 2^n register unitary) "
+                             "instead of composing it through PennyLane's qml.matrix. "
+                             "Same result, several times faster per step; no effect on "
+                             "the explicit optimizer.")
     parser.add_argument("--disentangle-gd-lr", type=float, default=0.05,
                         help="gradient: Adam learning rate.")
     parser.add_argument("--disentangle-tol", type=float, default=1e-6)
@@ -307,6 +314,7 @@ def main(argv=None) -> int:
         disentangle_target_chi=args.disentangle_target_chi,
         disentangle_target_per_chi=args.disentangle_target_per_chi,
         disentangle_optimizer=args.disentangle_optimizer,
+        disentangle_fast_gradient=args.fast_gradient,
         disentangle_gd_steps=args.disentangle_gd_steps,
         disentangle_gd_lr=args.disentangle_gd_lr,
         disentangle_sweeps=args.disentangle_sweeps,

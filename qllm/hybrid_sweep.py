@@ -113,6 +113,7 @@ class HybridConfig(CompactifaiConfig):
     gate_sizes: list[int] | None = None        # qubits per gate k (0 = whole register)
     disentangle_target_chi: int = 1            # bond dimension the circuits aim at
     disentangle_optimizer: str = "explicit"    # 'explicit' (env-SVD) or 'gradient' (Adam)
+    disentangle_fast_gradient: bool = False    # gradient: use pure-torch apply_circuit, not PennyLane qml.matrix
     disentangle_sweeps: int = 12               # explicit: max environment sweeps
     disentangle_gd_steps: int = 200            # gradient: Adam steps
     disentangle_gd_lr: float = 0.05            # gradient: Adam learning rate
@@ -582,6 +583,7 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
             optimizer=config.disentangle_optimizer,
             gd_steps=config.disentangle_gd_steps, gd_lr=config.disentangle_gd_lr,
             restarts=config.disentangle_restarts,
+            fast_gradient=config.disentangle_fast_gradient,
         )
 
     def _print_res(res):

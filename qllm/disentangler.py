@@ -439,7 +439,8 @@ def disentangle_loss(current: torch.Tensor, out_dims: list[int], in_dims: list[i
 
 
 def _train_gradient(padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
-                    steps, lr, init, seed, log, base_u=None, base_v=None):
+                    steps, lr, init, seed, log, base_u=None, base_v=None,
+                    fast=False):
     """Optimize the gate angles by Adam to minimize :func:`disentangle_loss`.
 
     Returns ``(u_gates, v_gates, steps_run, history)`` with the trained gates as
@@ -451,6 +452,13 @@ def _train_gradient(padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
     reproduces the base circuit exactly and Adam only *refines* it. Without them
     the gates are ``expm(skew(theta))`` from an identity (or Haar, ``init=random``)
     start, the from-scratch behaviour.
+
+    ``fast`` forms the disentangled operator ``U^T W V`` with the pure-torch
+    :func:`apply_circuit`/:func:`apply_right` local contractions (``O(#gates)``,
+    no ``2^n x 2^n`` register unitary) instead of composing it through PennyLane's
+    ``qml.matrix``. Both are differentiable and give the same operator; the torch
+    path is several times faster per step and much lighter on memory for wide
+    registers. The default keeps the PennyLane path (``qml.matrix``).
     """
     pos_u = gate_positions(n_out, gate_size, depth)
     pos_v = gate_positions(n_in, gate_size, depth)
@@ -479,12 +487,21 @@ def _train_gradient(padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
     opt = torch.optim.Adam(params, lr=lr)
     for step in range(max(1, steps)):
         opt.zero_grad()
-        # Build the circuits from the current angles and get their unitaries
-        # THROUGH PennyLane (circuit_unitary, torch interface) -- autograd flows
-        # from the loss back to the angles via the PennyLane circuit itself.
-        u = circuit_unitary(_gates_from_angles(theta_u, pos_u, bases_u), n_out)
-        v = circuit_unitary(_gates_from_angles(theta_v, pos_v, bases_v), n_in)
-        current = u.transpose(0, 1) @ padded @ v
+        # Build the disentangled operator U^T W V from the current angles. The
+        # gate matrices carry autograd either way; ``fast`` chooses how they are
+        # contracted into ``current``.
+        ug = _gates_from_angles(theta_u, pos_u, bases_u)
+        vg = _gates_from_angles(theta_v, pos_v, bases_v)
+        if fast:
+            # Pure-torch local contractions -- O(#gates), no register unitary.
+            current = apply_right(vg, apply_circuit(ug, padded, n_out, transpose=True),
+                                  n_in, transpose=True)
+        else:
+            # THROUGH PennyLane (qml.matrix, torch interface) -- autograd flows
+            # from the loss back to the angles via the PennyLane circuit itself.
+            u = circuit_unitary(ug, n_out)
+            v = circuit_unitary(vg, n_in)
+            current = u.transpose(0, 1) @ padded @ v
         loss = disentangle_loss(current, out_dims, in_dims, n_sites, target_chi)
         loss.backward()
         opt.step()
@@ -534,6 +551,7 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
                       target_mode: str = "adaptive", tensorization: str = "balanced",
                       qubit_align: str = "msb", optimizer: str = "explicit",
                       gd_steps: int = 200, gd_lr: float = 0.05,
+                      fast_gradient: bool = False,
                       log: bool = False) -> DisentangleResult:
     """Disentangle ``W`` into ``U MPO_new V^T`` with brickwall circuits of depth ``D``.
 
@@ -589,7 +607,7 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
     if optimizer == "gradient":
         u_gates, v_gates, steps_run, history = _train_gradient(
             padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
-            gd_steps, gd_lr, init, seed, log)
+            gd_steps, gd_lr, init, seed, log, fast=fast_gradient)
         return _build_result(
             weight, padded, u_gates, v_gates, n_out, n_in, gate_size, depth,
             target_chi, _plan, param_counting, retained_classical, target_ref,
@@ -643,7 +661,8 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
     if optimizer == "explicit+gradient" and (u_gates or v_gates):
         u_gates, v_gates, gd_run, gd_hist = _train_gradient(
             padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
-            gd_steps, gd_lr, init, seed, log, base_u=u_gates, base_v=v_gates)
+            gd_steps, gd_lr, init, seed, log, base_u=u_gates, base_v=v_gates,
+            fast=fast_gradient)
         history = history + gd_hist
         label = "explicit+gradient"
 
@@ -681,7 +700,8 @@ def disentangle(weight: torch.Tensor, gate_size: int, depth: int,
                 param_counting: str = "manifold", target_mode: str = "adaptive",
                 tensorization: str = "balanced", qubit_align: str = "msb",
                 optimizer: str = "explicit", gd_steps: int = 200, gd_lr: float = 0.05,
-                restarts: int = 1, log: bool = False) -> DisentangleResult:
+                restarts: int = 1, fast_gradient: bool = False,
+                log: bool = False) -> DisentangleResult:
     """Disentangle ``W``, keeping the best of ``restarts`` initializations.
 
     The optimization is not convex, so the gates can settle in different optima.
@@ -690,12 +710,15 @@ def disentangle(weight: torch.Tensor, gate_size: int, depth: int,
     ``restarts=1`` is a single run from ``init``. ``optimizer`` picks the training
     scheme: ``explicit`` (the paper's environment-SVD sweep, default) or
     ``gradient`` (Adam on the gate angles); both minimize the same objective.
+    ``fast_gradient`` evaluates the gradient scheme's loss with the pure-torch
+    ``apply_circuit`` contractions instead of PennyLane's ``qml.matrix`` (same
+    result, faster per step); it has no effect on the ``explicit`` optimizer.
     """
     def _run(this_init, this_seed):
         return _disentangle_once(
             weight, gate_size, depth, target_chi, n_sites, sweeps, tol, this_init,
             this_seed, param_counting, target_mode, tensorization, qubit_align,
-            optimizer, gd_steps, gd_lr, log)
+            optimizer, gd_steps, gd_lr, fast_gradient, log)
 
     best = _run(init, seed)
     for extra in range(1, max(1, restarts)):
