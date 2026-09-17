@@ -54,6 +54,7 @@ from .benchmark import (
 from .compactifai import (
     full_rank_chi,
     log_spaced_ints,
+    mpo_param_count,
     relative_error,
 )
 from .compactifai_sweep import (
@@ -65,7 +66,13 @@ from .compactifai_sweep import (
     select_layers,
     tensorized_name,
 )
-from .disentangler import disentangle, hybrid_weight, n_qubits_for, pad_to_qubits
+from .disentangler import (
+    disentangle,
+    hybrid_weight,
+    n_qubits_for,
+    pad_to_qubits,
+    quantum_param_count,
+)
 from .qubit_mpo import make_plan, plan_compress
 from .layer_analysis import parse_layer_info
 from .compactifai_heal import heal_layer, make_heal_batches
@@ -122,6 +129,7 @@ class HybridConfig(CompactifaiConfig):
     heal_mode: str = "full"                    # hybrid healing: "core" (chi' bond) or "full" (+U/V circuits)
     word_level: bool = False                   # report word-level PPL (Table I) instead of per-token
     measure_perplexity: bool = True            # False -> relative error / accuracy only (no model eval)
+    max_total_params: int | None = None        # skip (NaN row) any point whose M* = C(chi') + Q(D) exceeds this
 
 
 @dataclass
@@ -460,6 +468,35 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
                      str(row.circuit_depth), str(row.gate_size))] = asdict(row)
         checkpoint()
 
+    cap = config.max_total_params                    # None -> no parameter budget
+
+    def _skipped_row(*, name, layer_type, block, method, optimizer, chi, circuit_depth,
+                     gate_size, rows, cols, padded_rows, padded_cols, n_out, n_in,
+                     dense, c_params, q_params) -> HybridRow:
+        """An over-budget grid point: parameter counts kept, everything measured NaN.
+
+        The point is recorded (so it checkpoints and appears on the grid) but no MPO
+        truncation, disentangling, healing or model eval was run for it.
+        """
+        return HybridRow(
+            timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            model_id=config.model_id, param_name=name, layer_type=layer_type,
+            depth=block, method=method, tensorization=config.tensorization,
+            optimizer=optimizer, chi=chi, circuit_depth=circuit_depth, gate_size=gate_size,
+            rows=rows, cols=cols, padded_rows=padded_rows, padded_cols=padded_cols,
+            n_out_qubits=n_out, n_in_qubits=n_in, params_original=dense,
+            classical_params=c_params, quantum_params=q_params,
+            total_params=c_params + q_params,
+            compression_ratio=round((c_params + q_params) / dense, 6) if dense else float("nan"),
+            relative_error=float("nan"), perplexity=float("nan"),
+            ppl_baseline=round(baseline, 4), ppl_ratio=float("nan"),
+            disentangle_accuracy=float("nan"), disentangle_entropy=float("nan"),
+            disentangle_retained=float("nan"), disentangle_sweeps=0,
+            disentangle_seconds=0.0, eval_tokens=0, eval_seconds=0.0,
+            ppl_unit="word" if config.word_level else "token",
+            **_heal_cols("-", float("nan"), float("nan"), float("nan"), float("nan"), 0.0),
+        )
+
     start = time.perf_counter()
     total_points = len(todo) + n_hybrid_points
     done = 0
@@ -468,6 +505,22 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
     for _kind, name, param, chi, _d in todo:
         plan = classical_plans[name]
         orig = originals[name]
+        layer_type, block = parse_layer_info(name)
+        # Parameter budget: skip (NaN row) before any SVD / eval if C(chi) alone
+        # exceeds the cap. Q = 0 for the classical layer, so M* = C(chi).
+        if cap is not None:
+            c_only = mpo_param_count(plan.out_dims, plan.in_dims, chi)
+            if c_only > cap:
+                done += 1
+                record(_skipped_row(
+                    name=name, layer_type=layer_type, block=block, method="classical",
+                    optimizer="-", chi=chi, circuit_depth=-1, gate_size=0,
+                    rows=int(orig.shape[0]), cols=int(orig.shape[1]),
+                    padded_rows=int(orig.shape[0]), padded_cols=int(orig.shape[1]),
+                    n_out=0, n_in=0, dense=plan.dense_params, c_params=c_only, q_params=0))
+                print(f"  [{done}/{total_points}] classical {layer_type} d{block} "
+                      f"chi={chi:<4} C={c_only:<8,} SKIP (M* > cap {cap:,})")
+                continue
         approx, params_mpo = plan_compress(orig, plan, chi)
         err = relative_error(orig, approx)
         ppl, secs = float("nan"), 0.0
@@ -477,7 +530,6 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
             ppl, eval_tokens, secs = evaluate()
             with torch.no_grad():
                 param.copy_(orig.to(dtype=param.dtype, device=param.device))
-        layer_type, block = parse_layer_info(name)
         hmode, ph, pr, frac, hloss, hsec = "-", float("nan"), float("nan"), float("nan"), float("nan"), 0.0
         if heal_on and heal_batches:
             if config.tensorization == "balanced":
@@ -548,6 +600,35 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
                           svd_cache=False, align=config.qubit_align)
         exact = full_rank_chi(_geom.out_dims, _geom.in_dims)
         chi_list = sorted({min(int(c), exact) for c in missing})
+        dense = int(orig.shape[0]) * int(orig.shape[1])
+
+        # Parameter budget. Q(D) is fixed for this (D, k); C(chi') grows with chi'.
+        # Points over the cap are recorded as NaN rows with no compute; if *every*
+        # chi' is over budget the disentangling optimization itself is skipped --
+        # the whole point of the cap (a deep k=2 circuit can dwarf an all-to-all
+        # k=0 one for the same accuracy).
+        q_params = quantum_param_count(_no, _ni, k_eff, d, config.quantum_param_counting)
+        c_of = {c: mpo_param_count(_geom.out_dims, _geom.in_dims, c) for c in chi_list}
+        if cap is not None:
+            keep = [c for c in chi_list if c_of[c] + q_params <= cap]
+            skip = [c for c in chi_list if c_of[c] + q_params > cap]
+        else:
+            keep, skip = chi_list, []
+        for chi in skip:
+            done += 1
+            record(_skipped_row(
+                name=name, layer_type=layer_type, block=block, method="hybrid",
+                optimizer=config.disentangle_optimizer, chi=chi, circuit_depth=d,
+                gate_size=k_row, rows=int(orig.shape[0]), cols=int(orig.shape[1]),
+                padded_rows=1 << _no, padded_cols=1 << _ni, n_out=_no, n_in=_ni,
+                dense=dense, c_params=c_of[chi], q_params=q_params))
+            print(f"  [{done}/{total_points}] hybrid    {layer_type} d{block} "
+                  f"k={k_row} D={d} chi'={chi:<4} C={c_of[chi]:<8,} Q={q_params:<8,} "
+                  f"M*={c_of[chi] + q_params:<9,} SKIP (M* > cap {cap:,})")
+        if not keep:
+            print(f"  skip disentangle {layer_type} d{block} D={d} k={k_eff}: every "
+                  f"chi' over cap (min M*={min(c_of.values()) + q_params:,} > {cap:,})")
+            continue
 
         # Default: one optimization at ``disentangle_target_chi`` reused across the
         # whole chi' grid (the residual SVD is truncated per chi', paper Table I).
@@ -561,7 +642,7 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
             res_shared = _disentangle_op(orig, k_eff, d, config.disentangle_target_chi)
             _print_res(res_shared)
 
-        for chi in chi_list:
+        for chi in keep:
             if per_chi:
                 print(f"  disentangling {layer_type} d{block} D={d} k={k_eff} "
                       f"target_chi'={chi} ...")
@@ -578,8 +659,7 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
                 ppl, eval_tokens, secs = evaluate()
                 with torch.no_grad():
                     param.copy_(orig.to(dtype=param.dtype, device=param.device))
-            q_params = res.quantum_params
-            dense = int(orig.shape[0]) * int(orig.shape[1])
+            q_params = res.quantum_params            # == the budgeted Q(D)
             hmode, ph, pr, frac, hloss, hsec = "-", float("nan"), float("nan"), float("nan"), float("nan"), 0.0
             if heal_on and heal_batches:
                 ph, hloss, hsec = _heal_and_eval(name, param, orig, chi, config.heal_mode, res=res)

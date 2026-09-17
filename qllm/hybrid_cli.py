@@ -189,6 +189,13 @@ def parse_args(argv=None) -> argparse.Namespace:
                              "disentangling accuracy/entropy/retained, and the "
                              "parameter counts. Much faster (no forward passes); "
                              "healing and --solve are unavailable in this mode.")
+    parser.add_argument("--max-total-params", type=int, default=None,
+                        help="Parameter budget M* = C(chi') + Q(D). Any grid point "
+                             "whose total exceeds it is recorded as a NaN row with "
+                             "no compute; when every chi' at a (D, k) is over budget "
+                             "the disentangling optimization itself is skipped. Lets "
+                             "you sweep k and (chi', D) together without wasting time "
+                             "on the deep circuits a small k needs for high D.")
 
     parser.add_argument("--solve", action="store_true",
                         help="After the sweep, solve the memory budget on the "
@@ -315,6 +322,7 @@ def main(argv=None) -> int:
         heal_lr=args.heal_lr, heal_tokens=args.heal_tokens, heal_batch=args.heal_batch,
         heal_split=args.heal_split, heal_dataset=args.heal_dataset,
         word_level=args.word_level, measure_perplexity=not args.no_perplexity,
+        max_total_params=args.max_total_params,
         results_dir=args.results_dir, hybrid_csv_name=args.csv_name,
         force_recompute=args.recompute,
     )

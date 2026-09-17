@@ -668,6 +668,35 @@ This costs one optimization per grid point instead of one per `D` (here roughly
 non-convex, so a `target_chi = chi'` optimum can occasionally land worse than the
 `chi'=1` circuits truncated to `chi'`; `--restarts` mitigates this.
 
+#### Parameter budget (`--max-total-params`)
+
+When you sweep several gate sizes `k` alongside `(chi', D)`, the depth a small
+`k` needs to reach a given accuracy is far larger than an all-to-all `k=0` gate
+needs, and `Q(D) ~ D` blows up: a deep `k=2` point can cost thousands of quantum
+parameters to match what a shallow `k=0` point does in a handful. Those points
+are off any sensible Pareto front, so computing them is wasted work. Pass
+`--max-total-params M` to cap the budget `M* = C(chi') + Q(D)`: every grid point
+over the cap is written as a **NaN row** (its `C`, `Q`, `total_params` are still
+recorded, but `relative_error`/`perplexity`/`accuracy` are blank) with **no MPO
+truncation, disentangling, healing or model eval**. Crucially, when *every* `chi'`
+at a `(D, k)` is over budget, the disentangling optimization itself -- the
+expensive part -- is skipped, not just the per-`chi'` evaluations:
+
+```bash
+python hybridize.py <MODEL> \
+    --profile-depths 10 --layer-types v_proj \
+    --tensorization qubit \
+    --gate-sizes 0 2 4 \
+    --circuit-depths 0 1 2 4 8 16 32 64 128 256 \
+    --chi 1 2 4 8 16 32 64 128 \
+    --no-perplexity --max-total-params 100000 \
+    --csv-name kq_grid.csv
+```
+
+The cap applies to the classical surface too (there `Q = 0`, so `M* = C(chi)`).
+NaN rows keep the grid rectangular for plotting and count as done for
+checkpoint/resume, so the budget only ever removes compute, never grid points.
+
 ### Measure both surfaces
 
 ```bash

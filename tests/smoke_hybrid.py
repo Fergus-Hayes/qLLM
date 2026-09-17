@@ -801,4 +801,41 @@ print(f"  balanced retained: explicit {be.retained:.4f} -> explicit+gradient "
       f"{bg.retained:.4f} (+{bg.retained - be.retained:.4f}); full-rank recon exact; "
       f"depth-0 no-op ok")
 
+# --------------------------------------------------------------------------- #
+# 14. Parameter budget (--max-total-params): over-cap points -> NaN rows
+# --------------------------------------------------------------------------- #
+print("\n=== 14. Parameter budget (--max-total-params) ===")
+shutil.rmtree(SCRATCH + "-cap", ignore_errors=True)
+CAP = 200
+capcfg = H.HybridConfig(
+    model_id="tiny-gpt2", device="cpu", dtype="float32",
+    include_pattern=r"h\.0\.attn\.c_proj", exclude_pattern=r"(wte|wpe|lm_head|ln|bias)",
+    tensorization="qubit", chi_values=[1, 2, 4], circuit_depths=[0, 8],
+    gate_sizes=[2], num_depths=1, disentangle_sweeps=6,
+    measure_perplexity=False, max_total_params=CAP,
+    results_dir=SCRATCH + "-cap", make_plots=False)
+caprows = H._read_rows(H.run_hybrid_sweep(capcfg))
+_hy = [r for r in caprows if r["method"] == "hybrid"]
+_over = [r for r in _hy if r["relative_error"] in ("", "nan")]
+_kept = [r for r in _hy if r["relative_error"] not in ("", "nan")]
+assert _over and _kept, "cap must both skip some points and keep others"
+# Every skipped row is over budget with its parameter counts still recorded;
+# every kept row is within budget and actually computed.
+for r in _over:
+    assert int(r["total_params"]) > CAP, f"skipped row not over cap: {r['total_params']}"
+    assert int(r["classical_params"]) > 0 and r["perplexity"] in ("", "nan")
+    assert r["disentangle_sweeps"] == "0", "skipped row must run no sweeps"
+for r in _kept:
+    assert int(r["total_params"]) <= CAP, f"kept row over cap: {r['total_params']}"
+# The whole disentangling optimization is skipped when every chi' at a (D, k) is
+# over budget: here D=8 (Q large) exceeds the cap for all chi', so no D=8 row is
+# ever computed (all NaN), while D=0 (Q=0) keeps its small-chi' rows.
+_d8 = [r for r in _hy if int(r["circuit_depth"]) == 8]
+assert _d8 and all(r["relative_error"] in ("", "nan") for r in _d8), \
+    "D=8 exceeds cap for every chi' -> optimization skipped, all rows NaN"
+assert any(int(r["circuit_depth"]) == 0 and r["relative_error"] not in ("", "nan")
+           for r in _hy), "D=0 small-chi' points stay within budget and compute"
+print(f"  cap {CAP}: {len(_kept)} computed, {len(_over)} over-budget NaN rows; "
+      f"D=8 optimization skipped entirely")
+
 print("\nALL HYBRID SMOKE STAGES PASSED")
