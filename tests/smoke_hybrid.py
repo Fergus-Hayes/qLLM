@@ -735,4 +735,42 @@ assert float(_by_chi[0]["relative_error"]) > float(_by_chi[-1]["relative_error"]
 assert len({r["disentangle_accuracy"] for r in _h}) == 1, "accuracy is per-D, constant across chi'"
 print(f"  --no-perplexity: {len(nprows)} rows, relative_error + accuracy only, no forward passes, heal auto-off")
 
+# --------------------------------------------------------------------------- #
+# 12. Per-(D, chi') disentangling (--disentangle-target-per-chi)
+# --------------------------------------------------------------------------- #
+print("\n=== 12. Per-(D, chi') disentangling (target_chi' = chi') ===")
+shutil.rmtree(SCRATCH + "-perchi", ignore_errors=True)
+pccfg = H.HybridConfig(
+    model_id="tiny-gpt2", device="cpu", dtype="float32",
+    include_pattern=r"h\.0\.attn\.c_proj", exclude_pattern=r"(wte|wpe|lm_head|ln|bias)",
+    tensorization="qubit", chi_values=[1, 2, 4], circuit_depths=[0, 8],
+    gate_sizes=[2], num_depths=1, disentangle_sweeps=6,
+    measure_perplexity=False, disentangle_target_per_chi=True,
+    results_dir=SCRATCH + "-perchi", make_plots=False)
+pcpath = H.run_hybrid_sweep(pccfg)
+pcrows = H._read_rows(pcpath)
+assert pcrows, "per-chi sweep wrote no rows"
+assert all(_isfinite(r["relative_error"]) for r in pcrows), "relative_error must be recorded"
+# With a fresh optimization per (D, chi') the disentangling stats are no longer a
+# per-D constant: at fixed D>0 the accuracy/retained now vary across chi' (each
+# row squeezed to its own target_chi = chi'), unlike the shared-optimization mode
+# asserted constant in stage 11.
+_pc = [r for r in pcrows if r["method"] == "hybrid" and int(r["circuit_depth"]) == 8]
+assert len(_pc) >= 2, "need multiple chi' at D=8"
+assert len({r["disentangle_accuracy"] for r in _pc}) > 1, \
+    "per-(D, chi') accuracy must vary across chi' (target_chi' = chi')"
+assert len({r["disentangle_retained"] for r in _pc}) > 1, \
+    "per-(D, chi') retained must vary across chi'"
+# The default (shared) mode over the same grid keeps them constant -- the contrast.
+shutil.rmtree(SCRATCH + "-shared", ignore_errors=True)
+shcfg = H.HybridConfig(**{**pccfg.__dict__, "disentangle_target_per_chi": False,
+                          "results_dir": SCRATCH + "-shared"})
+shrows = H._read_rows(H.run_hybrid_sweep(shcfg))
+_sh = [r for r in shrows if r["method"] == "hybrid" and int(r["circuit_depth"]) == 8]
+assert len({r["disentangle_accuracy"] for r in _sh}) == 1, \
+    "shared mode: accuracy constant across chi' (one optimization at target_chi')"
+print(f"  per-(D,chi'): {len(pcrows)} rows; D=8 accuracy over chi' = "
+      f"{sorted(float(r['disentangle_accuracy']) for r in _pc)} "
+      f"(shared mode: constant {_sh[0]['disentangle_accuracy']})")
+
 print("\nALL HYBRID SMOKE STAGES PASSED")

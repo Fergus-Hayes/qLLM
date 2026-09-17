@@ -14,11 +14,15 @@ probe tokens**, so their budgets are directly comparable:
 isolates the cost of the power-of-two qubit padding from the benefit of the
 circuits.
 
-One disentangling optimization is reused across the whole ``chi'`` grid -- the
-residual operator is disentangled once per ``(layer, D)`` and its cached SVD is
-truncated at each bond dimension, mirroring how the classical sweep reuses one
-SVD per layer. The heavy term is therefore the perplexity probe, one evaluation
-per row, and everything is checkpointed per row so an interrupted sweep resumes.
+By default one disentangling optimization is reused across the whole ``chi'``
+grid -- the residual operator is disentangled once per ``(layer, D)`` (squeezing
+to ``disentangle_target_chi``) and its cached SVD is truncated at each bond
+dimension, mirroring how the classical sweep reuses one SVD per layer. With
+``disentangle_target_per_chi`` a fresh optimization is run for every
+``(layer, D, chi')`` point instead, each squeezing to ``target_chi = chi'`` -- the
+best circuits for that bond, at one optimization per grid point. The heavy term
+is otherwise the perplexity probe, one evaluation per row, and everything is
+checkpointed per row so an interrupted sweep resumes.
 
 With ``config.heal`` each point is additionally healed -- briefly retrained
 against the LM loss (all other layers dense) to minimise its perplexity -- and
@@ -61,7 +65,7 @@ from .compactifai_sweep import (
     select_layers,
     tensorized_name,
 )
-from .disentangler import disentangle, hybrid_weight, n_qubits_for
+from .disentangler import disentangle, hybrid_weight, n_qubits_for, pad_to_qubits
 from .qubit_mpo import make_plan, plan_compress
 from .layer_analysis import parse_layer_info
 from .compactifai_heal import heal_layer, make_heal_batches
@@ -108,6 +112,7 @@ class HybridConfig(CompactifaiConfig):
     disentangle_tol: float = 1e-6
     disentangle_init: str = "identity"
     disentangle_target_mode: str = "adaptive"  # 'adaptive' or the paper's 'fixed'
+    disentangle_target_per_chi: bool = False   # re-optimize per (D, chi') with target_chi = chi'
     disentangle_restarts: int = 1
     disentangle_seed: int = 0
     quantum_param_counting: str = "manifold"   # 'manifold' (angles) or 'entries'
@@ -426,9 +431,13 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
                     hybrid_jobs.append((name, param, d, k_eff, k_row, missing))
 
     n_hybrid_points = sum(len(j[-1]) for j in hybrid_jobs)
+    _n_opts = n_hybrid_points if config.disentangle_target_per_chi else len(hybrid_jobs)
+    _opt_note = ("one per (D, chi'), target_chi'=chi'"
+                 if config.disentangle_target_per_chi
+                 else f"reused across chi', target_chi'={config.disentangle_target_chi}")
     print(f"\n{len(layers)} layers | classical points to run: {len(todo)} | "
           f"hybrid points to run: {n_hybrid_points} "
-          f"({len(hybrid_jobs)} disentangling optimizations)")
+          f"({_n_opts} disentangling optimizations, {_opt_note})")
     if measure_ppl:
         windows = max(1, math.ceil((budget or input_ids.size(1)) / probe_stride))
         print(f"Each point = one perplexity evaluation over {budget} tokens "
@@ -507,14 +516,13 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
               + f"  elapsed={elapsed:.0f}s eta={elapsed / done * (total_points - done):.0f}s")
 
     # ---- Hybrid surface: PPL(chi', D) with the disentangling circuits in place.
-    for name, param, d, k_eff, k_row, missing in hybrid_jobs:
-        orig = originals[name]
-        layer_type, block = parse_layer_info(name)
-        print(f"  disentangling {layer_type} d{block} D={d} k={k_eff} ...")
-        res = disentangle(
-            orig, gate_size=k_eff, depth=d,
+    per_chi = config.disentangle_target_per_chi
+
+    def _disentangle_op(op, k_eff, d, target_chi):
+        return disentangle(
+            op, gate_size=k_eff, depth=d,
             tensorization=config.tensorization, qubit_align=config.qubit_align,
-            target_chi=config.disentangle_target_chi, n_sites=config.mpo_sites,
+            target_chi=target_chi, n_sites=config.mpo_sites,
             sweeps=config.disentangle_sweeps, tol=config.disentangle_tol,
             init=config.disentangle_init, seed=config.disentangle_seed,
             param_counting=config.quantum_param_counting,
@@ -523,12 +531,44 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
             gd_steps=config.disentangle_gd_steps, gd_lr=config.disentangle_gd_lr,
             restarts=config.disentangle_restarts,
         )
+
+    def _print_res(res):
         print(f"    {res.n_out_qubits}q x {res.n_in_qubits}q, Q(D)={res.quantum_params:,} "
               f"| retained {res.retained_classical:.4f} -> {res.retained:.4f} "
               f"| accuracy {res.accuracy:.4f} | entropy {res.entropy:.4f} "
               f"| {res.sweeps_run} sweeps in {res.seconds:.1f}s")
-        exact = full_rank_chi(res.plan.out_dims, res.plan.in_dims)
-        for chi in sorted({min(int(c), exact) for c in missing}):
+
+    for name, param, d, k_eff, k_row, missing in hybrid_jobs:
+        orig = originals[name]
+        layer_type, block = parse_layer_info(name)
+        # Full-rank bond of the padded operator: geometry only, so it is the same
+        # whatever the circuits or target_chi are -- clamp the chi' grid to it.
+        _padded, _no, _ni = pad_to_qubits(orig)
+        _geom = make_plan(_padded, config.tensorization, config.mpo_sites,
+                          svd_cache=False, align=config.qubit_align)
+        exact = full_rank_chi(_geom.out_dims, _geom.in_dims)
+        chi_list = sorted({min(int(c), exact) for c in missing})
+
+        # Default: one optimization at ``disentangle_target_chi`` reused across the
+        # whole chi' grid (the residual SVD is truncated per chi', paper Table I).
+        # ``disentangle_target_per_chi``: a fresh optimization per (D, chi') that
+        # squeezes to ``target_chi = chi'`` -- best circuits for each bond, at N x
+        # the disentangling cost.
+        res_shared = None
+        if not per_chi:
+            print(f"  disentangling {layer_type} d{block} D={d} k={k_eff} "
+                  f"target_chi'={config.disentangle_target_chi} ...")
+            res_shared = _disentangle_op(orig, k_eff, d, config.disentangle_target_chi)
+            _print_res(res_shared)
+
+        for chi in chi_list:
+            if per_chi:
+                print(f"  disentangling {layer_type} d{block} D={d} k={k_eff} "
+                      f"target_chi'={chi} ...")
+                res = _disentangle_op(orig, k_eff, d, chi)
+                _print_res(res)
+            else:
+                res = res_shared
             approx, c_params = hybrid_weight(res, chi)
             err = relative_error(orig, approx)
             ppl, secs = float("nan"), 0.0

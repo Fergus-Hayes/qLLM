@@ -638,6 +638,36 @@ CompactifAI point (no circuits); `--chi` doubles as both the classical `chi` gri
 and the hybrid `chi'` grid. `--solve` is unavailable in this mode (it needs the
 perplexity curve) and is skipped with a note.
 
+#### One optimization per `(D, chi')` (`--disentangle-target-per-chi`)
+
+By default a single disentangling optimization per `D` (squeezing to
+`--disentangle-target-chi`, i.e. `chi'=1`, the paper's product-operator target)
+is reused across the whole `chi'` grid: the circuits are optimal for `chi'=1` and
+every larger `chi'` is a post-hoc truncation of that one result, so
+`accuracy`/`entropy` are constant down each `D` column. Pass
+`--disentangle-target-per-chi` to instead run a **fresh** optimization for every
+`(D, chi')` point, each squeezing to `target_chi = chi'` -- the best circuits for
+*that* bond dimension. `accuracy`/`entropy`/`retained` then vary per `(D, chi')`,
+and `--disentangle-target-chi` is ignored:
+
+```bash
+python hybridize.py <MODEL> \
+    --profile-depths 10 --layer-types v_proj \
+    --tensorization qubit --gate-sizes 2 \
+    --circuit-depths 0 1 2 4 8 16 32 64 128 256 \
+    --chi 1 2 4 8 16 32 64 128 \
+    --no-perplexity --disentangle-target-per-chi \
+    --disentangle-target fixed --disentangle-sweeps 40 --restarts 3 \
+    --csv-name accuracy_grid_perchi.csv
+```
+
+This costs one optimization per grid point instead of one per `D` (here roughly
+`8x` more disentangling work), so it is the expensive-but-faithful way to ask
+"what is the best each `chi'` can do at each depth". It usually lowers
+`relative_error` at larger `chi'`, though not always -- the env-SVD sweep is
+non-convex, so a `target_chi = chi'` optimum can occasionally land worse than the
+`chi'=1` circuits truncated to `chi'`; `--restarts` mitigates this.
+
 ### Measure both surfaces
 
 ```bash

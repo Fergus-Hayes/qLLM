@@ -97,7 +97,14 @@ def parse_args(argv=None) -> argparse.Namespace:
                              "layers but blows up transpiled circuit depth.")
     parser.add_argument("--disentangle-target-chi", type=int, default=1,
                         help="Bond dimension the circuits are optimized to "
-                             "squeeze the layer into (the paper uses 1).")
+                             "squeeze the layer into (the paper uses 1). Ignored "
+                             "when --disentangle-target-per-chi is set.")
+    parser.add_argument("--disentangle-target-per-chi", action="store_true",
+                        help="Run a separate disentangling optimization for every "
+                             "(D, chi') grid point, each squeezing to target_chi = "
+                             "that chi' (best circuits per bond), instead of one "
+                             "optimization at --disentangle-target-chi reused across "
+                             "the chi' grid. Costs one optimization per point.")
     parser.add_argument("--disentangle-optimizer", default="explicit",
                         choices=["explicit", "gradient"],
                         help="Training scheme for the circuits: 'explicit' (the "
@@ -287,6 +294,7 @@ def main(argv=None) -> int:
         circuit_depths=args.circuit_depths or default_depths(),
         gate_sizes=args.gate_sizes,
         disentangle_target_chi=args.disentangle_target_chi,
+        disentangle_target_per_chi=args.disentangle_target_per_chi,
         disentangle_optimizer=args.disentangle_optimizer,
         disentangle_gd_steps=args.disentangle_gd_steps,
         disentangle_gd_lr=args.disentangle_gd_lr,
