@@ -773,4 +773,32 @@ print(f"  per-(D,chi'): {len(pcrows)} rows; D=8 accuracy over chi' = "
       f"{sorted(float(r['disentangle_accuracy']) for r in _pc)} "
       f"(shared mode: constant {_sh[0]['disentangle_accuracy']})")
 
+# --------------------------------------------------------------------------- #
+# 13. explicit+gradient: implicit refinement after the explicit sweep
+# --------------------------------------------------------------------------- #
+print("\n=== 13. explicit+gradient (implicit refinement after explicit) ===")
+torch.manual_seed(0)
+Wr = torch.randn(64, 64)
+# The chained mode is warm-started from the explicit gates and descends
+# disentangle_loss. On a single-bond BALANCED plan that loss aligns with the
+# reported retained, so the polish does not lose ground there.
+be = disentangle(Wr, gate_size=2, depth=4, target_chi=2, tensorization="balanced",
+                 sweeps=12, optimizer="explicit", seed=0)
+bg = disentangle(Wr, gate_size=2, depth=4, target_chi=2, tensorization="balanced",
+                 sweeps=12, optimizer="explicit+gradient", gd_steps=300, gd_lr=0.02, seed=0)
+assert bg.optimizer == "explicit+gradient", bg.optimizer
+assert bg.retained >= be.retained - 1e-6, \
+    f"balanced polish must not lose retained: {be.retained} -> {bg.retained}"
+# Full-rank reconstruction stays exact (U, V remain orthogonal after refinement).
+_ex = full_rank_chi(bg.plan.out_dims, bg.plan.in_dims)
+_approx, _ = hybrid_weight(bg, _ex)
+assert rel(Wr, _approx) < 1e-4, f"refined circuits must stay orthogonal: {rel(Wr, _approx)}"
+# Depth 0 has no gates: the chained mode is a no-op that still yields a result.
+b0 = disentangle(Wr, gate_size=2, depth=0, target_chi=2, tensorization="qubit",
+                 sweeps=6, optimizer="explicit+gradient", gd_steps=50, seed=0)
+assert not b0.u_gates and not b0.v_gates, "depth 0 must have no gates"
+print(f"  balanced retained: explicit {be.retained:.4f} -> explicit+gradient "
+      f"{bg.retained:.4f} (+{bg.retained - be.retained:.4f}); full-rank recon exact; "
+      f"depth-0 no-op ok")
+
 print("\nALL HYBRID SMOKE STAGES PASSED")

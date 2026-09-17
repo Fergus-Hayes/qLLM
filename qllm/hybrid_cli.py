@@ -106,15 +106,19 @@ def parse_args(argv=None) -> argparse.Namespace:
                              "optimization at --disentangle-target-chi reused across "
                              "the chi' grid. Costs one optimization per point.")
     parser.add_argument("--disentangle-optimizer", default="explicit",
-                        choices=["explicit", "gradient"],
+                        choices=["explicit", "gradient", "explicit+gradient"],
                         help="Training scheme for the circuits: 'explicit' (the "
-                             "paper's environment-SVD sweep, closed-form) or "
-                             "'gradient' (Adam directly on the gate angles). Each "
-                             "writes its own CSV.")
+                             "paper's environment-SVD sweep, closed-form), "
+                             "'gradient' (Adam directly on the gate angles), or "
+                             "'explicit+gradient' (the sweep, then Adam refinement "
+                             "warm-started from it, descending the per-bond loss -- "
+                             "this can move retained/accuracy either way on the "
+                             "multi-site qubit MPO; it aligns for balanced). "
+                             "Each writes its own CSV.")
     parser.add_argument("--disentangle-sweeps", type=int, default=12,
                         help="explicit: maximum environment sweeps per optimization.")
     parser.add_argument("--disentangle-gd-steps", type=int, default=200,
-                        help="gradient: Adam steps per optimization.")
+                        help="gradient / explicit+gradient: Adam steps per optimization.")
     parser.add_argument("--disentangle-gd-lr", type=float, default=0.05,
                         help="gradient: Adam learning rate.")
     parser.add_argument("--disentangle-tol", type=float, default=1e-6)

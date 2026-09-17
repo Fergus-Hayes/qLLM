@@ -394,10 +394,22 @@ def _gate_from_angles(theta: torch.Tensor, k: int) -> torch.Tensor:
 
 
 def _gates_from_angles(thetas: list[torch.Tensor],
-                       positions: list[tuple[int, int]]) -> list[Gate]:
-    """Build :class:`Gate` objects (differentiable matrices) from angle tensors."""
-    return [Gate(s, k, _gate_from_angles(t, k))
-            for t, (s, k) in zip(thetas, positions)]
+                       positions: list[tuple[int, int]],
+                       bases: list[torch.Tensor] | None = None) -> list[Gate]:
+    """Build :class:`Gate` objects (differentiable matrices) from angle tensors.
+
+    Without ``bases`` each gate is ``expm(skew(theta))`` (identity at theta=0).
+    With ``bases`` each gate is ``base @ expm(skew(theta))`` -- a differentiable
+    refinement multiplying a fixed orthogonal base gate, so ``theta=0`` reproduces
+    ``base`` exactly. This is how the gradient stage warm-starts from the explicit
+    sweep's gates (the same parameterization :class:`~qllm.hybrid_heal.HybridAdapter`
+    uses to heal circuits).
+    """
+    if bases is None:
+        return [Gate(s, k, _gate_from_angles(t, k))
+                for t, (s, k) in zip(thetas, positions)]
+    return [Gate(s, k, b @ _gate_from_angles(t, k))
+            for t, (s, k), b in zip(thetas, positions, bases)]
 
 
 def disentangle_loss(current: torch.Tensor, out_dims: list[int], in_dims: list[int],
@@ -427,31 +439,41 @@ def disentangle_loss(current: torch.Tensor, out_dims: list[int], in_dims: list[i
 
 
 def _train_gradient(padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
-                    steps, lr, init, seed, log):
+                    steps, lr, init, seed, log, base_u=None, base_v=None):
     """Optimize the gate angles by Adam to minimize :func:`disentangle_loss`.
 
     Returns ``(u_gates, v_gates, steps_run, history)`` with the trained gates as
     :class:`Gate` objects (PennyLane ``QubitUnitary`` under the hood).
+
+    ``base_u`` / ``base_v`` warm-start the optimization from an existing circuit
+    (e.g. the explicit sweep's result): each trainable gate becomes
+    ``base @ expm(skew(theta))`` with ``theta`` initialised to zero, so step 0
+    reproduces the base circuit exactly and Adam only *refines* it. Without them
+    the gates are ``expm(skew(theta))`` from an identity (or Haar, ``init=random``)
+    start, the from-scratch behaviour.
     """
     pos_u = gate_positions(n_out, gate_size, depth)
     pos_v = gate_positions(n_in, gate_size, depth)
     gen = torch.Generator().manual_seed(seed)
+    refine = base_u is not None                      # warm-start from base gates
+    bases_u = [g.matrix for g in base_u] if refine else None
+    bases_v = [g.matrix for g in base_v] if refine else None
 
     def _init(positions):
         out = []
         for _s, k in positions:
             m = (1 << k) * ((1 << k) - 1) // 2
-            if init == "random":
-                out.append((0.1 * torch.randn(m, generator=gen)).requires_grad_(True))
+            if refine or init != "random":
+                out.append(torch.zeros(m, requires_grad=True))  # start at base/identity
             else:
-                out.append(torch.zeros(m, requires_grad=True))  # identity gates
+                out.append((0.1 * torch.randn(m, generator=gen)).requires_grad_(True))
         return out
 
     theta_u, theta_v = _init(pos_u), _init(pos_v)
     params = theta_u + theta_v
     history: list[float] = []
     if not params:                                   # depth 0: no gates to train
-        return [], [], 0, history
+        return (base_u or []), (base_v or []), 0, history
 
     out_dims, in_dims, n_sites = plan_pad.out_dims, plan_pad.in_dims, plan_pad.n_sites
     opt = torch.optim.Adam(params, lr=lr)
@@ -460,8 +482,8 @@ def _train_gradient(padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
         # Build the circuits from the current angles and get their unitaries
         # THROUGH PennyLane (circuit_unitary, torch interface) -- autograd flows
         # from the loss back to the angles via the PennyLane circuit itself.
-        u = circuit_unitary(_gates_from_angles(theta_u, pos_u), n_out)
-        v = circuit_unitary(_gates_from_angles(theta_v, pos_v), n_in)
+        u = circuit_unitary(_gates_from_angles(theta_u, pos_u, bases_u), n_out)
+        v = circuit_unitary(_gates_from_angles(theta_v, pos_v, bases_v), n_in)
         current = u.transpose(0, 1) @ padded @ v
         loss = disentangle_loss(current, out_dims, in_dims, n_sites, target_chi)
         loss.backward()
@@ -471,10 +493,10 @@ def _train_gradient(padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
             print(f"      gd step {step + 1:>4}/{steps}  loss={float(loss):.6f}")
 
     with torch.no_grad():
-        u_gates = [Gate(s, k, _gate_from_angles(t, k).detach())
-                   for t, (s, k) in zip(theta_u, pos_u)]
-        v_gates = [Gate(s, k, _gate_from_angles(t, k).detach())
-                   for t, (s, k) in zip(theta_v, pos_v)]
+        u_gates = [Gate(g.start, g.k, g.matrix.detach())
+                   for g in _gates_from_angles(theta_u, pos_u, bases_u)]
+        v_gates = [Gate(g.start, g.k, g.matrix.detach())
+                   for g in _gates_from_angles(theta_v, pos_v, bases_v)]
     return u_gates, v_gates, max(1, steps), history
 
 
@@ -538,6 +560,17 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
     * ``gradient`` -- optimize the gate angles directly by Adam on
       :func:`disentangle_loss` (``gd_steps`` steps at ``gd_lr``). Same objective,
       an implicit iterative solver instead of the closed-form update.
+    * ``explicit+gradient`` -- run the explicit sweep first, then refine its gates
+      with the gradient optimizer warm-started from them (``gd_steps`` Adam steps,
+      each gate ``base @ expm(skew(theta))`` with ``theta=0`` at start, so the
+      polish begins exactly at the explicit result). The polish monotonically
+      descends :func:`disentangle_loss`, its own objective. Note that loss is the
+      *mean per-bond* rank-``target_chi`` discarded weight, which coincides with the
+      reported ``retained``/``accuracy`` only for a single-bond (balanced) plan; for
+      the multi-site qubit MPO it is a proxy, so the polish can move those headline
+      metrics either way even as its own loss falls. Use with ``balanced``, or
+      compare against ``explicit`` and keep the better, when ``retained`` is what you
+      optimize.
     """
     t0 = time.perf_counter()
     padded, n_out, n_in = pad_to_qubits(weight)
@@ -601,10 +634,23 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
             break                                # the gate sweeps have converged
         score = new_score
 
+    label = "explicit"
+    # Optional implicit (gradient) polish, warm-started from the explicit gates:
+    # Adam refines base @ expm(skew(theta)) with theta=0 at start (step 0 reproduces
+    # the sweep) and monotonically descends disentangle_loss. That per-bond loss is
+    # only a proxy for retained/accuracy on the multi-site qubit MPO, so the polish
+    # can move those either way; on a single-bond (balanced) plan it aligns.
+    if optimizer == "explicit+gradient" and (u_gates or v_gates):
+        u_gates, v_gates, gd_run, gd_hist = _train_gradient(
+            padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
+            gd_steps, gd_lr, init, seed, log, base_u=u_gates, base_v=v_gates)
+        history = history + gd_hist
+        label = "explicit+gradient"
+
     return _build_result(
         weight, padded, u_gates, v_gates, n_out, n_in, gate_size, depth,
         target_chi, _plan, param_counting, retained_classical, target_ref,
-        ref_norm, norm, sweeps_run, t0, history, "explicit")
+        ref_norm, norm, sweeps_run, t0, history, label)
 
 
 def hybrid_weight(result: DisentangleResult, chi: int) -> tuple[torch.Tensor, int]:

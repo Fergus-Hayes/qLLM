@@ -207,8 +207,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "bond-1 truncation of the original operator.")
     p.add_argument("--tensorization", default="qubit", choices=["balanced", "qubit"],
                    help="MPO geometry (default: qubit, the paper's).")
-    p.add_argument("--optimizer", default="explicit", choices=["explicit", "gradient"],
-                   help="Training scheme (default: explicit, the paper's env-SVD).")
+    p.add_argument("--optimizer", default="explicit",
+                   choices=["explicit", "gradient", "explicit+gradient"],
+                   help="Training scheme (default: explicit, the paper's env-SVD). "
+                        "'explicit+gradient' refines the sweep with Adam afterwards.")
     p.add_argument("--disentangle-sweeps", type=int, default=40,
                    help="explicit: max environment sweeps per L.")
     p.add_argument("--disentangle-gd-steps", type=int, default=200)
