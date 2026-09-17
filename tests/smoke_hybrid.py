@@ -901,4 +901,38 @@ assert "relative-error" in __import__("qllm.disentangler", fromlist=["x"]).GRADI
 print(f"  relative-error obj: RE@target {_re_at(ex, 1):.5f} -> {_re_at(reo, 1):.5f}, "
       f"retained {ex.retained:.4f} -> {reo.retained:.4f} (exact full-rank recon)")
 
+# --------------------------------------------------------------------------- #
+# 17. Per-layer parameter cap (--max-total-params 0 caps at params_original)
+# --------------------------------------------------------------------------- #
+# (Process-parallel --jobs is validated separately in tests/smoke_parallel.py,
+# which needs a __main__-guarded entry for the forkserver start method.)
+print("\n=== 17. Per-layer cap (--max-total-params 0) ===")
+shutil.rmtree(SCRATCH + "-cap0", ignore_errors=True)
+cap0cfg = H.HybridConfig(
+    model_id="tiny-gpt2", device="cpu", dtype="float32",
+    include_pattern=r"h\.0\.attn\.c_proj", exclude_pattern=r"(wte|wpe|lm_head|ln|bias)",
+    tensorization="qubit", chi_values=[1, 2, 4, 16, 64], circuit_depths=[1, 4, 16],
+    gate_sizes=[2, 3], num_depths=1, disentangle_sweeps=6,
+    disentangle_optimizer="explicit", measure_perplexity=False,
+    max_total_params=0, results_dir=SCRATCH + "-cap0", make_plots=False)
+cap0rows = H._read_rows(H.run_hybrid_sweep(cap0cfg))
+_hy = [r for r in cap0rows if r["method"] == "hybrid"]
+_kept = [r for r in _hy if r["relative_error"] not in ("", "nan")]
+_skip = [r for r in _hy if r["relative_error"] in ("", "nan")]
+assert _kept and _skip, "cap=0 must keep some points and skip others"
+# --max-total-params 0 caps each layer at its own params_original: kept rows are
+# within it, skipped rows exceed it.
+for r in _kept:
+    assert int(r["total_params"]) <= int(r["params_original"]), \
+        f"cap=0 kept a row over params_original: {r['total_params']} > {r['params_original']}"
+for r in _skip:
+    assert int(r["total_params"]) > int(r["params_original"]), \
+        f"cap=0 skipped a row within budget: {r['total_params']} <= {r['params_original']}"
+# The classical surface honours it too (Q=0, so it caps C(chi) at params_original).
+_cl_skip = [r for r in cap0rows if r["method"] == "classical" and r["relative_error"] in ("", "nan")]
+for r in _cl_skip:
+    assert int(r["classical_params"]) > int(r["params_original"])
+print(f"  cap=0: kept {len(_kept)} hybrid (<= params_original), skipped {len(_skip)} "
+      f"(> params_original), {len(_cl_skip)} classical skipped")
+
 print("\nALL HYBRID SMOKE STAGES PASSED")

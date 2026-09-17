@@ -210,7 +210,16 @@ def parse_args(argv=None) -> argparse.Namespace:
                              "no compute; when every chi' at a (D, k) is over budget "
                              "the disentangling optimization itself is skipped. Lets "
                              "you sweep k and (chi', D) together without wasting time "
-                             "on the deep circuits a small k needs for high D.")
+                             "on the deep circuits a small k needs for high D. Set 0 "
+                             "to cap at each layer's own params_original (skip any "
+                             "compression larger than the original weight).")
+    parser.add_argument("--jobs", type=int, default=1,
+                        help="Disentangle independent (layer, D, k) points in this "
+                             "many parallel processes (<=0 = all CPU cores). Torch "
+                             "threads are split across workers to avoid "
+                             "oversubscription. Applies only without perplexity, "
+                             "healing or --disentangle-target-per-chi (otherwise "
+                             "ignored, run stays sequential).")
 
     parser.add_argument("--solve", action="store_true",
                         help="After the sweep, solve the memory budget on the "
@@ -339,7 +348,7 @@ def main(argv=None) -> int:
         heal_lr=args.heal_lr, heal_tokens=args.heal_tokens, heal_batch=args.heal_batch,
         heal_split=args.heal_split, heal_dataset=args.heal_dataset,
         word_level=args.word_level, measure_perplexity=not args.no_perplexity,
-        max_total_params=args.max_total_params,
+        max_total_params=args.max_total_params, n_jobs=args.jobs,
         results_dir=args.results_dir, hybrid_csv_name=args.csv_name,
         force_recompute=args.recompute,
     )

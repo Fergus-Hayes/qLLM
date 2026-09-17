@@ -696,6 +696,24 @@ python hybridize.py <MODEL> \
 The cap applies to the classical surface too (there `Q = 0`, so `M* = C(chi)`).
 NaN rows keep the grid rectangular for plotting and count as done for
 checkpoint/resume, so the budget only ever removes compute, never grid points.
+**`--max-total-params 0`** is a special value: it caps each layer at *its own*
+`params_original` (the dense weight count), skipping any point whose compressed
+size would exceed the original weight it replaces -- a per-layer budget that
+automatically adapts to `q_proj`/`o_proj` (larger) vs `k_proj`/`v_proj` (smaller).
+
+#### Parallel disentangling (`--jobs`)
+
+The independent `(layer, D, k)` disentangling optimizations can run in parallel
+processes with `--jobs N` (`--jobs 0` uses all cores). Torch threads are split
+across the workers so they don't oversubscribe the CPU. This applies only when
+there is no model in the loop -- i.e. with `--no-perplexity`, no healing and no
+`--disentangle-target-per-chi` (otherwise the run stays sequential and `--jobs`
+is ignored). Because each worker uses a different torch thread count, a parallel
+run's `relative_error` values can differ from a sequential run's at the ~1e-2
+level (threaded-SVD floating-point non-determinism in a non-convex optimization);
+the grid, parameter counts and skip decisions are identical, and every row is a
+valid measurement -- exact bit-reproducibility across `--jobs` settings is not
+guaranteed.
 
 ### Measure both surfaces
 

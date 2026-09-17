@@ -37,7 +37,10 @@ the checkpoint, and a point counts as done only once it carries a healed value.
 from __future__ import annotations
 
 import math
+import multiprocessing as mp
+import os
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
@@ -131,7 +134,8 @@ class HybridConfig(CompactifaiConfig):
     heal_mode: str = "full"                    # hybrid healing: "core" (chi' bond) or "full" (+U/V circuits)
     word_level: bool = False                   # report word-level PPL (Table I) instead of per-token
     measure_perplexity: bool = True            # False -> relative error / accuracy only (no model eval)
-    max_total_params: int | None = None        # skip (NaN row) any point whose M* = C(chi') + Q(D) exceeds this
+    max_total_params: int | None = None        # skip (NaN row) any point whose M* = C(chi') + Q(D) exceeds this; 0 = cap at params_original
+    n_jobs: int = 1                             # parallel disentangling workers (<=0 -> all cores); only without perplexity/healing/per-chi
 
 
 @dataclass
@@ -206,6 +210,39 @@ def default_depths(max_depth: int = 8, count: int = 4) -> list[int]:
         depths.append(d)
         d *= 2
     return depths
+
+
+def _disentangle_job(job: dict) -> tuple[int, dict, list[dict]]:
+    """Worker: disentangle one (layer, D, k) and truncate to each kept chi'.
+
+    Pure and picklable -- no model, no shared state -- so independent jobs run in
+    separate processes (used only without perplexity/healing/per-chi). Returns the
+    job index, a scalar summary of the disentangling, and the per-chi' scalars the
+    parent needs to build the CSV rows. Only numbers cross the process boundary.
+    """
+    import torch as _torch
+    from .disentangler import disentangle as _disentangle, hybrid_weight as _hw
+    from .compactifai import relative_error as _relerr
+
+    _torch.set_num_threads(max(1, int(job.get("threads", 1))))
+    orig = job["orig"]
+    res = _disentangle(orig, gate_size=job["k_eff"], depth=job["d"],
+                       target_chi=job["target_chi"], **job["dkw"])
+    rows = []
+    for chi in job["keep"]:
+        approx, c_params = _hw(res, chi)
+        rows.append({"chi": int(chi), "c_params": int(c_params),
+                     "err": float(_relerr(orig, approx))})
+    summ = {
+        "n_out": int(res.n_out_qubits), "n_in": int(res.n_in_qubits),
+        "quantum_params": int(res.quantum_params),
+        "retained_classical": float(res.retained_classical),
+        "retained": float(res.retained), "accuracy": float(res.accuracy),
+        "entropy": float(res.entropy), "sweeps_run": int(res.sweeps_run),
+        "seconds": float(res.seconds),
+        "padded_rows": int(res.padded_shape[0]), "padded_cols": int(res.padded_shape[1]),
+    }
+    return job["idx"], summ, rows
 
 
 def _select_profile_layers(model, config: HybridConfig):
@@ -470,7 +507,13 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
                      str(row.circuit_depth), str(row.gate_size))] = asdict(row)
         checkpoint()
 
-    cap = config.max_total_params                    # None -> no parameter budget
+    cap = config.max_total_params                    # None -> no budget; 0 -> per-layer dense
+
+    def _layer_cap(dense: int):
+        """Effective M* budget for a layer: fixed cap, or its own params_original (cap=0)."""
+        if cap is None:
+            return None
+        return dense if cap == 0 else cap
 
     def _skipped_row(*, name, layer_type, block, method, optimizer, chi, circuit_depth,
                      gate_size, rows, cols, padded_rows, padded_cols, n_out, n_in,
@@ -510,9 +553,10 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
         layer_type, block = parse_layer_info(name)
         # Parameter budget: skip (NaN row) before any SVD / eval if C(chi) alone
         # exceeds the cap. Q = 0 for the classical layer, so M* = C(chi).
-        if cap is not None:
+        lc = _layer_cap(plan.dense_params)
+        if lc is not None:
             c_only = mpo_param_count(plan.out_dims, plan.in_dims, chi)
-            if c_only > cap:
+            if c_only > lc:
                 done += 1
                 record(_skipped_row(
                     name=name, layer_type=layer_type, block=block, method="classical",
@@ -521,7 +565,7 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
                     padded_rows=int(orig.shape[0]), padded_cols=int(orig.shape[1]),
                     n_out=0, n_in=0, dense=plan.dense_params, c_params=c_only, q_params=0))
                 print(f"  [{done}/{total_points}] classical {layer_type} d{block} "
-                      f"chi={chi:<4} C={c_only:<8,} SKIP (M* > cap {cap:,})")
+                      f"chi={chi:<4} C={c_only:<8,} SKIP (M* > cap {lc:,})")
                 continue
         approx, params_mpo = plan_compress(orig, plan, chi)
         err = relative_error(orig, approx)
@@ -594,115 +638,209 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
               f"| accuracy {res.accuracy:.4f} | entropy {res.entropy:.4f} "
               f"| {res.sweeps_run} sweeps in {res.seconds:.1f}s")
 
-    for name, param, d, k_eff, k_row, missing in hybrid_jobs:
-        orig = originals[name]
-        layer_type, block = parse_layer_info(name)
-        # Full-rank bond of the padded operator: geometry only, so it is the same
-        # whatever the circuits or target_chi are -- clamp the chi' grid to it.
+    def _partition(orig, missing, d, k_eff):
+        """Clamp the chi' grid to full rank and split it by the M* budget.
+
+        Geometry only (no optimization): returns qubit counts, dense count, Q(D),
+        C(chi') per chi', and the kept / over-budget chi' lists at this layer's cap.
+        """
         _padded, _no, _ni = pad_to_qubits(orig)
         _geom = make_plan(_padded, config.tensorization, config.mpo_sites,
                           svd_cache=False, align=config.qubit_align)
         exact = full_rank_chi(_geom.out_dims, _geom.in_dims)
         chi_list = sorted({min(int(c), exact) for c in missing})
         dense = int(orig.shape[0]) * int(orig.shape[1])
-
-        # Parameter budget. Q(D) is fixed for this (D, k); C(chi') grows with chi'.
-        # Points over the cap are recorded as NaN rows with no compute; if *every*
-        # chi' is over budget the disentangling optimization itself is skipped --
-        # the whole point of the cap (a deep k=2 circuit can dwarf an all-to-all
-        # k=0 one for the same accuracy).
         q_params = quantum_param_count(_no, _ni, k_eff, d, config.quantum_param_counting)
         c_of = {c: mpo_param_count(_geom.out_dims, _geom.in_dims, c) for c in chi_list}
-        if cap is not None:
-            keep = [c for c in chi_list if c_of[c] + q_params <= cap]
-            skip = [c for c in chi_list if c_of[c] + q_params > cap]
+        lc = _layer_cap(dense)
+        if lc is not None:
+            keep = [c for c in chi_list if c_of[c] + q_params <= lc]
+            skip = [c for c in chi_list if c_of[c] + q_params > lc]
         else:
             keep, skip = chi_list, []
-        for chi in skip:
+        return {"no": _no, "ni": _ni, "dense": dense, "q_params": q_params,
+                "c_of": c_of, "keep": keep, "skip": skip, "lc": lc}
+
+    def _emit_computed(name, layer_type, block, k_row, d, dense, summ, rows):
+        """Record CSV rows for one disentangled (layer, D, k) from scalar results."""
+        nonlocal done
+        for r in rows:
+            done += 1
+            c_params, chi, err = r["c_params"], r["chi"], r["err"]
+            q_params = summ["quantum_params"]
+            record(HybridRow(
+                timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                model_id=config.model_id, param_name=name, layer_type=layer_type,
+                depth=block, method="hybrid", tensorization=config.tensorization,
+                optimizer=config.disentangle_optimizer, chi=chi, circuit_depth=d,
+                gate_size=k_row, rows=summ["rows_n"], cols=summ["cols_n"],
+                padded_rows=summ["padded_rows"], padded_cols=summ["padded_cols"],
+                n_out_qubits=summ["n_out"], n_in_qubits=summ["n_in"],
+                params_original=dense, classical_params=c_params,
+                quantum_params=q_params, total_params=c_params + q_params,
+                compression_ratio=round((c_params + q_params) / dense, 6),
+                relative_error=round(err, 6), perplexity=float("nan"),
+                ppl_baseline=round(baseline, 4), ppl_ratio=float("nan"),
+                disentangle_accuracy=round(summ["accuracy"], 6),
+                disentangle_entropy=round(summ["entropy"], 6),
+                disentangle_retained=round(summ["retained"], 6),
+                disentangle_sweeps=summ["sweeps_run"],
+                disentangle_seconds=round(summ["seconds"], 2),
+                eval_tokens=0, eval_seconds=0.0,
+                ppl_unit="word" if config.word_level else "token",
+                **_heal_cols("-", float("nan"), float("nan"), float("nan"), float("nan"), 0.0),
+            ))
+            elapsed = time.perf_counter() - start
+            print(f"  [{done}/{total_points}] hybrid    {layer_type} d{block} "
+                  f"k={k_row} D={d} chi'={chi:<4} C={c_params:<8,} Q={q_params:<8,} "
+                  f"rel.err={err:.4f}  elapsed={elapsed:.0f}s "
+                  f"eta={elapsed / done * (total_points - done):.0f}s")
+
+    # Partition every job: record the over-budget chi' as NaN rows now (no compute),
+    # and collect the jobs that still have work to disentangle.
+    prepared = []
+    for name, param, d, k_eff, k_row, missing in hybrid_jobs:
+        orig = originals[name]
+        layer_type, block = parse_layer_info(name)
+        part = _partition(orig, missing, d, k_eff)
+        for chi in part["skip"]:
             done += 1
             record(_skipped_row(
                 name=name, layer_type=layer_type, block=block, method="hybrid",
                 optimizer=config.disentangle_optimizer, chi=chi, circuit_depth=d,
                 gate_size=k_row, rows=int(orig.shape[0]), cols=int(orig.shape[1]),
-                padded_rows=1 << _no, padded_cols=1 << _ni, n_out=_no, n_in=_ni,
-                dense=dense, c_params=c_of[chi], q_params=q_params))
+                padded_rows=1 << part["no"], padded_cols=1 << part["ni"],
+                n_out=part["no"], n_in=part["ni"], dense=part["dense"],
+                c_params=part["c_of"][chi], q_params=part["q_params"]))
             print(f"  [{done}/{total_points}] hybrid    {layer_type} d{block} "
-                  f"k={k_row} D={d} chi'={chi:<4} C={c_of[chi]:<8,} Q={q_params:<8,} "
-                  f"M*={c_of[chi] + q_params:<9,} SKIP (M* > cap {cap:,})")
-        if not keep:
-            print(f"  skip disentangle {layer_type} d{block} D={d} k={k_eff}: every "
-                  f"chi' over cap (min M*={min(c_of.values()) + q_params:,} > {cap:,})")
+                  f"k={k_row} D={d} chi'={chi:<4} C={part['c_of'][chi]:<8,} "
+                  f"Q={part['q_params']:<8,} M*={part['c_of'][chi] + part['q_params']:<9,} "
+                  f"SKIP (M* > cap {part['lc']:,})")
+        if not part["keep"]:
+            if part["c_of"]:
+                print(f"  skip disentangle {layer_type} d{block} D={d} k={k_eff}: every "
+                      f"chi' over cap (min M*="
+                      f"{min(part['c_of'].values()) + part['q_params']:,} > {part['lc']:,})")
             continue
+        prepared.append({"name": name, "param": param, "orig": orig,
+                         "layer_type": layer_type, "block": block, "d": d,
+                         "k_eff": k_eff, "k_row": k_row, "part": part})
 
-        # Default: one optimization at ``disentangle_target_chi`` reused across the
-        # whole chi' grid (the residual SVD is truncated per chi', paper Table I).
-        # ``disentangle_target_per_chi``: a fresh optimization per (D, chi') that
-        # squeezes to ``target_chi = chi'`` -- best circuits for each bond, at N x
-        # the disentangling cost.
-        res_shared = None
-        if not per_chi:
-            print(f"  disentangling {layer_type} d{block} D={d} k={k_eff} "
-                  f"target_chi'={config.disentangle_target_chi} ...")
-            res_shared = _disentangle_op(orig, k_eff, d, config.disentangle_target_chi)
-            _print_res(res_shared)
-
-        for chi in keep:
-            if per_chi:
+    # Parallel path: independent (layer, D, k) disentanglings across processes. Only
+    # safe without a model in the loop (no perplexity), no healing and no per-chi'
+    # re-optimization -- exactly this run's configuration.
+    parallel = (config.n_jobs != 1) and (not measure_ppl) and (not heal_on) and (not per_chi)
+    if parallel and prepared:
+        workers = (os.cpu_count() or 1) if config.n_jobs <= 0 else config.n_jobs
+        workers = max(1, min(workers, len(prepared)))
+        threads = max(1, (os.cpu_count() or 1) // workers)
+        dkw = dict(
+            tensorization=config.tensorization, qubit_align=config.qubit_align,
+            n_sites=config.mpo_sites, sweeps=config.disentangle_sweeps,
+            tol=config.disentangle_tol, init=config.disentangle_init,
+            seed=config.disentangle_seed, param_counting=config.quantum_param_counting,
+            target_mode=config.disentangle_target_mode, optimizer=config.disentangle_optimizer,
+            gd_steps=config.disentangle_gd_steps, gd_lr=config.disentangle_gd_lr,
+            restarts=config.disentangle_restarts,
+            fast_gradient=config.disentangle_fast_gradient,
+            gradient_objective=config.disentangle_gradient_objective)
+        # Use a 'forkserver' (or 'spawn') start method, never the default 'fork':
+        # the main process holds live OpenMP/BLAS threads by now, and forking that
+        # state deadlocks the children (they inherit locks held by absent threads).
+        # forkserver's clean server process avoids the deadlock and does not re-run
+        # __main__, so it is safe from an unguarded caller too.
+        try:
+            ctx = mp.get_context("forkserver")
+        except ValueError:                           # platform without forkserver
+            ctx = mp.get_context("spawn")
+        print(f"\nDisentangling {len(prepared)} jobs across {workers} process(es), "
+              f"{threads} torch thread(s) each ({ctx.get_start_method()}) ...")
+        payloads = [{"idx": i, "orig": p["orig"], "k_eff": p["k_eff"], "d": p["d"],
+                     "keep": p["part"]["keep"], "target_chi": config.disentangle_target_chi,
+                     "threads": threads, "dkw": dkw} for i, p in enumerate(prepared)]
+        with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as ex:
+            futures = [ex.submit(_disentangle_job, pl) for pl in payloads]
+            for fut in as_completed(futures):
+                idx, summ, rows = fut.result()
+                p = prepared[idx]
+                summ["rows_n"] = int(p["orig"].shape[0])
+                summ["cols_n"] = int(p["orig"].shape[1])
+                print(f"  disentangled {p['layer_type']} d{p['block']} D={p['d']} "
+                      f"k={p['k_eff']}: {summ['n_out']}q x {summ['n_in']}q "
+                      f"Q(D)={summ['quantum_params']:,} | retained "
+                      f"{summ['retained_classical']:.4f} -> {summ['retained']:.4f} | "
+                      f"accuracy {summ['accuracy']:.4f} in {summ['seconds']:.1f}s")
+                _emit_computed(p["name"], p["layer_type"], p["block"], p["k_row"],
+                               p["d"], p["part"]["dense"], summ, rows)
+    else:
+        # Sequential path: handles perplexity, healing and per-chi' re-optimization.
+        for p in prepared:
+            name, param, orig = p["name"], p["param"], p["orig"]
+            layer_type, block, d = p["layer_type"], p["block"], p["d"]
+            k_eff, k_row, dense = p["k_eff"], p["k_row"], p["part"]["dense"]
+            res_shared = None
+            if not per_chi:
                 print(f"  disentangling {layer_type} d{block} D={d} k={k_eff} "
-                      f"target_chi'={chi} ...")
-                res = _disentangle_op(orig, k_eff, d, chi)
-                _print_res(res)
-            else:
-                res = res_shared
-            approx, c_params = hybrid_weight(res, chi)
-            err = relative_error(orig, approx)
-            ppl, secs = float("nan"), 0.0
-            if measure_ppl:
-                with torch.no_grad():
-                    param.copy_(approx.to(dtype=param.dtype, device=param.device))
-                ppl, eval_tokens, secs = evaluate()
-                with torch.no_grad():
-                    param.copy_(orig.to(dtype=param.dtype, device=param.device))
-            q_params = res.quantum_params            # == the budgeted Q(D)
-            hmode, ph, pr, frac, hloss, hsec = "-", float("nan"), float("nan"), float("nan"), float("nan"), 0.0
-            if heal_on and heal_batches:
-                ph, hloss, hsec = _heal_and_eval(name, param, orig, chi, config.heal_mode, res=res)
-                pr = ph / baseline if baseline else float("nan")
-                frac = _recovered(ppl, ph); hmode = config.heal_mode
-            done += 1
-            record(HybridRow(
-                timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                model_id=config.model_id, param_name=name, layer_type=layer_type,
-                depth=block, method="hybrid",
-                tensorization=config.tensorization,
-                optimizer=config.disentangle_optimizer, chi=chi, circuit_depth=d,
-                gate_size=k_row,
-                rows=int(orig.shape[0]), cols=int(orig.shape[1]),
-                padded_rows=res.padded_shape[0], padded_cols=res.padded_shape[1],
-                n_out_qubits=res.n_out_qubits, n_in_qubits=res.n_in_qubits,
-                params_original=dense, classical_params=c_params,
-                quantum_params=q_params, total_params=c_params + q_params,
-                compression_ratio=round((c_params + q_params) / dense, 6),
-                relative_error=round(err, 6), perplexity=round(ppl, 4),
-                ppl_baseline=round(baseline, 4),
-                ppl_ratio=round(ppl / baseline, 6) if baseline else float("nan"),
-                disentangle_accuracy=round(res.accuracy, 6),
-                disentangle_entropy=round(res.entropy, 6),
-                disentangle_retained=round(res.retained, 6),
-                disentangle_sweeps=res.sweeps_run,
-                disentangle_seconds=round(res.seconds, 2),
-                eval_tokens=eval_tokens, eval_seconds=round(secs, 2),
-                ppl_unit="word" if config.word_level else "token",
-                **_heal_cols(hmode, ph, pr, frac, hloss, hsec),
-            ))
-            elapsed = time.perf_counter() - start
-            print(f"  [{done}/{total_points}] hybrid    {layer_type} d{block} "
-                  f"k={k_row} D={d} chi'={chi:<4} C={c_params:<8,} Q={q_params:<8,} "
-                  f"rel.err={err:.4f} "
-                  + (f"ppl={ppl:.4f} (x{ppl / baseline:.4f})" if measure_ppl else "")
-                  + (f" heal x{pr:.4f}" if heal_on and pr == pr else "")
-                  + f"  elapsed={elapsed:.0f}s "
-                  f"eta={elapsed / done * (total_points - done):.0f}s")
+                      f"target_chi'={config.disentangle_target_chi} ...")
+                res_shared = _disentangle_op(orig, k_eff, d, config.disentangle_target_chi)
+                _print_res(res_shared)
+            for chi in p["part"]["keep"]:
+                if per_chi:
+                    print(f"  disentangling {layer_type} d{block} D={d} k={k_eff} "
+                          f"target_chi'={chi} ...")
+                    res = _disentangle_op(orig, k_eff, d, chi)
+                    _print_res(res)
+                else:
+                    res = res_shared
+                approx, c_params = hybrid_weight(res, chi)
+                err = relative_error(orig, approx)
+                ppl, secs = float("nan"), 0.0
+                if measure_ppl:
+                    with torch.no_grad():
+                        param.copy_(approx.to(dtype=param.dtype, device=param.device))
+                    ppl, eval_tokens, secs = evaluate()
+                    with torch.no_grad():
+                        param.copy_(orig.to(dtype=param.dtype, device=param.device))
+                q_params = res.quantum_params            # == the budgeted Q(D)
+                hmode, ph, pr, frac, hloss, hsec = "-", float("nan"), float("nan"), float("nan"), float("nan"), 0.0
+                if heal_on and heal_batches:
+                    ph, hloss, hsec = _heal_and_eval(name, param, orig, chi, config.heal_mode, res=res)
+                    pr = ph / baseline if baseline else float("nan")
+                    frac = _recovered(ppl, ph); hmode = config.heal_mode
+                done += 1
+                record(HybridRow(
+                    timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    model_id=config.model_id, param_name=name, layer_type=layer_type,
+                    depth=block, method="hybrid",
+                    tensorization=config.tensorization,
+                    optimizer=config.disentangle_optimizer, chi=chi, circuit_depth=d,
+                    gate_size=k_row,
+                    rows=int(orig.shape[0]), cols=int(orig.shape[1]),
+                    padded_rows=res.padded_shape[0], padded_cols=res.padded_shape[1],
+                    n_out_qubits=res.n_out_qubits, n_in_qubits=res.n_in_qubits,
+                    params_original=dense, classical_params=c_params,
+                    quantum_params=q_params, total_params=c_params + q_params,
+                    compression_ratio=round((c_params + q_params) / dense, 6),
+                    relative_error=round(err, 6), perplexity=round(ppl, 4),
+                    ppl_baseline=round(baseline, 4),
+                    ppl_ratio=round(ppl / baseline, 6) if baseline else float("nan"),
+                    disentangle_accuracy=round(res.accuracy, 6),
+                    disentangle_entropy=round(res.entropy, 6),
+                    disentangle_retained=round(res.retained, 6),
+                    disentangle_sweeps=res.sweeps_run,
+                    disentangle_seconds=round(res.seconds, 2),
+                    eval_tokens=eval_tokens, eval_seconds=round(secs, 2),
+                    ppl_unit="word" if config.word_level else "token",
+                    **_heal_cols(hmode, ph, pr, frac, hloss, hsec),
+                ))
+                elapsed = time.perf_counter() - start
+                print(f"  [{done}/{total_points}] hybrid    {layer_type} d{block} "
+                      f"k={k_row} D={d} chi'={chi:<4} C={c_params:<8,} Q={q_params:<8,} "
+                      f"rel.err={err:.4f} "
+                      + (f"ppl={ppl:.4f} (x{ppl / baseline:.4f})" if measure_ppl else "")
+                      + (f" heal x{pr:.4f}" if heal_on and pr == pr else "")
+                      + f"  elapsed={elapsed:.0f}s "
+                      f"eta={elapsed / done * (total_points - done):.0f}s")
 
     with torch.no_grad():
         for name, param in layers:
