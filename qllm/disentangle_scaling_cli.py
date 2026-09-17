@@ -215,6 +215,11 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="gradient/explicit+gradient: evaluate the loss with pure-torch "
                         "apply_circuit contractions instead of PennyLane qml.matrix "
                         "(same result, faster per step; no effect on explicit).")
+    p.add_argument("--gradient-objective", default="disentangle-loss",
+                   choices=["disentangle-loss", "relative-error"],
+                   help="gradient/explicit+gradient: minimize the per-bond discarded "
+                        "weight ('disentangle-loss', default) or the joint "
+                        "reconstruction error at target_chi ('relative-error').")
     p.add_argument("--disentangle-sweeps", type=int, default=40,
                    help="explicit: max environment sweeps per L.")
     p.add_argument("--disentangle-gd-steps", type=int, default=200)
@@ -697,7 +702,8 @@ def main(argv=None) -> int:
                 optimizer=args.optimizer, sweeps=args.disentangle_sweeps,
                 gd_steps=args.disentangle_gd_steps, gd_lr=args.disentangle_gd_lr,
                 restarts=args.restarts, seed=args.seed,
-                fast_gradient=args.fast_gradient)
+                fast_gradient=args.fast_gradient,
+                gradient_objective=args.gradient_objective)
             ppl = float("nan")
             heal_cols: dict = {}
             if measure_ppl:

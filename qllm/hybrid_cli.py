@@ -126,6 +126,14 @@ def parse_args(argv=None) -> argparse.Namespace:
                              "instead of composing it through PennyLane's qml.matrix. "
                              "Same result, several times faster per step; no effect on "
                              "the explicit optimizer.")
+    parser.add_argument("--gradient-objective", default="disentangle-loss",
+                        choices=["disentangle-loss", "relative-error"],
+                        help="What the gradient / explicit+gradient optimizer minimizes: "
+                             "'disentangle-loss' (default, the mean per-bond discarded "
+                             "weight) or 'relative-error' (the joint reconstruction error "
+                             "||W - W'||/||W|| at target_chi). Use 'relative-error' with "
+                             "--disentangle-target-per-chi to minimize the error at each "
+                             "served chi'. No effect on the explicit optimizer.")
     parser.add_argument("--disentangle-gd-lr", type=float, default=0.05,
                         help="gradient: Adam learning rate.")
     parser.add_argument("--disentangle-tol", type=float, default=1e-6)
@@ -315,6 +323,7 @@ def main(argv=None) -> int:
         disentangle_target_per_chi=args.disentangle_target_per_chi,
         disentangle_optimizer=args.disentangle_optimizer,
         disentangle_fast_gradient=args.fast_gradient,
+        disentangle_gradient_objective=args.gradient_objective,
         disentangle_gd_steps=args.disentangle_gd_steps,
         disentangle_gd_lr=args.disentangle_gd_lr,
         disentangle_sweeps=args.disentangle_sweeps,

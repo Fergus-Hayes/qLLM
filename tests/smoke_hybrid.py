@@ -866,4 +866,39 @@ assert rel(Wg, hybrid_weight(polish, full_rank_chi(polish.plan.out_dims,
 print(f"  fast==slow: retained {slow.retained:.5f} vs {fast.retained:.5f}, "
       f"W' reldiff {rel(a_slow, a_fast):.1e}; explicit+gradient --fast-gradient exact")
 
+# --------------------------------------------------------------------------- #
+# 16. --gradient-objective relative-error: polish lowers relative_error
+# --------------------------------------------------------------------------- #
+print("\n=== 16. --gradient-objective relative-error ===")
+torch.manual_seed(0)
+Wr = torch.randn(16, 16)   # 4q x 4q qubit MPO (multi-site), small & fast
+
+
+def _re_at(res, chi):
+    a, _ = hybrid_weight(res, chi)
+    return rel(Wr, a)
+
+
+_kw = dict(gate_size=2, depth=4, target_chi=1, tensorization="qubit", sweeps=20,
+           seed=0)
+ex = disentangle(Wr, optimizer="explicit", **_kw)
+# The relative-error objective, warm-started from the explicit gates, minimizes
+# the true reconstruction error at target_chi -- so it can only match or beat
+# explicit there (unlike disentangle-loss, which the user saw *worsen* it).
+reo = disentangle(Wr, optimizer="explicit+gradient", gd_steps=40, gd_lr=0.03,
+                  fast_gradient=True, gradient_objective="relative-error", **_kw)
+assert _re_at(reo, 1) <= _re_at(ex, 1) + 1e-4, \
+    f"relative-error objective must not worsen relative_error at target: " \
+    f"{_re_at(ex, 1)} -> {_re_at(reo, 1)}"
+# Minimizing the reconstruction error maximizes retained at the target bond.
+assert reo.retained >= ex.retained - 1e-4, \
+    f"relative-error objective should not lose retained: {ex.retained} -> {reo.retained}"
+# Circuits stay orthogonal -> exact full-rank reconstruction.
+assert rel(Wr, hybrid_weight(reo, full_rank_chi(reo.plan.out_dims,
+                                                reo.plan.in_dims))[0]) < 1e-4
+# The default objective is unchanged (disentangle-loss).
+assert "relative-error" in __import__("qllm.disentangler", fromlist=["x"]).GRADIENT_OBJECTIVES
+print(f"  relative-error obj: RE@target {_re_at(ex, 1):.5f} -> {_re_at(reo, 1):.5f}, "
+      f"retained {ex.retained:.4f} -> {reo.retained:.4f} (exact full-rank recon)")
+
 print("\nALL HYBRID SMOKE STAGES PASSED")

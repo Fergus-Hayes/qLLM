@@ -67,7 +67,12 @@ import numpy as np
 import pennylane as qml
 import torch
 
-from .compactifai import MPOPlan, _interleave_perm, mpo_param_count
+from .compactifai import (
+    MPOPlan,
+    _deinterleave_perm,
+    _interleave_perm,
+    mpo_param_count,
+)
 from .qubit_mpo import make_plan, plan_bond_entropy, plan_compress
 
 
@@ -438,13 +443,71 @@ def disentangle_loss(current: torch.Tensor, out_dims: list[int], in_dims: list[i
     return torch.stack(losses).mean()
 
 
+GRADIENT_OBJECTIVES = ("disentangle-loss", "relative-error")
+
+
+def _truncated_dense(current: torch.Tensor, out_dims: list[int], in_dims: list[int],
+                     n_sites: int, chi: int) -> torch.Tensor:
+    """Differentiable ``T_chi(current)``: the rank-``chi`` MPO truncation, contracted.
+
+    A grad-enabled copy of :func:`~qllm.compactifai.mpo_factors` followed by
+    :func:`~qllm.compactifai.contract_factors` (both ``@torch.no_grad``): the same
+    left-to-right sequential truncated SVD the evaluation path uses, so this
+    reproduces ``plan_compress(current, plan, chi)`` exactly while keeping the
+    autograd graph back to ``current`` (and thence the gate angles).
+    """
+    tensor = current.reshape(*out_dims, *in_dims).permute(*_interleave_perm(n_sites))
+    tensor = tensor.contiguous()
+    factors: list[torch.Tensor] = []
+    bond_left = 1
+    mat = tensor.reshape(out_dims[0] * in_dims[0], -1)
+    for k in range(n_sites - 1):
+        u, s, vh = torch.linalg.svd(mat, full_matrices=False)
+        r = max(1, min(chi, int(s.numel())))
+        factors.append(u[:, :r].reshape(bond_left, out_dims[k], in_dims[k], r))
+        mat = s[:r].unsqueeze(1) * vh[:r]
+        bond_left = r
+        if k + 1 < n_sites - 1:
+            mat = mat.reshape(bond_left * out_dims[k + 1] * in_dims[k + 1], -1)
+    factors.append(mat.reshape(bond_left, out_dims[-1], in_dims[-1], 1))
+    dense = factors[0]
+    for k in range(1, n_sites):
+        dense = torch.tensordot(dense, factors[k], dims=([dense.ndim - 1], [0]))
+    dense = dense.squeeze(0).squeeze(-1).permute(*_deinterleave_perm(n_sites)).contiguous()
+    return dense.reshape(math.prod(out_dims), math.prod(in_dims))
+
+
+def relative_error_loss(current: torch.Tensor, out_dims: list[int], in_dims: list[int],
+                        n_sites: int, chi: int) -> torch.Tensor:
+    """Differentiable reconstruction error ``||current - T_chi(current)|| / ||current||``.
+
+    Because ``U``/``V`` are orthogonal, ``||W_pad - U T_chi(U^T W_pad V) V^T||``
+    equals ``||current - T_chi(current)||`` with ``current = U^T W_pad V``; dividing
+    by ``||current|| = ||W_pad||`` gives the padded relative error, a tight upper
+    bound on the reported (cropped) one. Minimizing it directly targets the
+    compressed layer's error at bond ``chi`` -- unlike :func:`disentangle_loss`,
+    which minimizes the *mean per-bond* discarded weight, a proxy that can move the
+    joint reconstruction error the wrong way on a multi-site MPO.
+    """
+    recon = _truncated_dense(current, out_dims, in_dims, n_sites, chi)
+    denom = torch.linalg.norm(current).clamp_min(1e-30)
+    return torch.linalg.norm(current - recon) / denom
+
+
 def _train_gradient(padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
                     steps, lr, init, seed, log, base_u=None, base_v=None,
-                    fast=False):
-    """Optimize the gate angles by Adam to minimize :func:`disentangle_loss`.
+                    fast=False, objective="disentangle-loss"):
+    """Optimize the gate angles by Adam to minimize the chosen ``objective``.
 
     Returns ``(u_gates, v_gates, steps_run, history)`` with the trained gates as
     :class:`Gate` objects (PennyLane ``QubitUnitary`` under the hood).
+
+    ``objective`` picks the loss: ``disentangle-loss`` (default) minimizes the
+    mean per-bond rank-``target_chi`` discarded weight (:func:`disentangle_loss`);
+    ``relative-error`` minimizes the joint reconstruction error at bond
+    ``target_chi`` (:func:`relative_error_loss`), i.e. the quantity the compressed
+    layer actually incurs, evaluated at ``target_chi`` (pair with
+    ``disentangle_target_per_chi`` to target each served chi').
 
     ``base_u`` / ``base_v`` warm-start the optimization from an existing circuit
     (e.g. the explicit sweep's result): each trainable gate becomes
@@ -502,7 +565,10 @@ def _train_gradient(padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
             u = circuit_unitary(ug, n_out)
             v = circuit_unitary(vg, n_in)
             current = u.transpose(0, 1) @ padded @ v
-        loss = disentangle_loss(current, out_dims, in_dims, n_sites, target_chi)
+        if objective == "relative-error":
+            loss = relative_error_loss(current, out_dims, in_dims, n_sites, target_chi)
+        else:
+            loss = disentangle_loss(current, out_dims, in_dims, n_sites, target_chi)
         loss.backward()
         opt.step()
         history.append(1.0 - float(loss.detach()))
@@ -552,6 +618,7 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
                       qubit_align: str = "msb", optimizer: str = "explicit",
                       gd_steps: int = 200, gd_lr: float = 0.05,
                       fast_gradient: bool = False,
+                      gradient_objective: str = "disentangle-loss",
                       log: bool = False) -> DisentangleResult:
     """Disentangle ``W`` into ``U MPO_new V^T`` with brickwall circuits of depth ``D``.
 
@@ -607,7 +674,8 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
     if optimizer == "gradient":
         u_gates, v_gates, steps_run, history = _train_gradient(
             padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
-            gd_steps, gd_lr, init, seed, log, fast=fast_gradient)
+            gd_steps, gd_lr, init, seed, log, fast=fast_gradient,
+            objective=gradient_objective)
         return _build_result(
             weight, padded, u_gates, v_gates, n_out, n_in, gate_size, depth,
             target_chi, _plan, param_counting, retained_classical, target_ref,
@@ -662,7 +730,7 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
         u_gates, v_gates, gd_run, gd_hist = _train_gradient(
             padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
             gd_steps, gd_lr, init, seed, log, base_u=u_gates, base_v=v_gates,
-            fast=fast_gradient)
+            fast=fast_gradient, objective=gradient_objective)
         history = history + gd_hist
         label = "explicit+gradient"
 
@@ -701,6 +769,7 @@ def disentangle(weight: torch.Tensor, gate_size: int, depth: int,
                 tensorization: str = "balanced", qubit_align: str = "msb",
                 optimizer: str = "explicit", gd_steps: int = 200, gd_lr: float = 0.05,
                 restarts: int = 1, fast_gradient: bool = False,
+                gradient_objective: str = "disentangle-loss",
                 log: bool = False) -> DisentangleResult:
     """Disentangle ``W``, keeping the best of ``restarts`` initializations.
 
@@ -713,12 +782,16 @@ def disentangle(weight: torch.Tensor, gate_size: int, depth: int,
     ``fast_gradient`` evaluates the gradient scheme's loss with the pure-torch
     ``apply_circuit`` contractions instead of PennyLane's ``qml.matrix`` (same
     result, faster per step); it has no effect on the ``explicit`` optimizer.
+    ``gradient_objective`` picks what the gradient scheme minimizes:
+    ``disentangle-loss`` (default, mean per-bond discarded weight) or
+    ``relative-error`` (the joint reconstruction error at ``target_chi``); it also
+    has no effect on ``explicit``.
     """
     def _run(this_init, this_seed):
         return _disentangle_once(
             weight, gate_size, depth, target_chi, n_sites, sweeps, tol, this_init,
             this_seed, param_counting, target_mode, tensorization, qubit_align,
-            optimizer, gd_steps, gd_lr, fast_gradient, log)
+            optimizer, gd_steps, gd_lr, fast_gradient, gradient_objective, log)
 
     best = _run(init, seed)
     for extra in range(1, max(1, restarts)):
