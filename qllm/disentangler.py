@@ -548,6 +548,16 @@ def _train_gradient(padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
 
     out_dims, in_dims, n_sites = plan_pad.out_dims, plan_pad.in_dims, plan_pad.n_sites
     opt = torch.optim.Adam(params, lr=lr)
+    # Keep the best (lowest-loss) *finite* iterate and restore it at the end. The
+    # differentiable SVD in the relative-error objective is ill-conditioned near
+    # degenerate singular values and can hand Adam a non-finite gradient, which
+    # then poisons the angles (and the next forward SVD). Snapshotting the best
+    # iterate and stopping on the first non-finite step makes the optimizer
+    # monotone-safe: it can only improve on the start (the explicit gates, for
+    # explicit+gradient), never diverge into NaNs.
+    best_loss = math.inf
+    best_u = [t.detach().clone() for t in theta_u]
+    best_v = [t.detach().clone() for t in theta_v]
     for step in range(max(1, steps)):
         opt.zero_grad()
         # Build the disentangled operator U^T W V from the current angles. The
@@ -565,17 +575,36 @@ def _train_gradient(padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
             u = circuit_unitary(ug, n_out)
             v = circuit_unitary(vg, n_in)
             current = u.transpose(0, 1) @ padded @ v
-        if objective == "relative-error":
-            loss = relative_error_loss(current, out_dims, in_dims, n_sites, target_chi)
-        else:
-            loss = disentangle_loss(current, out_dims, in_dims, n_sites, target_chi)
-        loss.backward()
+        if not torch.isfinite(current).all():
+            break                                    # angles diverged; keep best
+        try:
+            if objective == "relative-error":
+                loss = relative_error_loss(current, out_dims, in_dims, n_sites, target_chi)
+            else:
+                loss = disentangle_loss(current, out_dims, in_dims, n_sites, target_chi)
+            lval = float(loss.detach())
+            if not math.isfinite(lval):
+                break
+            if lval < best_loss:                     # snapshot the best-so-far
+                best_loss = lval
+                best_u = [t.detach().clone() for t in theta_u]
+                best_v = [t.detach().clone() for t in theta_v]
+            loss.backward()
+        except RuntimeError:                         # SVD non-convergence -> keep best
+            break
+        if not all(p.grad is not None and torch.isfinite(p.grad).all() for p in params):
+            break                                    # non-finite gradient; keep best
+        torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
         opt.step()
-        history.append(1.0 - float(loss.detach()))
+        history.append(1.0 - lval)
         if log and (step == 0 or (step + 1) % max(1, steps // 5) == 0):
-            print(f"      gd step {step + 1:>4}/{steps}  loss={float(loss):.6f}")
+            print(f"      gd step {step + 1:>4}/{steps}  loss={lval:.6f}")
 
-    with torch.no_grad():
+    with torch.no_grad():                            # restore the best iterate
+        for t, b in zip(theta_u, best_u):
+            t.copy_(b)
+        for t, b in zip(theta_v, best_v):
+            t.copy_(b)
         u_gates = [Gate(g.start, g.k, g.matrix.detach())
                    for g in _gates_from_angles(theta_u, pos_u, bases_u)]
         v_gates = [Gate(g.start, g.k, g.matrix.detach())
