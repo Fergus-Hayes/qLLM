@@ -39,11 +39,12 @@ class BenchmarkConfig:
     the same config shape works across arbitrary models.
     """
 
-    model_id: str
+    model_id: str                 # Hub id, OR a local directory saved by save_pretrained
     device: str = "auto"          # auto | cpu | cuda | mps
     dtype: str = "float32"        # auto | float32 | float16 | bfloat16
     trust_remote_code: bool = False
     revision: str | None = None
+    local_files_only: bool = False  # load only from disk/cache; never reach the Hub
 
     # Perplexity.
     dataset: str = "Salesforce/wikitext"
@@ -136,7 +137,9 @@ def resolve_dtype(name: str):
 # --------------------------------------------------------------------------- #
 def load_model_and_tokenizer(config: BenchmarkConfig, device: str):
     """Fetch a model and tokenizer from the Hub (or a local path)."""
-    print(f"Fetching '{config.model_id}' from the Hugging Face Hub ...")
+    source = ("local files only" if config.local_files_only
+              else "the Hugging Face Hub (or local cache)")
+    print(f"Loading '{config.model_id}' from {source} ...")
     if device == "cpu" and config.dtype == "float16":
         print("    WARNING: float16 on CPU is slow and unsupported for some ops; "
               "prefer --dtype float32 (or bfloat16) on CPU.")
@@ -146,6 +149,7 @@ def load_model_and_tokenizer(config: BenchmarkConfig, device: str):
         config.model_id,
         trust_remote_code=config.trust_remote_code,
         revision=config.revision,
+        local_files_only=config.local_files_only,
     )
     # Many base-model tokenizers have no pad token; generation needs one.
     if tokenizer.pad_token_id is None:
@@ -156,6 +160,7 @@ def load_model_and_tokenizer(config: BenchmarkConfig, device: str):
         torch_dtype=dtype,
         trust_remote_code=config.trust_remote_code,
         revision=config.revision,
+        local_files_only=config.local_files_only,
     )
     model.to(device)
     model.eval()

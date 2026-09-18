@@ -60,7 +60,18 @@ def parse_args(argv=None) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("model", nargs="?", default=DEFAULT_MODEL)
+    parser.add_argument("model", nargs="?", default=DEFAULT_MODEL,
+                        help="Hub id (e.g. HuggingFaceTB/SmolLM2-135M) OR a local "
+                             "directory saved by save_pretrained (e.g. "
+                             "models/SmolLM2-135M). A local path loads offline and "
+                             "names its results by the directory's basename.")
+    parser.add_argument("--local-files-only", "--offline", action="store_true",
+                        dest="local_files_only",
+                        help="Never contact the Hugging Face Hub: load the model, "
+                             "tokenizer and config only from the given local path or "
+                             "the local cache. Use with a directory saved by "
+                             "save_pretrained (equivalent to HF_HUB_OFFLINE=1 for the "
+                             "model load).")
     parser.add_argument("--device", default="auto",
                         choices=["auto", "cpu", "cuda", "mps"])
     parser.add_argument("--dtype", default="float32",
@@ -314,6 +325,7 @@ def main(argv=None) -> int:
     config = HybridConfig(
         model_id=args.model, device=args.device, dtype=args.dtype,
         trust_remote_code=args.trust_remote_code, revision=args.revision,
+        local_files_only=args.local_files_only,
         tensorization=args.tensorization, qubit_align=args.qubit_align,
         mpo_sites=args.mpo_sites, chi_min=args.chi_min, chi_max=args.chi_max,
         num_chi=args.num_chi, chi_values=args.chi,
@@ -359,7 +371,8 @@ def main(argv=None) -> int:
             BenchmarkConfig(model_id=config.model_id, device=config.device,
                             dtype=config.dtype,
                             trust_remote_code=config.trust_remote_code,
-                            revision=config.revision), device)
+                            revision=config.revision,
+                            local_files_only=config.local_files_only), device)
         return _run_plan(args, shapes_from_model(model, config))
 
     path = run_hybrid_sweep(config)

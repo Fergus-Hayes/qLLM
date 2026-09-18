@@ -547,6 +547,28 @@ python hybridize.py MODEL_ID --profile-depths 10 --layer-types v_proj \
     --solve --budgets 1.003 --q-weights 0 1
 ```
 
+**Local / offline models.** The `MODEL_ID` argument is a Hub id *or* a local
+directory saved with `save_pretrained` (weights, `config.json`, tokenizer). Point
+it at the directory and add `--local-files-only` (alias `--offline`) to load
+entirely from disk with no Hub contact -- useful for air-gapped runs or to avoid
+re-downloading. Results are named by the directory's basename, so
+`models/SmolLM2-135M` writes to `results/llms/SmolLM2-135M/...` exactly as the Hub
+id would:
+
+```bash
+# Save once (weights + config + tokenizer) ...
+python -c "from transformers import AutoModelForCausalLM, AutoTokenizer; \
+    AutoModelForCausalLM.from_pretrained('HuggingFaceTB/SmolLM2-135M').save_pretrained('models/SmolLM2-135M'); \
+    AutoTokenizer.from_pretrained('HuggingFaceTB/SmolLM2-135M').save_pretrained('models/SmolLM2-135M')"
+
+# ... then run offline against the local copy.
+python hybridize.py models/SmolLM2-135M --local-files-only \
+    --tensorization qubit --gate-sizes 2 --circuit-depths 0 1 2 4 8 --no-perplexity
+```
+
+(`--local-files-only` covers the model load; a perplexity run also needs its
+dataset available offline -- pre-cache it or set `HF_DATASETS_OFFLINE=1`.)
+
 ### Prune the grid first (no model, no tokens)
 
 Whether the hybrid *can* win is settled by arithmetic before any token is

@@ -66,11 +66,12 @@ MLP_OUTPUT_RE = r"(mlp|feed_forward|ffn)\.(down_proj|c_proj|w2|fc2|down)\b"
 
 @dataclass
 class CompactifaiConfig:
-    model_id: str
+    model_id: str                       # Hub id, OR a local dir saved by save_pretrained
     device: str = "auto"
     dtype: str = "float32"
     trust_remote_code: bool = False
     revision: str | None = None
+    local_files_only: bool = False      # load only from disk/cache; never reach the Hub
 
     # Compression.
     tensorization: str = "balanced"     # "balanced" (2-site) or "qubit" (paper geometry)

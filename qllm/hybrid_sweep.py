@@ -294,6 +294,7 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
     load_cfg = BenchmarkConfig(
         model_id=config.model_id, device=config.device, dtype=config.dtype,
         trust_remote_code=config.trust_remote_code, revision=config.revision,
+        local_files_only=config.local_files_only,
         dataset=config.dataset, dataset_config=config.dataset_config,
         split=config.split, text_column=config.text_column,
     )
@@ -429,6 +430,7 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
         heal_cfg = BenchmarkConfig(
             model_id=config.model_id, device=config.device, dtype=config.dtype,
             trust_remote_code=config.trust_remote_code, revision=config.revision,
+            local_files_only=config.local_files_only,
             dataset=config.heal_dataset or config.dataset,
             dataset_config=config.dataset_config, split=config.heal_split,
             text_column=config.text_column)
