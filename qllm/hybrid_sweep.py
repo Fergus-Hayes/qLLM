@@ -253,6 +253,23 @@ def _disentangle_job(job: dict) -> tuple[int, dict, list[dict]]:
     return job["idx"], summ, rows
 
 
+def _pool_ping(_=None) -> str:
+    """Trivial worker task run once before the real jobs are submitted.
+
+    Exercises the same import chain a real job needs, so that if the workers
+    cannot start (wrong start method, ``qllm`` not importable in the child, an
+    incompatible runtime), the preflight surfaces the real exception instead of
+    the sweep discovering a dead pool one job at a time.
+    """
+    # Test hook: simulate a pool that cannot start (every worker dies at bootstrap),
+    # to exercise the preflight -> sequential fallback. Never set in normal use.
+    if os.environ.get("QLLM_TEST_KILL_PING"):
+        os._exit(1)
+    import torch as _torch  # noqa: F401
+    from .disentangler import disentangle as _d  # noqa: F401
+    return "ok"
+
+
 def _select_profile_layers(model, config: HybridConfig):
     """The same block/type subsetting the CompactifAI per-layer profile uses."""
     layers = select_layers(model, config)
@@ -776,58 +793,83 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
             restarts=config.disentangle_restarts,
             fast_gradient=config.disentangle_fast_gradient,
             gradient_objective=config.disentangle_gradient_objective)
-        # Use 'spawn' (fully isolated fresh interpreters), never the default 'fork':
-        # by now the main process holds live OpenMP/BLAS threads, and forking that
-        # state deadlocks or crashes the children. 'spawn' inherits none of it and
-        # does not re-run an unguarded __main__ the way a bare fork of this module
-        # would; the CLI entry (hybridize.py) is __main__-guarded.
+        # Start method, never the default 'fork': by now the main process holds live
+        # OpenMP/BLAS threads (model load, MPO extraction), and forking that state
+        # deadlocks the children. 'forkserver' imports the entry module ONCE in a
+        # clean server process (before those threads exist) and forks workers from it
+        # -- faster and more reliable startup than 'spawn' re-importing in every
+        # worker -- and, like spawn, does not re-run our __main__-guarded CLI entry.
+        # 'spawn' is the fallback where forkserver is unavailable. Both need the child
+        # to import 'qllm', which holds when run from the repo root (its dir is on
+        # sys.path); the preflight below verifies that before committing 120 jobs.
+        method = "forkserver"
         try:
-            ctx = mp.get_context("spawn")
+            ctx = mp.get_context(method)
         except ValueError:                           # pragma: no cover
-            ctx = mp.get_context("forkserver")
+            method, ctx = "spawn", mp.get_context("spawn")
         # Recycle each worker after a few tasks so peak memory can't accumulate
         # across the big high-D layers (a dead worker OOMs the whole pool otherwise).
         pool_kwargs = {"max_workers": workers, "mp_context": ctx}
         if "max_tasks_per_child" in inspect.signature(ProcessPoolExecutor).parameters:
             pool_kwargs["max_tasks_per_child"] = 8   # Python >= 3.11: bound memory growth
-        print(f"\nDisentangling {len(prepared)} jobs across {workers} process(es), "
-              f"{threads} torch thread(s) each (spawn) ...")
         payloads = [{"idx": i, "orig": p["orig"], "k_eff": p["k_eff"], "d": p["d"],
                      "keep": p["part"]["keep"], "target_chi": config.disentangle_target_chi,
                      "threads": threads, "dkw": dkw} for i, p in enumerate(prepared)]
         pending = set(range(len(prepared)))          # jobs not yet emitted
+
+        # Preflight: prove the pool can actually run a job before submitting all of
+        # them. If the workers can't start at all (a common failure: the child can't
+        # import 'qllm', or an incompatible runtime), catch it once here, show the
+        # real cause, and drop straight to the sequential path -- rather than emitting
+        # one warning per job and silently grinding through them one at a time.
         ex = ProcessPoolExecutor(**pool_kwargs)
+        pool_ok = True
         try:
-            futures = {ex.submit(_disentangle_job, pl): pl["idx"] for pl in payloads}
-            for fut in as_completed(futures):
-                idx = futures[fut]
-                try:
-                    _, summ, rows = fut.result()
-                except Exception as exc:             # noqa: BLE001  (worker crash)
-                    print(f"  [warn] worker failed on job {idx} "
-                          f"({type(exc).__name__}); will finish it sequentially.")
-                    continue
-                pending.discard(idx)
-                p = prepared[idx]
-                summ["rows_n"] = int(p["orig"].shape[0])
-                summ["cols_n"] = int(p["orig"].shape[1])
-                print(f"  disentangled {p['layer_type']} d{p['block']} D={p['d']} "
-                      f"k={p['k_eff']}: {summ['n_out']}q x {summ['n_in']}q "
-                      f"Q(D)={summ['quantum_params']:,} | retained "
-                      f"{summ['retained_classical']:.4f} -> {summ['retained']:.4f} | "
-                      f"accuracy {summ['accuracy']:.4f} in {summ['seconds']:.1f}s")
-                _emit_computed(p["name"], p["layer_type"], p["block"], p["k_row"],
-                               p["d"], p["part"]["dense"], summ, rows)
-        except BrokenProcessPool:
-            print("  [warn] the process pool died (a worker was killed -- most often "
-                  "out of memory). Finishing the remaining jobs sequentially; re-run "
-                  "with a smaller --jobs to parallelize within the memory budget.")
-        finally:
+            ex.submit(_pool_ping).result(timeout=180)
+            print(f"\nDisentangling {len(prepared)} jobs across {workers} process(es), "
+                  f"{threads} torch thread(s) each ({method}) ...")
+        except Exception as exc:                     # noqa: BLE001  (pool won't start)
+            pool_ok = False
             ex.shutdown(wait=False, cancel_futures=True)
-        # Sequential fallback for anything the pool did not deliver -- guarantees the
-        # sweep completes (single-process memory is what the earlier runs used).
+            print(f"\n  [warn] parallel workers could not start ({type(exc).__name__}: "
+                  f"{str(exc)[:160]}); any worker traceback is printed above. Running "
+                  f"the {len(prepared)} disentangling(s) sequentially in this process.")
+
+        if pool_ok:
+            try:
+                futures = {ex.submit(_disentangle_job, pl): pl["idx"] for pl in payloads}
+                for fut in as_completed(futures):
+                    idx = futures[fut]
+                    try:
+                        _, summ, rows = fut.result()
+                    except Exception as exc:         # noqa: BLE001  (worker crash)
+                        print(f"  [warn] worker failed on job {idx} "
+                              f"({type(exc).__name__}); will finish it sequentially.")
+                        continue
+                    pending.discard(idx)
+                    p = prepared[idx]
+                    summ["rows_n"] = int(p["orig"].shape[0])
+                    summ["cols_n"] = int(p["orig"].shape[1])
+                    print(f"  disentangled {p['layer_type']} d{p['block']} D={p['d']} "
+                          f"k={p['k_eff']}: {summ['n_out']}q x {summ['n_in']}q "
+                          f"Q(D)={summ['quantum_params']:,} | retained "
+                          f"{summ['retained_classical']:.4f} -> {summ['retained']:.4f} | "
+                          f"accuracy {summ['accuracy']:.4f} in {summ['seconds']:.1f}s")
+                    _emit_computed(p["name"], p["layer_type"], p["block"], p["k_row"],
+                                   p["d"], p["part"]["dense"], summ, rows)
+            except BrokenProcessPool:
+                print("  [warn] the process pool died (a worker was killed -- most often "
+                      "out of memory). Finishing the remaining jobs sequentially; re-run "
+                      "with a smaller --jobs to parallelize within the memory budget.")
+            finally:
+                ex.shutdown(wait=False, cancel_futures=True)
+
+        # Sequential fallback for anything the pool did not deliver (never started, or
+        # workers died mid-run) -- guarantees the sweep completes on single-process
+        # memory, exactly as the non-parallel runs do.
         if pending:
-            print(f"  Finishing {len(pending)} job(s) sequentially ...")
+            if pool_ok:
+                print(f"  Finishing {len(pending)} job(s) sequentially ...")
             for idx in sorted(pending):
                 _run_job_sequential(prepared[idx])
     else:

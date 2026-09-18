@@ -708,9 +708,15 @@ processes with `--jobs N` (`--jobs 0` uses all cores). Torch threads are split
 across the workers so they don't oversubscribe the CPU. This applies only when
 there is no model in the loop -- i.e. with `--no-perplexity`, no healing and no
 `--disentangle-target-per-chi` (otherwise the run stays sequential and `--jobs`
-is ignored). Workers are launched with the `spawn` start method (fully isolated
-fresh interpreters) -- never `fork`, which would deadlock or crash after torch
-has spun up its thread pool.
+is ignored). Workers are launched with the `forkserver` start method -- never
+`fork`, which would deadlock after torch has spun up its OpenMP thread pool.
+`forkserver` imports the entry module once in a clean server process (before
+those threads exist) and forks workers from it; `spawn` is the fallback where
+`forkserver` is unavailable. Both require the child to be able to import `qllm`,
+which holds when you run `python hybridize.py` from the repository root (its
+directory is on `sys.path`). A **preflight** ping job runs before the real work:
+if the pool can't start at all, it's caught once, the real cause is printed, and
+the whole sweep runs in a single process -- rather than one warning per job.
 
 Because each worker uses a different torch thread count, a parallel run's
 `relative_error` values can differ from a sequential run's at the ~1e-2 level
@@ -721,11 +727,11 @@ guaranteed.
 
 **Memory:** each worker holds a full padded layer operator, so `--jobs 0` on a
 grid with the large `q_proj`/`o_proj` layers at high `D` can exhaust RAM and a
-worker gets OOM-killed. That no longer aborts the run: a dead worker (or a broken
-pool) is caught and its jobs are finished **sequentially**, so the sweep always
-completes and everything is checkpointed. If you hit the warning, re-run with a
-smaller `--jobs` (e.g. `--jobs 6`) to parallelize within your memory budget --
-the checkpoint skips everything already done.
+worker gets OOM-killed. That no longer aborts the run: a dead worker mid-run (or
+a pool that never starts) is caught and its jobs are finished **sequentially**,
+so the sweep always completes and everything is checkpointed. If you hit either
+warning, re-run with a smaller `--jobs` (e.g. `--jobs 6`) to parallelize within
+your memory budget -- the checkpoint skips everything already done.
 
 ### Measure both surfaces
 

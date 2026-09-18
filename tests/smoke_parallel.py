@@ -6,7 +6,9 @@ deadlocks after torch spins up OpenMP threads), and forkserver re-imports the
 entry module -- so this must live behind ``if __name__ == "__main__"`` rather than
 in the flat ``smoke_hybrid.py`` script.
 
-Verifies that ``--jobs 2`` produces the same grid of points as ``--jobs 1``
+A preflight ping job runs first; if the pool can't start the sweep drops to a
+single-process fallback, and if a worker dies mid-run the remaining jobs finish
+sequentially. Verifies that ``--jobs 2`` produces the same grid as ``--jobs 1``
 (bit-identical relative errors are not expected: worker threads differ, so the
 non-convex SVD lands FP-different optima) and that ``--max-total-params 0`` caps
 each layer at its own ``params_original``.
@@ -87,6 +89,20 @@ def main():
     assert len(fb_kept) == len(kept), \
         f"fallback did not finish every disentangle: {len(fb_kept)} vs {len(kept)}"
     print(f"  worker-death fallback: all {len(fb)} rows completed ({len(fb_kept)} disentangled)")
+
+    # Preflight failure: the pool can't start at all (every worker dies at bootstrap,
+    # exactly the user's Python 3.12 spawn case). The preflight ping must catch it
+    # once and complete every point sequentially -- no per-job warning storm.
+    os.environ["QLLM_TEST_KILL_PING"] = "1"
+    try:
+        pf = _run(2, "-preflight")
+    finally:
+        del os.environ["QLLM_TEST_KILL_PING"]
+    assert {key(r) for r in pf} == {key(r) for r in seq}, "preflight fallback lost/added grid points"
+    pf_kept = [r for r in pf if r["method"] == "hybrid" and r["relative_error"] not in ("", "nan")]
+    assert len(pf_kept) == len(kept), \
+        f"preflight fallback did not finish every disentangle: {len(pf_kept)} vs {len(kept)}"
+    print(f"  dead-pool preflight fallback: all {len(pf)} rows completed ({len(pf_kept)} disentangled)")
     print("\nPARALLEL SMOKE PASSED")
 
 
