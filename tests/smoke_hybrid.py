@@ -960,4 +960,43 @@ for r in _cl_skip:
 print(f"  cap=0: kept {len(_kept)} hybrid (<= params_original), skipped {len(_skip)} "
       f"(> params_original), {len(_cl_skip)} classical skipped")
 
+print("\n=== 18. Load layers from files (--layers-dir) ===")
+# _layers_from_dir sources weights from extract_layers.py files and applies the same
+# depth/type filters as _select_profile_layers -- no full model needed.
+import tempfile as _tf
+from safetensors.torch import save_file as _save_file
+_ld = _tf.mkdtemp()
+_specs = {  # full param name -> (rows, cols); two types across two depths
+    "model.layers.0.self_attn.q_proj.weight": (16, 16),
+    "model.layers.0.self_attn.v_proj.weight": (8, 16),
+    "model.layers.1.self_attn.q_proj.weight": (16, 16),
+    "model.layers.2.self_attn.q_proj.weight": (16, 16),
+}
+import csv as _csv
+_man = []
+for _nm, (_r, _c) in _specs.items():
+    _lt, _dep = H.parse_layer_info(_nm)
+    _f = f"block{_dep:03d}.{_lt}.safetensors"
+    _save_file({_nm: torch.randn(_r, _c)}, os.path.join(_ld, _f))
+    _man.append({"file": _f, "param_name": _nm, "layer_type": _lt, "depth": _dep})
+with open(os.path.join(_ld, "manifest.csv"), "w", newline="") as _fh:
+    _w = _csv.DictWriter(_fh, fieldnames=list(_man[0].keys())); _w.writeheader(); _w.writerows(_man)
+
+_cfg_ld = H.HybridConfig(model_id="unused", tensorization="qubit",
+                         profile_depths=[0, 2], layer_types=["q_proj"], layers_dir=_ld)
+_layers, _keep, _avail = H._layers_from_dir(_ld, _cfg_ld)
+assert _avail == [0, 1, 2], _avail                         # every depth present in the dir
+assert _keep == [0, 2], _keep                              # narrowed by profile_depths
+_got = sorted(n for n, _ in _layers)
+assert _got == ["model.layers.0.self_attn.q_proj.weight",
+                "model.layers.2.self_attn.q_proj.weight"], _got   # type+depth filtered
+assert all(t.ndim == 2 for _, t in _layers)
+# Glob fallback: same result with no manifest.csv present.
+os.remove(os.path.join(_ld, "manifest.csv"))
+_layers2, _, _ = H._layers_from_dir(_ld, _cfg_ld)
+assert sorted(n for n, _ in _layers2) == _got, "glob fallback disagreed with manifest"
+shutil.rmtree(_ld, ignore_errors=True)
+print(f"  --layers-dir: {len(_got)} layer(s) selected from files (q_proj @ depths 0,2); "
+      f"manifest and glob paths agree")
+
 print("\nALL HYBRID SMOKE STAGES PASSED")

@@ -569,6 +569,26 @@ python hybridize.py models/SmolLM2-135M --local-files-only \
 (`--local-files-only` covers the model load; a perplexity run also needs its
 dataset available offline -- pre-cache it or set `HF_DATASETS_OFFLINE=1`.)
 
+**Sweep straight from extracted layers.** If you only need a handful of layers,
+extract them once with `extract_layers.py` and point the sweep at that directory
+with `--layers-dir`. In a `--no-perplexity` run the full model is never loaded --
+the weights come from the per-layer files -- which saves the model's memory and
+startup time. The usual `--layer-types` / `--profile-depths` filters still narrow
+the set, and a `manifest.csv` (or, failing that, the tensor key in each
+`.safetensors` / `.pt`) supplies each layer's name. Because perplexity and healing
+need forward passes through the whole network, `--layers-dir` is ignored (with a
+note) whenever either is on.
+
+```bash
+python extract_layers.py models/SmolLM2-135M --local-files-only \
+    --types k_proj o_proj q_proj v_proj --depths 10 15 20 --out layers/
+
+python hybridize.py models/SmolLM2-135M --layers-dir layers/ --no-perplexity \
+    --tensorization qubit --gate-sizes 2 4 --circuit-depths 1 4 16 64 256 \
+    --chi 1 4 16 64 256 --max-total-params 0 \
+    --disentangle-optimizer explicit+gradient --fast-gradient --jobs 2
+```
+
 ### Prune the grid first (no model, no tokens)
 
 Whether the hybrid *can* win is settled by arithmetic before any token is

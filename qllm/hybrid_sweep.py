@@ -36,6 +36,7 @@ the checkpoint, and a point counts as done only once it carries a healed value.
 
 from __future__ import annotations
 
+import csv
 import inspect
 import math
 import multiprocessing as mp
@@ -54,6 +55,7 @@ from .benchmark import (
     load_model_and_tokenizer,
     perplexity_over_ids,
     resolve_device,
+    resolve_dtype,
     tokenize_corpus,
 )
 from .compactifai import (
@@ -138,6 +140,7 @@ class HybridConfig(CompactifaiConfig):
     measure_perplexity: bool = True            # False -> relative error / accuracy only (no model eval)
     max_total_params: int | None = None        # skip (NaN row) any point whose M* = C(chi') + Q(D) exceeds this; 0 = cap at params_original
     n_jobs: int = 1                             # parallel disentangling workers (<=0 -> all cores); only without perplexity/healing/per-chi
+    layers_dir: str | None = None              # load layer weights from extract_layers.py files instead of the full model (no perplexity/healing)
 
 
 @dataclass
@@ -288,6 +291,88 @@ def _select_profile_layers(model, config: HybridConfig):
     return layers, keep, available
 
 
+def _read_layer_tensor(path: Path, name: str | None) -> torch.Tensor:
+    """Load one 2-D weight tensor from a per-layer file (safetensors / pt / npy)."""
+    suffix = path.suffix.lower()
+    if suffix == ".safetensors":
+        from safetensors.torch import load_file
+        data = load_file(str(path))
+        key = name if (name and name in data) else next(iter(data))
+        return data[key]
+    if suffix == ".pt":
+        obj = torch.load(str(path), map_location="cpu", weights_only=True)
+        if isinstance(obj, dict):
+            key = name if (name and name in obj) else next(iter(obj))
+            return obj[key]
+        return obj                                   # a bare tensor
+    if suffix == ".npy":
+        import numpy as np
+        return torch.from_numpy(np.load(str(path)))
+    raise RuntimeError(f"unsupported layer file type: {path.name}")
+
+
+def _layers_from_dir(layers_dir: str, config: HybridConfig):
+    """Build the (name, weight) layer list from a directory of extracted layer files.
+
+    Mirrors :func:`_select_profile_layers` -- the same depth (``profile_depths`` /
+    ``num_depths``) and type (``layer_types``) filters are applied -- but sources the
+    weights from files written by ``extract_layers.py`` instead of a loaded model, so
+    no full model has to be held in memory. ``manifest.csv`` (authoritative parameter
+    names) is used when present; otherwise every ``*.safetensors`` / ``*.pt`` file in
+    the directory is read and its tensor key taken as the parameter name.
+    """
+    d = Path(layers_dir)
+    if not d.is_dir():
+        raise RuntimeError(f"--layers-dir '{d}' is not a directory.")
+    entries: list[tuple[str, torch.Tensor]] = []
+    manifest = d / "manifest.csv"
+    if manifest.exists():
+        with open(manifest, newline="") as fh:
+            for row in csv.DictReader(fh):
+                path = d / row["file"]
+                if not path.exists():
+                    raise RuntimeError(f"manifest.csv lists a missing file: {path}")
+                entries.append((row["param_name"], _read_layer_tensor(path, row["param_name"])))
+    else:
+        files = sorted(d.glob("*.safetensors")) + sorted(d.glob("*.pt"))
+        if not files:
+            raise RuntimeError(
+                f"No manifest.csv and no *.safetensors / *.pt files in '{d}'. "
+                f"Run extract_layers.py to produce them.")
+        for f in files:
+            if f.suffix.lower() == ".safetensors":
+                from safetensors.torch import load_file
+                key = next(iter(load_file(str(f))))
+            else:
+                obj = torch.load(str(f), map_location="cpu", weights_only=True)
+                key = next(iter(obj)) if isinstance(obj, dict) else f.stem
+            entries.append((key, _read_layer_tensor(f, key)))
+
+    # Cast to the requested compute dtype (a normal model load would honour --dtype).
+    dtype = resolve_dtype(config.dtype)
+    if isinstance(dtype, torch.dtype):
+        entries = [(n, t.to(dtype)) for n, t in entries]
+    entries = [(n, t) for n, t in entries if t.ndim == 2]
+    if not entries:
+        raise RuntimeError(f"No 2-D weight tensors found under '{d}'.")
+
+    available = sorted({parse_layer_info(n)[1] for n, _ in entries
+                        if parse_layer_info(n)[1] >= 0})
+    if config.profile_depths is not None:
+        keep = sorted(set(config.profile_depths) & set(available))
+    elif config.num_depths:
+        keep = evenly_spaced(available, config.num_depths)
+    else:
+        keep = available
+    keep_set = set(keep)
+    layers = [(n, t) for n, t in entries if parse_layer_info(n)[1] in keep_set]
+    if config.layer_types:
+        wanted = tuple(config.layer_types)
+        layers = [(n, t) for n, t in layers
+                  if any(w in parse_layer_info(n)[0] for w in wanted)]
+    return layers, keep, available
+
+
 def run_hybrid_sweep(config: HybridConfig) -> Path:
     """Measure PPL(chi) for the TN layer and PPL(chi', D) for the PQC+TN layer."""
     device = resolve_device(config.device)
@@ -298,9 +383,22 @@ def run_hybrid_sweep(config: HybridConfig) -> Path:
         dataset=config.dataset, dataset_config=config.dataset_config,
         split=config.split, text_column=config.text_column,
     )
-    model, tokenizer = load_model_and_tokenizer(load_cfg, device)
-
-    layers, keep, available = _select_profile_layers(model, config)
+    # Source the layer weights from individual files (extract_layers.py) when a
+    # --layers-dir is given and no full model is needed -- i.e. without perplexity or
+    # healing, which require forward passes through the whole network. This skips the
+    # full-model load entirely (memory + startup time). Otherwise load the model.
+    need_model = config.measure_perplexity or config.heal
+    model = tokenizer = None
+    if config.layers_dir and not need_model:
+        layers, keep, available = _layers_from_dir(config.layers_dir, config)
+        print(f"Loaded {len(layers)} layer weight(s) from '{config.layers_dir}' "
+              f"(no full model loaded).")
+    else:
+        if config.layers_dir and need_model:
+            print(f"--layers-dir ignored: perplexity/healing needs the full model; "
+                  f"loading '{config.model_id}' instead.")
+        model, tokenizer = load_model_and_tokenizer(load_cfg, device)
+        layers, keep, available = _select_profile_layers(model, config)
     if not layers:
         raise RuntimeError("No layers selected for the hybrid sweep.")
 

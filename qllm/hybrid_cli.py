@@ -224,6 +224,14 @@ def parse_args(argv=None) -> argparse.Namespace:
                              "on the deep circuits a small k needs for high D. Set 0 "
                              "to cap at each layer's own params_original (skip any "
                              "compression larger than the original weight).")
+    parser.add_argument("--layers-dir", default=None,
+                        help="Load the layer weights from a directory of per-layer "
+                             "files written by extract_layers.py, instead of loading "
+                             "the full model. Skips the full-model load entirely (less "
+                             "memory, faster start). The same --layer-types / "
+                             "--profile-depths filters still apply. Requires "
+                             "--no-perplexity and no healing (those need the whole "
+                             "network); ignored, with a note, if either is on.")
     parser.add_argument("--jobs", type=int, default=1,
                         help="Disentangle independent (layer, D, k) points in this "
                              "many parallel processes (<=0 = all CPU cores). Torch "
@@ -361,6 +369,7 @@ def main(argv=None) -> int:
         heal_split=args.heal_split, heal_dataset=args.heal_dataset,
         word_level=args.word_level, measure_perplexity=not args.no_perplexity,
         max_total_params=args.max_total_params, n_jobs=args.jobs,
+        layers_dir=args.layers_dir,
         results_dir=args.results_dir, hybrid_csv_name=args.csv_name,
         force_recompute=args.recompute,
     )
