@@ -66,6 +66,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pennylane as qml
 import torch
+from torch.utils.checkpoint import checkpoint as _ckpt
 
 from .compactifai import (
     MPOPlan,
@@ -254,8 +255,21 @@ def apply_gate(tensor: torch.Tensor, gate: torch.Tensor, start: int, k: int,
     return out.reshape(1 << n_qubits, -1)
 
 
+def _ckpt_segments(n_gates: int, threshold: int = 32) -> int | None:
+    """Number of gradient-checkpoint segments for a chain of ``n_gates`` gates.
+
+    ``None`` (no checkpointing) below ``threshold`` gates -- a shallow circuit's
+    graph is cheap, so the recompute isn't worth it. Above it, ``~sqrt(n_gates)``
+    segments minimize peak memory (``O(sqrt(n_gates))`` retained) for one extra
+    forward pass.
+    """
+    if n_gates <= threshold:
+        return None
+    return max(2, round(n_gates ** 0.5))
+
+
 def apply_circuit(gates: list[Gate], tensor: torch.Tensor, n_qubits: int,
-                  transpose: bool = False) -> torch.Tensor:
+                  transpose: bool = False, checkpoint_segments: int | None = None) -> torch.Tensor:
     """``C X`` (or ``C^T X``): the circuit applied to the row index, gate by gate.
 
     Gates are applied one at a time (the way a state-vector simulator runs a
@@ -265,19 +279,44 @@ def apply_circuit(gates: list[Gate], tensor: torch.Tensor, n_qubits: int,
     so this carries the gradient scheme's autograd too. Use :func:`circuit_unitary`
     when the explicit ``2^n x 2^n`` operator is actually wanted (export, small
     circuits, verification).
+
+    ``checkpoint_segments`` enables gradient checkpointing when building an autograd
+    graph: the chain is applied in that many contiguous segments, and only the
+    segment boundaries are kept for backward -- the intra-segment activations are
+    recomputed. Without it the retained graph is ``O(#gates)``, so a deep circuit's
+    training memory grows linearly with depth and OOMs; with ``~sqrt(#gates)``
+    segments it grows as ``~sqrt(depth)`` for one extra forward pass. It is a no-op
+    (identical result, no recompute) when there is no grad to record.
     """
+    seq = list(reversed(gates)) if transpose else list(gates)
+
+    def _run(sub, x):
+        for g in sub:
+            mat = g.matrix.T if transpose else g.matrix
+            x = apply_gate(x, mat, g.start, g.k, n_qubits)
+        return x
+
+    if not checkpoint_segments or len(seq) <= 1 or not torch.is_grad_enabled():
+        return _run(seq, tensor)
+    # Gradient checkpointing: store only each segment boundary, recompute the rest in
+    # backward. use_reentrant=False is required -- the tensors that need gradients (the
+    # gate matrices) are captured in the closure, not passed as inputs, and only the
+    # non-reentrant checkpoint tracks those.
+    n_seg = max(1, min(int(checkpoint_segments), len(seq)))
+    bounds = [round(i * len(seq) / n_seg) for i in range(n_seg + 1)]
     out = tensor
-    for g in (reversed(gates) if transpose else gates):
-        mat = g.matrix.T if transpose else g.matrix
-        out = apply_gate(out, mat, g.start, g.k, n_qubits)
+    for a, b in zip(bounds[:-1], bounds[1:]):
+        if b > a:
+            out = _ckpt(lambda x, _a=a, _b=b: _run(seq[_a:_b], x), out,
+                        use_reentrant=False)
     return out
 
 
 def apply_right(gates: list[Gate], tensor: torch.Tensor, n_qubits: int,
-                transpose: bool = False) -> torch.Tensor:
+                transpose: bool = False, checkpoint_segments: int | None = None) -> torch.Tensor:
     """``X C^T`` (or ``X C``): the circuit acting on the *column* index of ``X``."""
     moved = apply_circuit(gates, tensor.transpose(0, 1).contiguous(), n_qubits,
-                          transpose=transpose)
+                          transpose=transpose, checkpoint_segments=checkpoint_segments)
     return moved.transpose(0, 1).contiguous()
 
 
@@ -566,9 +605,16 @@ def _train_gradient(padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
         ug = _gates_from_angles(theta_u, pos_u, bases_u)
         vg = _gates_from_angles(theta_v, pos_v, bases_v)
         if fast:
-            # Pure-torch local contractions -- O(#gates), no register unitary.
-            current = apply_right(vg, apply_circuit(ug, padded, n_out, transpose=True),
-                                  n_in, transpose=True)
+            # Pure-torch local contractions -- O(#gates), no register unitary. For a
+            # deep circuit the retained autograd graph (one activation per gate) is
+            # what makes training memory grow with depth and OOM; checkpoint the chain
+            # in ~sqrt(#gates) segments so it grows as ~sqrt(depth) instead. Shallow
+            # circuits (few gates) skip it -- no benefit, and it avoids the recompute.
+            seg_u = _ckpt_segments(len(ug))
+            seg_v = _ckpt_segments(len(vg))
+            current = apply_right(vg, apply_circuit(ug, padded, n_out, transpose=True,
+                                                    checkpoint_segments=seg_u),
+                                  n_in, transpose=True, checkpoint_segments=seg_v)
         else:
             # THROUGH PennyLane (qml.matrix, torch interface) -- autograd flows
             # from the loss back to the angles via the PennyLane circuit itself.

@@ -74,6 +74,31 @@ for n, k, D in [(6, 2, 3), (5, 2, 4), (8, 3, 2), (4, 4, 1)]:
     assert torch.allclose(apply_right(gates, R, n), R @ U.T, atol=1e-5)
     assert torch.allclose(apply_right(gates, R, n, transpose=True), R @ U, atol=1e-5)
 print("  gates orthogonal, circuits exactly invertible, left/right forms agree")
+
+# Gradient checkpointing (deep circuits): segmenting the chain must not change the
+# forward OR the gradient -- it only trades recompute for memory, so a deep D=256
+# circuit trains in a few GB instead of OOM-ing.
+from qllm.disentangler import _ckpt_segments, _gates_from_angles
+_pos = gate_positions(8, 2, 12)                          # ~42 gates > 32 -> checkpointed
+assert _ckpt_segments(len(_pos)) is not None, "a deep chain should checkpoint"
+assert _ckpt_segments(4) is None, "a shallow chain should not checkpoint"
+_pad = torch.randn(1 << 8, 1 << 8)
+
+
+def _fwd_grad(segs):
+    th = [torch.zeros(6, requires_grad=True) for _ in _pos]   # so(4) = 6 angles per k=2 gate
+    gg = _gates_from_angles(th, _pos, None)
+    y = apply_circuit(gg, _pad, 8, transpose=True, checkpoint_segments=segs)
+    (y * y).sum().backward()
+    return y.detach(), torch.cat([t.grad.flatten() for t in th])
+
+
+_y0, _g0 = _fwd_grad(None)
+_y1, _g1 = _fwd_grad(_ckpt_segments(len(_pos)))
+assert torch.allclose(_y0, _y1, atol=1e-6) and torch.allclose(_g0, _g1, atol=1e-6), \
+    "gradient checkpointing changed the forward/gradient"
+print(f"  gradient checkpointing exact over {len(_pos)} gates "
+      f"({_ckpt_segments(len(_pos))} segments): forward & gradient match")
 assert len(gate_positions(10, 10, 5)) == 1, "a register-wide gate must not stack"
 assert quantum_param_count(10, 8, 10, 1) == 1024 * 1023 // 2 + 256 * 255 // 2
 print(f"  Q for the paper's (10qU, 8qV, L=1): "
