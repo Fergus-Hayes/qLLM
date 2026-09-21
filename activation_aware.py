@@ -46,18 +46,75 @@ def _load_layers(args):
 
 
 # --------------------------------------------------------------------------- #
+def _calibration_ids(args):
+    """Token ids for calibration, from the cheapest source that works.
+
+    ``H = E[x x^T]`` needs activations, so it needs token *ids* -- never a tokenizer
+    and never the Hub. ``--token-ids`` therefore skips both entirely; the tokenizer
+    is imported only if text still has to be turned into ids.
+    """
+    if args.token_ids:
+        obj = torch.load(args.token_ids, map_location="cpu")
+        if isinstance(obj, dict):
+            obj = next(iter(obj.values()))
+        ids = obj.long()
+        if ids.dim() == 1:
+            ids = ids.unsqueeze(0)
+        print(f"Calibration ids from {args.token_ids}: {tuple(ids.shape)}")
+        return ids
+
+    from transformers import AutoTokenizer
+    src = args.tokenizer or args.model
+    try:
+        tok = AutoTokenizer.from_pretrained(src, local_files_only=args.local_files_only)
+    except Exception as exc:                                     # noqa: BLE001
+        raise SystemExit(
+            f"Could not load a tokenizer from '{src}':\n  {type(exc).__name__}: {exc}\n\n"
+            f"Capturing H needs token ids, not a tokenizer. Any of these unblocks it:\n"
+            f"  --tokenizer HuggingFaceTB/SmolLM2-135M --local-files-only   "
+            f"(use the copy in your HF cache)\n"
+            f"  --token-ids ids.pt                                         "
+            f"(pre-tokenized ids; no tokenizer, no dataset)\n"
+            f"  --text-file corpus.txt                                     "
+            f"(local text, still needs a tokenizer)\n"
+            f"  pip install sentencepiece                                  "
+            f"(some tokenizers need it to convert slow -> fast)"
+        ) from exc
+    if tok.pad_token_id is None and tok.eos_token is not None:
+        tok.pad_token = tok.eos_token
+
+    if args.text_file:
+        text = Path(args.text_file).read_text()
+        ids = tok(text, return_tensors="pt").input_ids
+        print(f"Calibration ids from {args.text_file}: {tuple(ids.shape)}")
+        return ids
+
+    from qllm.benchmark import BenchmarkConfig, tokenize_corpus
+    bcfg = BenchmarkConfig(model_id=args.model, dataset=args.dataset,
+                           dataset_config=args.dataset_config, split=args.split,
+                           local_files_only=args.local_files_only)
+    return tokenize_corpus(tok, bcfg)
+
+
 def cmd_capture(args):
-    from qllm.benchmark import (BenchmarkConfig, load_model_and_tokenizer,
-                                resolve_device, tokenize_corpus)
+    from transformers import AutoModelForCausalLM
+
+    from qllm.benchmark import DTYPE_MAP, resolve_device
     from qllm.compactifai_heal import make_heal_batches
     from qllm.hybrid_sweep import HybridConfig, _select_profile_layers
 
     device = resolve_device(args.device)
-    bcfg = BenchmarkConfig(model_id=args.model, device=args.device, dtype=args.dtype,
-                           local_files_only=args.local_files_only,
-                           dataset=args.dataset, dataset_config=args.dataset_config,
-                           split=args.split)
-    model, tokenizer = load_model_and_tokenizer(bcfg, device)
+    # Load the model directly rather than through load_model_and_tokenizer: the
+    # tokenizer is not needed to capture activations, and a local save with missing
+    # or unconvertible tokenizer files must not block the capture.
+    print(f"Loading '{args.model}'"
+          f"{' (local files only)' if args.local_files_only else ''} ...")
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model, torch_dtype=DTYPE_MAP.get(args.dtype, torch.float32),
+        local_files_only=args.local_files_only)
+    model.to(device)
+    model.eval()
+
     hcfg = HybridConfig(model_id=args.model, profile_depths=args.depths,
                         layer_types=args.types)
     layers, _keep, _avail = _select_profile_layers(model, hcfg)
@@ -66,12 +123,12 @@ def cmd_capture(args):
     names = [n for n, _p in layers]
     print(f"Capturing H = E[x x^T] for {len(names)} layer(s).")
 
-    ids = tokenize_corpus(tokenizer, bcfg)
+    ids = _calibration_ids(args)
     batches = make_heal_batches(ids, args.window, args.batch_size, args.calib_tokens)
     if not batches:
-        raise SystemExit("No calibration batches; raise --calib-tokens.")
-    tok = sum(b.numel() for b in batches)
-    print(f"Calibration: {len(batches)} batch(es), {tok:,} tokens "
+        raise SystemExit("No calibration batches; raise --calib-tokens or lower --window.")
+    tok_n = sum(b.numel() for b in batches)
+    print(f"Calibration: {len(batches)} batch(es), {tok_n:,} tokens "
           f"(window {args.window}, batch {args.batch_size})")
 
     def prog(i, n):
@@ -198,6 +255,14 @@ def main():
     c.add_argument("--dataset", default="Salesforce/wikitext")
     c.add_argument("--dataset-config", default="wikitext-2-raw-v1")
     c.add_argument("--split", default="train")
+    c.add_argument("--tokenizer", default=None,
+                   help="load the tokenizer from here instead of the model directory "
+                        "(e.g. the Hub id, which resolves from your local HF cache)")
+    c.add_argument("--token-ids", default=None,
+                   help="pre-tokenized ids (.pt, [T] or [1,T]) -- needs no tokenizer "
+                        "and no dataset, so it works fully offline")
+    c.add_argument("--text-file", default=None,
+                   help="tokenize this local text file instead of the Hub dataset")
     c.add_argument("--calib-tokens", type=int, default=65536)
     c.add_argument("--window", type=int, default=512)
     c.add_argument("--batch-size", type=int, default=2)
