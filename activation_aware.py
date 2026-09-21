@@ -34,6 +34,8 @@ from qllm.activation_stats import (
     low_rank_whitened,
     magic_matched_null,
     output_relative_error,
+    sparse_lowrank_params,
+    sparse_lowrank_whitened,
     stabilizer_renyi_entropy,
 )
 from qllm.compactifai import relative_error
@@ -267,6 +269,12 @@ def cmd_curve(args):
     compile-time change of objective, not a runtime cost, and because it is the
     exact optimum of the H-weighted error it is a hard lower bound on what *any*
     rank-r approximation can achieve on the output metric.
+
+    ``sparse`` and ``sparse+low-rank-w`` are the classes that can hold the one
+    structure the diagnostics did find. Their nonzeros are charged for their indices
+    as well as their values (see :func:`sparse_lowrank_params`), so sparsity gets no
+    more of a free ride than a quantum gate does; the budget axis stays one number
+    that every method is spending from.
     """
     from safetensors.torch import load_file
 
@@ -306,8 +314,39 @@ def cmd_curve(args):
                              param_frac=round(cpar / dense, 5),
                              output_err=round(output_relative_error(W, approx, H), 6),
                              frob_err=round(float(relative_error(W, approx)), 6)))
+
+        # Sparse, and sparse on top of the whitened low-rank. The split between the
+        # two budgets is a free knob, so it is swept rather than guessed: every
+        # (rank, nnz) pair lands on the same parameter axis and the budget table
+        # below picks the best split for each budget by itself.
+        # The grids stop at the largest budget the table reads: a point costing more
+        # than that can never be selected, and the per-row weighted refit gets
+        # expensive exactly there (its solves are O(nnz_per_row^3) per row).
+        cap = max(args.budgets) * dense
+        k_max = max(1, min(n, int(cap / sparse_lowrank_params(
+            m, n, 0, 1, args.value_bits, args.index_bits))))
+        nnzs = sorted(set(log_spaced_ints(1, k_max, args.sparse_points)))
+        sp_ranks = [0] + sorted(set(log_spaced_ints(1, min(m, n), args.sparse_points)))
+        n_sp = 0
+        for r in sp_ranks:
+            for k in nnzs:
+                cost = sparse_lowrank_params(m, n, r, k, args.value_bits,
+                                             args.index_bits)
+                if cost > cap:
+                    continue
+                approx, _inf = sparse_lowrank_whitened(
+                    W, H, r, k, args.damp, args.sparse_iters)
+                n_sp += 1
+                rows.append(dict(
+                    layer_type=lt, depth=dep,
+                    method="sparse" if r == 0 else "sparse+low-rank-w",
+                    knob=(k if r == 0 else r * 10000 + k), params=round(cost, 1),
+                    dense=dense, param_frac=round(cost / dense, 5),
+                    output_err=round(output_relative_error(W, approx, H), 6),
+                    frob_err=round(float(relative_error(W, approx)), 6)))
         print(f"  {lt:<18} d{dep:<3} {m}x{n}: "
-              f"{len(ranks)} ranks + {args.points} chi", flush=True)
+              f"{len(ranks)} ranks + {args.points} chi + "
+              f"{n_sp} sparse", flush=True)
 
     with open(args.out, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=list(rows[0]))
@@ -318,10 +357,11 @@ def cmd_curve(args):
     # What each budget actually buys: the best point a method reaches without
     # exceeding it. Budgets are fractions of the dense layer.
     import statistics as st
-    methods = ["mpo", "low-rank", "low-rank-whitened"]
+    methods = ["mpo", "low-rank", "low-rank-whitened", "sparse", "sparse+low-rank-w"]
     print(f"\nBest output error at or under a parameter budget "
           f"(mean over {len(layers)} layers)")
     print(f"{'budget':>10}" + "".join(f"{mth:>21}" for mth in methods))
+    best_at = {}
     for frac in args.budgets:
         cells = []
         for mth in methods:
@@ -334,11 +374,44 @@ def cmd_curve(args):
                 if cand:
                     vals.append(min(cand))
             cells.append(st.mean(vals) if vals else float("nan"))
+        best_at[frac] = dict(zip(methods, cells))
         line = f"{frac:>9.1%}" + "".join(f"{c:>21.4f}" for c in cells)
         print(line)
     print("\n(low-rank-whitened is the exact optimum of the output error over all "
           "rank-r maps,\n so it lower-bounds every rank-r method; it costs the same "
           "r*(m+n) as plain low-rank.)")
+    idx_bits = (args.index_bits if args.index_bits is not None
+                else max(1, int(math.ceil(math.log2(max(2, max(int(W.shape[1])
+                                                               for _n, W in layers)))))))
+    print(f"(a sparse nonzero is charged "
+          f"{1 + idx_bits / args.value_bits:.3f} parameter-equivalents: one "
+          f"{args.value_bits}-bit value\n plus a {idx_bits}-bit column index. "
+          f"Values only would be 1.000.)")
+
+    # Does adding sparsity to the whitened low-rank actually buy anything, at a
+    # budget it has to pay for? This is the question the build was made to answer.
+    print("\nSparse gain over whitened low-rank, at equal total budget")
+    print(f"{'budget':>10}{'LR-whitened':>16}{'best sparse mix':>18}{'gain':>10}")
+    fired = []
+    for frac in args.budgets:
+        lr = best_at[frac]["low-rank-whitened"]
+        cand = [v for k, v in best_at[frac].items()
+                if k in ("sparse", "sparse+low-rank-w") and v == v]
+        mix = min(cand) if cand else float("nan")
+        # A budget no method can afford says nothing; skip it rather than score it.
+        gain = lr / mix if (lr == lr and mix == mix and mix > 0) else float("nan")
+        if gain == gain and gain > 1.05:
+            fired.append((frac, gain))
+        print(f"{frac:>9.1%}{lr:>16.4f}{mix:>18.4f}{gain:>9.2f}x")
+    if fired:
+        f, g = max(fired, key=lambda t: t[1])
+        print(f"\nVERDICT: sparsity pays -- up to {g:.2f}x lower output error than "
+              f"whitened low-rank\n  at the same total parameter count (best at the "
+              f"{f:.1%} budget), indices charged.")
+    else:
+        print("\nVERDICT: sparsity does not pay. Whitened low-rank is within 5% of "
+              "the best\n  sparse mix at every budget, once nonzeros are charged "
+              "for their indices.")
 
 
 # --------------------------------------------------------------------------- #
@@ -668,6 +741,15 @@ def main():
                     default=[0.01, 0.05, 0.10, 0.25, 0.50],
                     help="parameter budgets as a fraction of the dense layer")
     cu.add_argument("--damp", type=float, default=1e-6)
+    cu.add_argument("--sparse-points", type=int, default=7,
+                    help="grid points for rank and for nnz/row in the sparse mix "
+                         "(the (rank, nnz) split is swept, not guessed)")
+    cu.add_argument("--sparse-iters", type=int, default=3,
+                    help="alternating low-rank/sparse refinement steps")
+    cu.add_argument("--value-bits", type=int, default=16,
+                    help="width of a stored weight, for charging sparse indices")
+    cu.add_argument("--index-bits", type=int, default=None,
+                    help="bits per sparse index (default: ceil(log2(cols)))")
     cu.add_argument("--out", default="activation_curve.csv")
     cu.set_defaults(func=cmd_curve)
 

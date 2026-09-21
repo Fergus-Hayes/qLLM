@@ -226,3 +226,118 @@ def magic_matched_null(vec: torch.Tensor, reps: int = 8, seed: int = 0) -> float
         sign = torch.where(torch.rand(mags.numel(), generator=g) < 0.5, -1.0, 1.0)
         vals.append(stabilizer_renyi_entropy(mags[perm] * sign.to(torch.float64)))
     return sum(vals) / len(vals)
+
+
+# --------------------------------------------------------------------------- #
+# Sparse + whitened low-rank
+# --------------------------------------------------------------------------- #
+# Low-rank is the wrong model for a matrix whose energy sits in a few coordinates:
+# every diagnostic so far said the dominant whitened subspace is generic in
+# entanglement and in magic but *sparse*, and sparsity is the one structure a
+# factorization cannot express. ``W' = L + S`` with ``L`` rank r and ``S`` row-sparse
+# is the class that can hold both, and it is purely classical.
+def sparse_lowrank_params(rows: int, cols: int, rank: int, nnz_per_row: int,
+                          value_bits: int = 16, index_bits: int | None = None) -> float:
+    """Parameter-equivalent cost of ``L + S``, charging sparse indices honestly.
+
+    A nonzero is not one number: it is a value plus the index saying where it goes.
+    Counting only values would give sparsity a free ride exactly the way counting a
+    quantum gate as free would, so each nonzero costs ``1 + index_bits/value_bits``
+    parameter-equivalents. With a per-row support the index is a column id, so
+    ``index_bits = ceil(log2(cols))`` (10 bits against 16-bit values at cols=576,
+    i.e. 1.625x per nonzero). The low-rank part carries no indices.
+    """
+    if index_bits is None:
+        index_bits = max(1, int(math.ceil(math.log2(max(2, cols)))))
+    nnz = rows * max(0, int(nnz_per_row))
+    return rank * (rows + cols) + nnz * (1.0 + index_bits / float(value_bits))
+
+
+def _row_sparse_fit(resid: torch.Tensor, cov: torch.Tensor, nnz_per_row: int,
+                    damp: float = 1e-6, refit: bool = True) -> torch.Tensor:
+    """Best row-sparse ``S`` for ``min ||(R - S) H^(1/2)||_F``, support then values.
+
+    Support is picked by the diagonal saliency ``|R_ij| * sqrt(H_jj)`` -- the leading
+    term of the weighted objective, and the same criterion SparseGPT/OBS use. On that
+    fixed support the values are then solved *exactly*: stationarity of
+    ``(r - s) H (r - s)^T`` gives ``H[O,O] s_O^T = (R H)_O^T`` per row, which is a
+    small dense system because the support is small. A row keeps the refit only if it
+    measurably lowers that row's own error, so the step can never be worse than
+    plain magnitude values.
+    """
+    m, n = resid.shape
+    k = max(0, min(int(nnz_per_row), n))
+    out = torch.zeros_like(resid)
+    if k == 0:
+        return out
+    diag = torch.diagonal(cov).clamp_min(0.0).sqrt()
+    idx = torch.topk(resid.abs() * diag, k, dim=1).indices           # (m, k)
+    raw = torch.gather(resid, 1, idx)
+    if not refit:
+        return out.scatter(1, idx, raw)
+
+    rhs = torch.gather(resid @ cov, 1, idx)                          # (m, k)
+    lam = damp * float(torch.diagonal(cov).max().clamp_min(0.0))
+    eye = torch.eye(k, dtype=cov.dtype) * (lam if lam > 0 else damp)
+    fit = torch.empty_like(raw)
+    blk = max(1, int(2e6 // max(1, k * k)))                          # bound the gather
+    for b in range(0, m, blk):
+        ii = idx[b:b + blk]
+        sub = cov[ii.unsqueeze(2), ii.unsqueeze(1)] + eye            # (B, k, k)
+        try:
+            sol = torch.linalg.solve(sub, rhs[b:b + blk].unsqueeze(2))
+        except Exception:                                            # noqa: BLE001
+            sol = torch.linalg.lstsq(sub, rhs[b:b + blk].unsqueeze(2)).solution
+        fit[b:b + blk] = sol.squeeze(2)
+
+    # Per-row acceptance: keep whichever of {refit, raw} actually lowers that row.
+    err = {}
+    for tag, vals in (("fit", fit), ("raw", raw)):
+        d = resid - torch.zeros_like(resid).scatter(1, idx, vals)
+        err[tag] = ((d @ cov) * d).sum(1)
+    keep = (err["fit"] <= err["raw"]).unsqueeze(1)
+    return out.scatter(1, idx, torch.where(keep, fit, raw))
+
+
+def sparse_lowrank_whitened(weight: torch.Tensor, cov: torch.Tensor, rank: int,
+                            nnz_per_row: int, damp: float = 1e-6, iters: int = 3,
+                            refit: bool = True):
+    """``W ~= L + S``, ``L`` rank-``r`` whitened, ``S`` row-sparse, under the H-weighted error.
+
+    Alternating minimisation. Each half-step is the exact optimum of its own block
+    (:func:`low_rank_whitened` for ``L`` given ``S``, :func:`_row_sparse_fit`'s
+    solve for the values of ``S`` given ``L``); only the support selection is a
+    heuristic, so every intermediate is scored and the best is returned. ``S`` starts
+    at zero, which makes the first candidate exactly :func:`low_rank_whitened` --
+    the result therefore can never be worse than the whitened low-rank reference.
+
+    Returns ``(approx, info)`` where ``info`` carries the achieved weighted error and
+    which iteration produced it.
+    """
+    w = weight.detach().to(torch.float64).cpu()
+    h = cov.detach().to(torch.float64).cpu()
+    m, n = int(w.shape[0]), int(w.shape[1])
+    r = max(0, min(int(rank), min(m, n)))
+    k = max(0, min(int(nnz_per_row), n))
+
+    def score(a):
+        d = w - a
+        return float(((d @ h) * d).sum())
+
+    best, best_err, best_it = None, float("inf"), -1
+    s = torch.zeros_like(w)
+    for it in range(max(1, int(iters))):
+        lo = low_rank_whitened(w - s, h, r, damp) if r > 0 else torch.zeros_like(w)
+        for cand in (lo + s,):
+            e = score(cand)
+            if e < best_err:
+                best, best_err, best_it = cand, e, it
+        if k == 0:
+            break
+        s = _row_sparse_fit(w - lo, h, k, damp, refit)
+        cand = lo + s
+        e = score(cand)
+        if e < best_err:
+            best, best_err, best_it = cand, e, it
+    return best, {"weighted_err_sq": best_err, "iter": best_it,
+                  "rank": r, "nnz_per_row": k}

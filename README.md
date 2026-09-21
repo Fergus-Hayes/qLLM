@@ -850,6 +850,26 @@ python activation_aware.py curve --layers-dir models/SmolLM2-135M/layers \
     --cov cov/ --budgets 0.01 0.05 0.1 0.25 0.5 --out activation_curve.csv
 ```
 
+The curve also carries the two **sparse** classes, because sparsity is the one
+structure the `vectors` and `magic` diagnostics did find and the one a
+factorization cannot express. `W' = L + S` has `L` rank-`r` whitened and `S`
+row-sparse; the split between the two budgets is swept rather than guessed, so the
+table picks the best `(rank, nnz)` mix for each budget by itself. Both blocks are
+solved exactly given the other -- `L` by whitened truncation, and the values of `S`
+by the per-row system `H[O,O] s_O^T = (R H)_O^T`, which is the stationarity
+condition of the H-weighted error on a fixed support (only the support choice, by
+the `|R_ij| * sqrt(H_jj)` saliency of SparseGPT/OBS, is a heuristic). `S` starts at
+zero, so the first candidate is exactly whitened low-rank and the result can never
+come out worse than that reference.
+
+**Nonzeros are charged for their indices.** A nonzero is a value *plus* the column
+id saying where it goes, so it costs `1 + index_bits/value_bits`
+parameter-equivalents -- 1.625 at `cols=576` with 16-bit values. Counting only the
+values would hand sparsity a free ride in exactly the way counting a quantum gate
+as free would, and the budget axis has to stay one number that every method spends
+from. `--value-bits` and `--index-bits` set the convention; the run prints it.
+
+
 `score` reports, per layer and bond dimension, the Frobenius error next to the
 output error, and -- at matched parameter count -- the best plain low-rank
 approximation against the best **whitened** one. Read the **whitening gain**, not

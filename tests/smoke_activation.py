@@ -9,7 +9,12 @@ Verifies the claims the Phase-A verdict rests on:
   error, i.e. it really is the exact optimum for that class;
 * with isotropic ``H`` the output metric collapses onto the Frobenius metric and
   whitening buys nothing (the null case the verdict must not fire on);
-* with anisotropic ``H`` both the headroom and the whitening gain are large.
+* with anisotropic ``H`` both the headroom and the whitening gain are large;
+* the sparse + whitened low-rank build degrades to each of its endpoints exactly
+  (no sparsity reproduces whitened low-rank; a full support reproduces ``W``), never
+  scores worse than whitened low-rank at the same rank, and improves monotonically
+  with refinement steps -- the properties that make its budget-curve rows readable
+  as a genuine comparison rather than an artefact of the search.
 """
 import os
 import sys
@@ -21,7 +26,8 @@ sys.path.insert(0, ROOT)
 
 from qllm.activation_stats import (  # noqa: E402
     covariance_spectrum, input_covariance, low_rank_frobenius,
-    low_rank_whitened, output_relative_error,
+    low_rank_whitened, output_relative_error, sparse_lowrank_params,
+    sparse_lowrank_whitened,
 )
 from qllm.compactifai import relative_error  # noqa: E402
 
@@ -180,6 +186,50 @@ def main():
     print(f"  magic: stabilizer M2={m_stab:.2e}, Haar M2={m_haar:.2f} bits; that same "
           f"stabilizer\n         state reads {be_stab:.2f}x bond entropy (the blind "
           f"spot bond entropy cannot see)")
+
+    # --- sparse + whitened low-rank ----------------------------------------
+    torch.manual_seed(3)
+    m_, n_ = 40, 32
+    A = torch.randn(n_, n_).double()
+    Hs = A @ A.T / n_ + 1e-3 * torch.eye(n_, dtype=torch.float64)
+    Ws = torch.randn(m_, n_).double()
+
+    a0, _ = sparse_lowrank_whitened(Ws, Hs, 5, 0)
+    d0 = float((a0 - low_rank_whitened(Ws, Hs, 5)).abs().max())
+    assert d0 < 1e-12, f"no-sparsity endpoint differs from whitened low-rank ({d0})"
+
+    afull, _ = sparse_lowrank_whitened(Ws, Hs, 0, n_)
+    dfull = float((afull - Ws).abs().max())
+    assert dfull < 1e-10, f"full support did not reproduce W ({dfull})"
+
+    for r_ in (1, 2, 4, 8):
+        for k_ in (1, 2, 4):
+            ax, _ = sparse_lowrank_whitened(Ws, Hs, r_, k_)
+            e_mix = output_relative_error(Ws, ax, Hs)
+            e_lr = output_relative_error(Ws, low_rank_whitened(Ws, Hs, r_), Hs)
+            assert e_mix <= e_lr + 1e-12, f"sparse mix worse than LR at r={r_} k={k_}"
+
+    e_fit = output_relative_error(
+        Ws, sparse_lowrank_whitened(Ws, Hs, 4, 6, refit=True)[0], Hs)
+    e_raw = output_relative_error(
+        Ws, sparse_lowrank_whitened(Ws, Hs, 4, 6, refit=False)[0], Hs)
+    assert e_fit <= e_raw + 1e-12, "exact refit lost to raw magnitude values"
+
+    prev = None
+    for it in (1, 2, 3, 5, 8):
+        e_it = output_relative_error(
+            Ws, sparse_lowrank_whitened(Ws, Hs, 4, 4, iters=it)[0], Hs)
+        assert prev is None or e_it <= prev + 1e-12, f"iters={it} regressed"
+        prev = e_it
+
+    # Indices are charged, so a nonzero costs strictly more than a value.
+    c_vals = sparse_lowrank_params(64, 64, 0, 8, value_bits=16, index_bits=0)
+    c_idx = sparse_lowrank_params(64, 64, 0, 8)
+    assert c_vals == 64 * 8 and c_idx > c_vals, "sparse indices were not charged"
+    print(f"  sparse+LR: endpoints exact, never worse than whitened LR, "
+          f"refit {e_fit:.4f} vs raw {e_raw:.4f}")
+    print(f"         a nonzero costs {c_idx / c_vals:.3f} parameter-equivalents "
+          f"(value + index), not 1.0")
 
     print("\nACTIVATION SMOKE PASSED")
 
