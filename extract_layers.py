@@ -96,10 +96,31 @@ def main():
 
     print(f"Loading '{args.model}'"
           f"{' (local files only)' if args.local_files_only else ''} ...")
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model, torch_dtype=DTYPES[args.dtype],
-        trust_remote_code=args.trust_remote_code, revision=args.revision,
-        local_files_only=args.local_files_only)
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model, torch_dtype=DTYPES[args.dtype],
+            trust_remote_code=args.trust_remote_code, revision=args.revision,
+            local_files_only=args.local_files_only)
+    except Exception as exc:                                     # noqa: BLE001
+        hint = ""
+        d = Path(args.model)
+        if d.is_dir():
+            have = sorted(f.name for f in d.iterdir() if f.is_file())
+            hint = (f"\n'{d}' contains: {have or '(no files)'}\n"
+                    f"A loadable model directory needs config.json (with a "
+                    f"model_type key) and the weights.")
+        raise SystemExit(
+            f"Could not load a model from '{args.model}':\n"
+            f"  {type(exc).__name__}: {exc}{hint}\n\n"
+            f"If this local copy is incomplete, either load from the Hub id, which\n"
+            f"resolves from your local HF cache and needs no network:\n"
+            f"  python extract_layers.py HuggingFaceTB/SmolLM2-135M --local-files-only ...\n"
+            f"or re-save a complete copy from that cache first:\n"
+            f"  python -c \"from transformers import AutoModelForCausalLM, AutoTokenizer as T; "
+            f"m='HuggingFaceTB/SmolLM2-135M'; o='{args.model}'; "
+            f"AutoModelForCausalLM.from_pretrained(m, local_files_only=True).save_pretrained(o); "
+            f"T.from_pretrained(m, local_files_only=True).save_pretrained(o)\""
+        ) from exc
     model.eval()
 
     layers = select(model, args.include, args.exclude, args.types, args.depths)
