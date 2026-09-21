@@ -811,10 +811,25 @@ the whitened SVD of SVD-LLM / ASVD. Two properties decide what is implementable:
   gate. With `H` in the middle that equivalence breaks, so an output-error
   objective belongs on the gradient path, not the explicit sweep.
 
+Capturing `H` needs activations, so it needs token *ids* -- never a tokenizer
+and never the Hub. The model is loaded directly (not through the benchmark loader),
+so a local save with missing or unconvertible tokenizer files cannot block it, and
+the ids can come from `--token-ids` (fully offline), `--text-file`, a `--tokenizer`
+pointed somewhere that works (a Hub id resolves from the local HF cache), or the
+default Hub dataset.
+
 ```bash
 # 1. capture H over calibration text (needs the model)
 python activation_aware.py capture models/SmolLM2-135M --local-files-only \
     --types k_proj o_proj q_proj v_proj --depths 10 15 20 --out cov/
+
+# ... if the local save has no usable tokenizer, borrow one from the HF cache
+python activation_aware.py capture models/SmolLM2-135M --local-files-only \
+    --tokenizer HuggingFaceTB/SmolLM2-135M --out cov/
+
+# ... or skip tokenization entirely with pre-tokenized ids (no tokenizer, no Hub)
+python activation_aware.py capture models/SmolLM2-135M --local-files-only \
+    --token-ids ids.pt --out cov/
 
 # 2. re-score compressions under both metrics (needs only weights + H)
 python activation_aware.py score --layers-dir models/SmolLM2-135M/layers \
