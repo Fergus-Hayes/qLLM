@@ -403,15 +403,49 @@ def cmd_curve(args):
         if gain == gain and gain > 1.05:
             fired.append((frac, gain))
         print(f"{frac:>9.1%}{lr:>16.4f}{mix:>18.4f}{gain:>9.2f}x")
+    # The question is per layer, not on average: the hypothesis under test is that
+    # *some* layers want a different class at *some* error threshold, and a mean
+    # over layers is exactly the statistic that would hide it.
+    print("\nPer layer: best sparse mix vs whitened low-rank (gain at each budget)")
+    print(f"{'layer':<20}{'depth':>6}" + "".join(f"{f:>9.1%}" for f in args.budgets))
+    per_layer = {}
+    for name, W in layers:
+        lt, dep = parse_layer_info(name)
+        cells = []
+        for frac in args.budgets:
+            def _best(mths):
+                c = [r["output_err"] for r in rows
+                     if r["layer_type"] == lt and r["depth"] == dep
+                     and r["method"] in mths and r["param_frac"] <= frac]
+                return min(c) if c else float("nan")
+            lr = _best(("low-rank-whitened",))
+            mix = _best(("sparse", "sparse+low-rank-w"))
+            cells.append(lr / mix if (lr == lr and mix == mix and mix > 0)
+                         else float("nan"))
+        per_layer[(lt, dep)] = cells
+        print(f"{lt:<20}{dep:>6}" + "".join(
+            ("     n/a" if c != c else f"{c:>8.2f}x") for c in cells))
+
     if fired:
         f, g = max(fired, key=lambda t: t[1])
+        won = sorted((k for k, v in per_layer.items()
+                      if any(c == c and c > 1.05 for c in v)),
+                     key=lambda k: -max(c for c in per_layer[k] if c == c))
         print(f"\nVERDICT: sparsity pays -- up to {g:.2f}x lower output error than "
               f"whitened low-rank\n  at the same total parameter count (best at the "
-              f"{f:.1%} budget), indices charged.")
+              f"{f:.1%} budget), indices charged.\n  It wins on {len(won)}/"
+              f"{len(per_layer)} layers"
+              + (f", led by " + ", ".join(f"{lt} d{d}" for lt, d in won[:3])
+                 if won else "") + ".")
     else:
-        print("\nVERDICT: sparsity does not pay. Whitened low-rank is within 5% of "
-              "the best\n  sparse mix at every budget, once nonzeros are charged "
-              "for their indices.")
+        won = [k for k, v in per_layer.items()
+               if any(c == c and c > 1.05 for c in v)]
+        print("\nVERDICT: sparsity does not pay on average. Whitened low-rank is "
+              "within 5% of the\n  best sparse mix at every budget, once nonzeros "
+              f"are charged for their indices.\n  Per layer it still wins on "
+              f"{len(won)}/{len(per_layer)}"
+              + (": " + ", ".join(f"{lt} d{d}" for lt, d in won[:5]) if won
+                 else " -- nowhere.") + "")
 
 
 # --------------------------------------------------------------------------- #
