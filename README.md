@@ -836,6 +836,20 @@ python activation_aware.py score --layers-dir models/SmolLM2-135M/layers \
     --cov cov/ --out activation_aware.csv
 ```
 
+`curve` (Phase B) sweeps each method on its own grid and lays them on a common
+parameter axis, so "what does this budget buy" is read off directly without any
+matching. The whitened rank-`r` map costs exactly `r*(m+n)`, the same as any
+rank-`r` factorization -- `W' = trunc(W H^(1/2)) H^(-1/2)` is still rank `r` and the
+`H^(-1/2)` is absorbed into the right factor at build time -- so the whitening is a
+compile-time change of objective with no runtime cost. Being the exact optimum of
+the H-weighted error, it also lower-bounds what *any* rank-`r` method can reach on
+the output metric.
+
+```bash
+python activation_aware.py curve --layers-dir models/SmolLM2-135M/layers \
+    --cov cov/ --budgets 0.01 0.05 0.1 0.25 0.5 --out activation_curve.csv
+```
+
 `score` reports, per layer and bond dimension, the Frobenius error next to the
 output error, and -- at matched parameter count -- the best plain low-rank
 approximation against the best **whitened** one. Read the **whitening gain**, not

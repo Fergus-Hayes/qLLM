@@ -250,6 +250,93 @@ def cmd_score(args):
               f"worth building (Phase B/C).")
 
 
+# --------------------------------------------------------------------------- #
+def cmd_curve(args):
+    """Output error against parameter count, for each method on its own grid.
+
+    No budget matching is needed: both families are sampled densely and laid on a
+    common parameter axis, so "what does budget X buy" is read off directly.
+
+    A whitened rank-r map costs exactly ``r*(m+n)``, the same as any rank-r
+    factorization -- ``W' = trunc(W H^(1/2)) H^(-1/2)`` is still rank r, and the
+    ``H^(-1/2)`` is absorbed into the right factor at build time. The whitening is a
+    compile-time change of objective, not a runtime cost, and because it is the
+    exact optimum of the H-weighted error it is a hard lower bound on what *any*
+    rank-r approximation can achieve on the output metric.
+    """
+    from safetensors.torch import load_file
+
+    from qllm.compactifai import log_spaced_ints
+
+    covdir = Path(args.cov)
+    cov = {}
+    for r in csv.DictReader(open(covdir / "manifest.csv")):
+        cov[r["param_name"]] = next(iter(load_file(covdir / r["file"]).values()))
+    layers = [(n, w) for n, w in _load_layers(args) if n in cov]
+    if not layers:
+        raise SystemExit("No layer had a matching covariance.")
+
+    rows = []
+    for name, W in layers:
+        lt, dep = parse_layer_info(name)
+        H = cov[name]
+        m, n = int(W.shape[0]), int(W.shape[1])
+        dense = m * n
+        plan = make_plan(W, "qubit", 0)
+
+        ranks = sorted(set(log_spaced_ints(1, min(m, n), args.points)))
+        for r in ranks:
+            for tag, fn in (("low-rank", low_rank_frobenius),
+                            ("low-rank-whitened", None)):
+                approx = (low_rank_whitened(W, H, r, args.damp) if fn is None
+                          else fn(W, r))
+                rows.append(dict(layer_type=lt, depth=dep, method=tag, knob=r,
+                                 params=r * (m + n), dense=dense,
+                                 param_frac=round(r * (m + n) / dense, 5),
+                                 output_err=round(output_relative_error(W, approx, H), 6),
+                                 frob_err=round(float(relative_error(W, approx)), 6)))
+        for chi in sorted(set(log_spaced_ints(1, plan.max_chi, args.points))):
+            approx, cpar = plan_compress(W, plan, chi)
+            rows.append(dict(layer_type=lt, depth=dep, method="mpo", knob=chi,
+                             params=int(cpar), dense=dense,
+                             param_frac=round(cpar / dense, 5),
+                             output_err=round(output_relative_error(W, approx, H), 6),
+                             frob_err=round(float(relative_error(W, approx)), 6)))
+        print(f"  {lt:<18} d{dep:<3} {m}x{n}: "
+              f"{len(ranks)} ranks + {args.points} chi", flush=True)
+
+    with open(args.out, "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    print(f"\nWrote {len(rows)} rows to {Path(args.out).resolve()}")
+
+    # What each budget actually buys: the best point a method reaches without
+    # exceeding it. Budgets are fractions of the dense layer.
+    import statistics as st
+    methods = ["mpo", "low-rank", "low-rank-whitened"]
+    print(f"\nBest output error at or under a parameter budget "
+          f"(mean over {len(layers)} layers)")
+    print(f"{'budget':>10}" + "".join(f"{mth:>21}" for mth in methods))
+    for frac in args.budgets:
+        cells = []
+        for mth in methods:
+            vals = []
+            for name, W in layers:
+                lt, dep = parse_layer_info(name)
+                cand = [r["output_err"] for r in rows
+                        if r["layer_type"] == lt and r["depth"] == dep
+                        and r["method"] == mth and r["param_frac"] <= frac]
+                if cand:
+                    vals.append(min(cand))
+            cells.append(st.mean(vals) if vals else float("nan"))
+        line = f"{frac:>9.1%}" + "".join(f"{c:>21.4f}" for c in cells)
+        print(line)
+    print("\n(low-rank-whitened is the exact optimum of the output error over all "
+          "rank-r maps,\n so it lower-bounds every rank-r method; it costs the same "
+          "r*(m+n) as plain low-rank.)")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -290,6 +377,20 @@ def main():
                    help="relative damping for H^(-1/2) in the whitened low-rank build")
     s.add_argument("--out", default="activation_aware.csv")
     s.set_defaults(func=cmd_score)
+
+    cu = sub.add_parser("curve", help="output error vs parameter count per method")
+    cu.add_argument("--layers-dir", required=True)
+    cu.add_argument("--cov", required=True)
+    cu.add_argument("--types", nargs="+", default=None)
+    cu.add_argument("--depths", type=int, nargs="+", default=None)
+    cu.add_argument("--points", type=int, default=12,
+                    help="grid points per method (log spaced)")
+    cu.add_argument("--budgets", type=float, nargs="+",
+                    default=[0.01, 0.05, 0.10, 0.25, 0.50],
+                    help="parameter budgets as a fraction of the dense layer")
+    cu.add_argument("--damp", type=float, default=1e-6)
+    cu.add_argument("--out", default="activation_curve.csv")
+    cu.set_defaults(func=cmd_curve)
 
     args = ap.parse_args()
     return args.func(args)

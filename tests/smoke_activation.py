@@ -75,6 +75,14 @@ def main():
         assert abs(got - bound) < 1e-6, (r, got, bound)
     print("  whitened low-rank attains the Eckart-Young bound for the H-weighted error")
 
+    # The whitening must be free at runtime: W' = trunc(W H^(1/2)) H^(-1/2) is still
+    # rank r, so it deploys as an r*(m+n) factorization exactly like plain low-rank.
+    # If this failed, every parameter count in the Phase-B curve would be wrong.
+    for r in (2, 6, 12):
+        got = torch.linalg.matrix_rank(low_rank_whitened(W, H, r), tol=1e-8)
+        assert int(got) == r, f"whitened rank-{r} has rank {int(got)}"
+    print("  whitened low-rank stays exactly rank r (so it costs the same r*(m+n))")
+
     # --- 4. isotropic H: output metric == Frobenius, whitening is a no-op ---
     eye = torch.eye(W.shape[1], dtype=torch.float64)
     assert abs(output_relative_error(W, Wp, eye) - relative_error(W, Wp)) < 1e-6
