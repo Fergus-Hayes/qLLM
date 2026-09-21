@@ -381,7 +381,14 @@ def _bond_entropy(v: torch.Tensor) -> float:
 
 
 def _head_share(v: torch.Tensor, head_dim: int) -> float:
-    """Energy fraction in the single strongest head block."""
+    """Energy fraction in the single strongest head block.
+
+    Only meaningful where the register really is split into attention heads. MLP
+    projections have no head structure, so pass ``head_dim=0`` there and this
+    returns NaN rather than an arbitrary blocking of the coordinates.
+    """
+    if head_dim <= 1:
+        return float("nan")
     n = v.numel() // head_dim
     if n < 2:
         return float("nan")
@@ -404,8 +411,9 @@ def _null_stats(dim: int, head_dim: int, reps: int, seed: int, cache={}):
         be.append(_bond_entropy(v))
         hs.append(_head_share(v, head_dim))
     import statistics as st
+    hs = [x for x in hs if x == x]
     out = {"participation": st.mean(pr), "bond_entropy": st.mean(be),
-           "head_share": st.mean(hs)}
+           "head_share": st.mean(hs) if hs else float("nan")}
     cache[key] = out
     return out
 
@@ -447,7 +455,9 @@ def cmd_vectors(args):
                 pr = sum(_participation(v) for v in vecs) / r
                 be = sum(_bond_entropy(v) for v in vecs) / r
                 hs = sum(_head_share(v, args.head_dim) for v in vecs) / r
+                kept = (1 << int(math.floor(math.log2(dim)))) / dim
                 rows.append(dict(layer_type=lt, depth=dep, side=side, rank=r, dim=dim,
+                                 crop_kept=round(kept, 3),
                                  participation=round(pr, 2),
                                  participation_ratio=round(pr / null["participation"], 4),
                                  bond_entropy=round(be, 4),
@@ -465,30 +475,45 @@ def cmd_vectors(args):
     print(f"\nWrote {len(rows)} rows to {Path(args.out).resolve()}")
 
     import statistics as st
-    pr = st.mean(r["participation_ratio"] for r in rows)
-    be = st.mean(r["bond_entropy_ratio"] for r in rows)
-    hs = st.mean(r["head_share_ratio"] for r in rows)
-    print(f"\nvs Haar-random null:  sparsity {pr:.2f}x   bond entropy {be:.2f}x   "
-          f"head concentration {hs:.2f}x")
+
+    def _m(sel, key):
+        v = [r[key] for r in sel if r[key] == r[key]]
+        return st.mean(v) if v else float("nan")
+
+    # Broken down by layer type: the question is whether SOME layers admit a
+    # cheaper-than-r*(m+n) encoding, not whether the average does.
+    print(f"\n{'layer type':<20}{'sparsity':>11}{'bond entropy':>15}{'head conc.':>13}"
+          f"{'best bond ent @ rank>=4':>26}")
+    verdicts = {}
+    for lt in sorted({r["layer_type"] for r in rows}):
+        sel = [r for r in rows if r["layer_type"] == lt]
+        deep = [r["bond_entropy_ratio"] for r in sel if r["rank"] >= 4]
+        best = min(deep) if deep else float("nan")
+        print(f"{lt:<20}{_m(sel, 'participation_ratio'):>10.2f}x"
+              f"{_m(sel, 'bond_entropy_ratio'):>14.2f}x"
+              f"{_m(sel, 'head_share_ratio'):>12.2f}x{best:>25.2f}x")
+        verdicts[lt] = best
     print("(sparsity and bond entropy BELOW 1 mean structure; head concentration "
-          "ABOVE 1 means structure)")
-    structured = (pr < 0.8) or (be < 0.8) or (hs > 1.25)
-    if structured:
-        which = []
-        if pr < 0.8:
-            which.append(f"sparse ({pr:.2f}x)")
-        if be < 0.8:
-            which.append(f"low-entanglement ({be:.2f}x)")
-        if hs > 1.25:
-            which.append(f"head-concentrated ({hs:.2f}x)")
-        print(f"\nVERDICT: the dominant subspace is {', '.join(which)} -- it can "
-              f"plausibly be encoded for less than r*(m+n), so an informed ansatz "
-              f"could beat the whitened low-rank bound.")
+          "ABOVE 1 means structure.\n head concentration is NaN where --head-dim 0 "
+          "disabled it, e.g. MLP layers with no heads.)")
+
+    # Only bond entropy at a USEFUL rank decides whether a circuit/ancilla ansatz
+    # can pay: sparsity is a classical encoding, and rank 1 is too inaccurate to
+    # matter. A ratio here of ~0.4 or below is the threshold worth chasing.
+    good = {lt: b for lt, b in verdicts.items() if b == b and b <= 0.4}
+    print("\nDeciding quantity -- lowest bond entropy at rank >= 4, per layer type:")
+    if good:
+        print("  candidates for a circuit / ancilla ansatz: "
+              + ", ".join(f"{lt} ({b:.2f}x)" for lt, b in sorted(good.items())))
+        print("  these vectors are low-entanglement at a rank that matters, so they "
+              "could plausibly\n  be produced by a shallow circuit for less than one "
+              "parameter per entry.")
     else:
-        print("\nVERDICT: the dominant singular vectors look generic against the "
-              "random null. There is no structure left for an ansatz to exploit, so "
-              "whitened low-rank is the right answer under Q=1 pricing and no "
-              "circuit or tensor-network ansatz will beat it.")
+        b = min((v for v in verdicts.values() if v == v), default=float("nan"))
+        print(f"  none below 0.4x (best {b:.2f}x). At the ranks that deliver useful "
+              f"MSE the dominant\n  vectors are near-generic, so a shallow circuit "
+              f"cannot encode them cheaply and the\n  saving an ancilla ansatz could "
+              f"offer is small.")
 
 
 def main():

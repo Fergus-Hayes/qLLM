@@ -106,6 +106,35 @@ def main():
     print(f"  anisotropic H: stable rank {spec['stable_rank']:.1f}/{d}, "
           f"headroom {head:.2f}x, whitening gain {an_f/an_w:.2f}x")
 
+    # --- 6. structure measures: calibration against known vectors ----------
+    # These decide the ancilla/circuit verdict, so they must separate "sparse"
+    # from "low-entanglement" -- the two are easily conflated and imply very
+    # different encodings (a few index/value pairs vs an MPS).
+    import activation_aware as AA
+    dd, hd = 512, 64
+    nul = AA._null_stats(dd, hd, 64, 0)
+    def meas(v):
+        v = v / torch.linalg.norm(v)
+        return (AA._participation(v) / nul["participation"],
+                AA._bond_entropy(v) / nul["bond_entropy"],
+                AA._head_share(v, hd) / nul["head_share"])
+    onehot = torch.zeros(dd, dtype=torch.float64)
+    onehot[7] = 1.0
+    sp, be, _hsx = meas(onehot)
+    assert sp < 0.05 and be < 0.05, (sp, be)
+    prod = torch.tensor([1.0], dtype=torch.float64)
+    for _ in range(9):
+        prod = torch.kron(prod, torch.randn(2, dtype=torch.float64))
+    sp_p, be_p, _ = meas(prod)
+    assert be_p < 0.02, f"product state must read ~0 bond entropy, got {be_p}"
+    assert sp_p > 0.05, "a product state is NOT sparse -- the measures must differ"
+    sp_r, be_r, hs_r = meas(torch.randn(dd, dtype=torch.float64))
+    assert 0.8 < sp_r < 1.2 and 0.8 < be_r < 1.2, (sp_r, be_r)
+    assert AA._head_share(torch.randn(dd, dtype=torch.float64), 0) != \
+        AA._head_share(torch.randn(dd, dtype=torch.float64), 0), "head_dim=0 -> NaN"
+    print(f"  structure measures: one-hot {sp:.3f}x/{be:.3f}x, product state "
+          f"{sp_p:.2f}x sparsity but {be_p:.3f}x bond entropy, Haar {sp_r:.2f}x/{be_r:.2f}x")
+
     print("\nACTIVATION SMOKE PASSED")
 
 
