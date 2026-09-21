@@ -610,7 +610,7 @@ def cmd_magic(args):
               "pursuing.")
     else:
         b = min((v for v in lowest.values() if v == v), default=float("nan"))
-        print(f"\nVERDICT: no stabilizer structure (lowest {b:.2f}x of the Haar null). "
+        print(f"\nVERDICT: no stabilizer structure (lowest {b:.2f}x of the matched null). "
               f"The dominant\n  subspace is generic in magic as well as in "
               f"entanglement and sparsity, closing the\n  one identified blind spot "
               f"in the earlier analysis.")
