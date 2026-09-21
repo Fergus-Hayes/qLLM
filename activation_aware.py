@@ -481,6 +481,23 @@ def cmd_curve(args):
           "lower bound;\n  raise --points / --sparse-points to sharpen it. The "
           "sparse grids stop at the largest\n  budget, so n/a there means "
           "'not within that budget', not 'not reachable'.)")
+    # An n/a that only the grid cap caused is the one case where the table is
+    # silent about a layer the reader most wants an answer for, so say so.
+    blocked = [(t, sum(1 for lt, dp in keys
+                       if _cheapest(lt, dp, ("low-rank-whitened",), t) ==
+                       _cheapest(lt, dp, ("low-rank-whitened",), t)
+                       and _cheapest(lt, dp, ("sparse", "sparse+low-rank-w"), t)
+                       != _cheapest(lt, dp, ("sparse", "sparse+low-rank-w"), t)))
+               for t in args.thresholds]
+    blocked = [(t, c) for t, c in blocked if c]
+    if blocked:
+        worst = max(c for _t, c in blocked)
+        print(f" NOTE: whitened low-rank reaches targets the sparse grid cannot "
+              f"even be priced at\n  (up to {worst} layer(s), at "
+              + ", ".join(f"{t:.2f}" for t, _c in blocked)
+              + f"). That is the --budgets cap of "
+              f"{max(args.budgets):.0%},\n  not a property of the method: "
+              f"re-run with a larger top budget to settle those rows.")
 
     if fired:
         f, g = max(fired, key=lambda t: t[1])
