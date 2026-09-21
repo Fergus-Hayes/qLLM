@@ -426,6 +426,62 @@ def cmd_curve(args):
         print(f"{lt:<20}{dep:>6}" + "".join(
             ("     n/a" if c != c else f"{c:>8.2f}x") for c in cells))
 
+    print(" (below 1.00x is possible and expected: the never-worse guarantee holds "
+          "at equal RANK,\n  not at equal BUDGET -- the index charge means a mix "
+          "has to spend down its rank to fit.)")
+
+    # The inverse reading, and the one the stated goal actually names: fix an
+    # output-error threshold and ask what the cheapest way to reach it costs. The
+    # budget table answers "given P parameters, what error"; this answers "given an
+    # error, how few parameters" -- which is the question when the threshold is set
+    # by what the model can tolerate rather than by a parameter target.
+    def _cheapest(lt, dep, mths, tgt):
+        c = [r["param_frac"] for r in rows
+             if r["layer_type"] == lt and r["depth"] == dep
+             and r["method"] in mths and r["output_err"] <= tgt]
+        return min(c) if c else float("nan")
+
+    keys = [parse_layer_info(name) for name, _W in layers]
+    print(f"\nCheapest parameter fraction reaching an output-error threshold "
+          f"(mean over layers\nthat reach it at all; n = how many of "
+          f"{len(keys)} do)")
+    print(f"{'target':>10}" + "".join(f"{mth:>21}" for mth in methods))
+    for tgt in args.thresholds:
+        cells = []
+        for mth in methods:
+            v = [x for x in (_cheapest(lt, dp, (mth,), tgt) for lt, dp in keys)
+                 if x == x]
+            cells.append((st.mean(v), len(v)) if v else (float("nan"), 0))
+        print(f"{tgt:>10.3f}" + "".join(
+            ("                  n/a" if c != c else f"{c:>16.4f} (n={k:>2})")
+            for c, k in cells))
+
+    # Head to head at matched error, on the layers where both classes get there --
+    # averaging a saving over layers only one of them reaches would be meaningless.
+    print("\nParameter saving of the best sparse mix over whitened low-rank, "
+          "at matched error")
+    print(f"{'layer':<20}{'depth':>6}" + "".join(f"{t:>9.3f}" for t in args.thresholds))
+    saving = {}
+    for lt, dp in keys:
+        cells = []
+        for tgt in args.thresholds:
+            a = _cheapest(lt, dp, ("low-rank-whitened",), tgt)
+            b = _cheapest(lt, dp, ("sparse", "sparse+low-rank-w"), tgt)
+            cells.append(a / b if (a == a and b == b and b > 0) else float("nan"))
+        saving[(lt, dp)] = cells
+        print(f"{lt:<20}{dp:>6}" + "".join(
+            ("     n/a" if c != c else f"{c:>8.2f}x") for c in cells))
+    means = []
+    for i, tgt in enumerate(args.thresholds):
+        v = [saving[k][i] for k in keys if saving[k][i] == saving[k][i]]
+        means.append(st.mean(v) if v else float("nan"))
+    print(f"{'MEAN':<20}{'':>6}" + "".join(
+        ("     n/a" if c != c else f"{c:>8.2f}x") for c in means))
+    print(" (a saving is quantised by the log-spaced grid, so each figure is a "
+          "lower bound;\n  raise --points / --sparse-points to sharpen it. The "
+          "sparse grids stop at the largest\n  budget, so n/a there means "
+          "'not within that budget', not 'not reachable'.)")
+
     if fired:
         f, g = max(fired, key=lambda t: t[1])
         won = sorted((k for k, v in per_layer.items()
@@ -774,6 +830,10 @@ def main():
     cu.add_argument("--budgets", type=float, nargs="+",
                     default=[0.01, 0.05, 0.10, 0.25, 0.50],
                     help="parameter budgets as a fraction of the dense layer")
+    cu.add_argument("--thresholds", type=float, nargs="+",
+                    default=[0.50, 0.30, 0.20, 0.10],
+                    help="output-error targets for the inverse table: how few "
+                         "parameters does each method need to reach them")
     cu.add_argument("--damp", type=float, default=1e-6)
     cu.add_argument("--sparse-points", type=int, default=7,
                     help="grid points for rank and for nnz/row in the sparse mix "

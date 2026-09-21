@@ -869,6 +869,14 @@ values would hand sparsity a free ride in exactly the way counting a quantum gat
 as free would, and the budget axis has to stay one number that every method spends
 from. `--value-bits` and `--index-bits` set the convention; the run prints it.
 
+The run prints the comparison along both axes. The budget tables read "given `P`
+parameters, what error"; the **threshold** tables (`--thresholds`) read the inverse,
+"given an error, how few parameters" -- which is the question when the tolerance is
+set by what the model can take rather than by a parameter target. A per-layer gain
+below `1.00x` in the budget table is expected, not a bug: the never-worse guarantee
+holds at equal **rank**, not at equal **budget**, and the index charge forces a mix
+to spend down its rank to fit.
+
 
 `score` reports, per layer and bond dimension, the Frobenius error next to the
 output error, and -- at matched parameter count -- the best plain low-rank
