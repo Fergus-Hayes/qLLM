@@ -21,11 +21,13 @@ output error and the reference any activation-aware scheme must beat.
 """
 import argparse
 import csv
+import math
 from pathlib import Path
 
 import torch
 
 from qllm.activation_stats import (
+    _sqrt_and_inv,
     covariance_spectrum,
     input_covariance,
     low_rank_frobenius,
@@ -337,6 +339,158 @@ def cmd_curve(args):
           "r*(m+n) as plain low-rank.)")
 
 
+# --------------------------------------------------------------------------- #
+def _crop_pow2(v: torch.Tensor):
+    """Largest power-of-two prefix of a vector, and its qubit count."""
+    q = int(math.floor(math.log2(v.numel())))
+    return v[: 1 << q].contiguous(), q
+
+
+def _participation(v: torch.Tensor) -> float:
+    """Effective number of entries carrying the vector's energy (inverse Simpson).
+
+    Equals ``len(v)`` for a perfectly spread vector and 1 for a spike, so
+    ``participation / len`` is a scale-free sparsity score.
+    """
+    p = (v.double() ** 2)
+    tot = float(p.sum())
+    if tot <= 0:
+        return float("nan")
+    p = p / tot
+    return float(1.0 / (p ** 2).sum())
+
+
+def _bond_entropy(v: torch.Tensor) -> float:
+    """Entanglement entropy of a vector across a balanced qubit cut (bits).
+
+    A vector that factorizes over the qubit register has entropy 0 and can be
+    stored as a small MPS / produced by a shallow circuit; a generic vector is
+    near-maximal. This is what decides whether the important subspace can be
+    encoded for less than one parameter per entry.
+    """
+    w, q = _crop_pow2(v)
+    nrm = float(torch.linalg.norm(w.double()))
+    if nrm <= 0 or q < 2:
+        return float("nan")
+    a = q // 2
+    m = (w.double() / nrm).reshape(1 << a, -1)
+    sv = torch.linalg.svdvals(m).clamp_min(0)
+    p = (sv ** 2)
+    p = p[p > 1e-15]
+    return float(-(p * p.log2()).sum())
+
+
+def _head_share(v: torch.Tensor, head_dim: int) -> float:
+    """Energy fraction in the single strongest head block."""
+    n = v.numel() // head_dim
+    if n < 2:
+        return float("nan")
+    e = (v.double()[: n * head_dim] ** 2).reshape(n, head_dim).sum(1)
+    tot = float(e.sum())
+    return float(e.max() / tot) if tot > 0 else float("nan")
+
+
+def _null_stats(dim: int, head_dim: int, reps: int, seed: int, cache={}):
+    """Same measures on Haar-random unit vectors of the same length."""
+    key = (dim, head_dim, reps, seed)
+    if key in cache:
+        return cache[key]
+    g = torch.Generator().manual_seed(seed)
+    pr, be, hs = [], [], []
+    for _ in range(reps):
+        v = torch.randn(dim, generator=g, dtype=torch.float64)
+        v = v / torch.linalg.norm(v)
+        pr.append(_participation(v))
+        be.append(_bond_entropy(v))
+        hs.append(_head_share(v, head_dim))
+    import statistics as st
+    out = {"participation": st.mean(pr), "bond_entropy": st.mean(be),
+           "head_share": st.mean(hs)}
+    cache[key] = out
+    return out
+
+
+def cmd_vectors(args):
+    """Are the top singular vectors of W H^(1/2) structured?
+
+    Whitened low-rank is the exact optimum over rank-r maps, so beating it means
+    encoding the same dominant subspace for less than the r*(m+n) parameters a
+    factorization costs. That is possible only if the leading singular vectors are
+    themselves structured -- concentrated on few entries, confined to a head block,
+    or low-entanglement across the qubit register. Each is measured against a
+    Haar-random null of the same length: a ratio near 1 means the vector looks
+    generic and nothing structured can encode it more cheaply.
+    """
+    from safetensors.torch import load_file
+
+    covdir = Path(args.cov)
+    cov = {}
+    for r in csv.DictReader(open(covdir / "manifest.csv")):
+        cov[r["param_name"]] = next(iter(load_file(covdir / r["file"]).values()))
+    layers = [(n, w) for n, w in _load_layers(args) if n in cov]
+    if not layers:
+        raise SystemExit("No layer had a matching covariance.")
+
+    rows = []
+    print(f"{'layer':<17}{'d':>3}{'side':>7}{'rank':>6}{'sparsity':>11}"
+          f"{'bond ent':>11}{'head':>8}   (x null)")
+    for name, W in layers:
+        lt, dep = parse_layer_info(name)
+        S, _inv = _sqrt_and_inv(cov[name], args.damp)
+        u, sv, vh = torch.linalg.svd(W.double() @ S, full_matrices=False)
+        for side, mat in (("left(U)", u.T), ("right(V)", vh)):
+            dim = mat.shape[1]
+            null = _null_stats(dim, args.head_dim, args.null_reps, args.seed)
+            for r in args.ranks:
+                r = min(r, mat.shape[0])
+                vecs = [mat[i] for i in range(r)]
+                pr = sum(_participation(v) for v in vecs) / r
+                be = sum(_bond_entropy(v) for v in vecs) / r
+                hs = sum(_head_share(v, args.head_dim) for v in vecs) / r
+                rows.append(dict(layer_type=lt, depth=dep, side=side, rank=r, dim=dim,
+                                 participation=round(pr, 2),
+                                 participation_ratio=round(pr / null["participation"], 4),
+                                 bond_entropy=round(be, 4),
+                                 bond_entropy_ratio=round(be / null["bond_entropy"], 4),
+                                 head_share=round(hs, 4),
+                                 head_share_ratio=round(hs / null["head_share"], 4)))
+                print(f"{lt:<17}{dep:>3}{side:>7}{r:>6}"
+                      f"{pr / null['participation']:>10.2f}x"
+                      f"{be / null['bond_entropy']:>10.2f}x"
+                      f"{hs / null['head_share']:>7.2f}x")
+    with open(args.out, "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    print(f"\nWrote {len(rows)} rows to {Path(args.out).resolve()}")
+
+    import statistics as st
+    pr = st.mean(r["participation_ratio"] for r in rows)
+    be = st.mean(r["bond_entropy_ratio"] for r in rows)
+    hs = st.mean(r["head_share_ratio"] for r in rows)
+    print(f"\nvs Haar-random null:  sparsity {pr:.2f}x   bond entropy {be:.2f}x   "
+          f"head concentration {hs:.2f}x")
+    print("(sparsity and bond entropy BELOW 1 mean structure; head concentration "
+          "ABOVE 1 means structure)")
+    structured = (pr < 0.8) or (be < 0.8) or (hs > 1.25)
+    if structured:
+        which = []
+        if pr < 0.8:
+            which.append(f"sparse ({pr:.2f}x)")
+        if be < 0.8:
+            which.append(f"low-entanglement ({be:.2f}x)")
+        if hs > 1.25:
+            which.append(f"head-concentrated ({hs:.2f}x)")
+        print(f"\nVERDICT: the dominant subspace is {', '.join(which)} -- it can "
+              f"plausibly be encoded for less than r*(m+n), so an informed ansatz "
+              f"could beat the whitened low-rank bound.")
+    else:
+        print("\nVERDICT: the dominant singular vectors look generic against the "
+              "random null. There is no structure left for an ansatz to exploit, so "
+              "whitened low-rank is the right answer under Q=1 pricing and no "
+              "circuit or tensor-network ansatz will beat it.")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -391,6 +545,19 @@ def main():
     cu.add_argument("--damp", type=float, default=1e-6)
     cu.add_argument("--out", default="activation_curve.csv")
     cu.set_defaults(func=cmd_curve)
+
+    ve = sub.add_parser("vectors", help="is the dominant whitened subspace structured?")
+    ve.add_argument("--layers-dir", required=True)
+    ve.add_argument("--cov", required=True)
+    ve.add_argument("--types", nargs="+", default=None)
+    ve.add_argument("--depths", type=int, nargs="+", default=None)
+    ve.add_argument("--ranks", type=int, nargs="+", default=[1, 4, 16])
+    ve.add_argument("--head-dim", type=int, default=64)
+    ve.add_argument("--null-reps", type=int, default=64)
+    ve.add_argument("--damp", type=float, default=1e-6)
+    ve.add_argument("--seed", type=int, default=0)
+    ve.add_argument("--out", default="activation_vectors.csv")
+    ve.set_defaults(func=cmd_vectors)
 
     args = ap.parse_args()
     return args.func(args)
