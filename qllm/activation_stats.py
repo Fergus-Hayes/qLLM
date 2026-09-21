@@ -146,3 +146,59 @@ def low_rank_whitened(weight: torch.Tensor, cov: torch.Tensor, rank: int,
     s_mat, s_inv = _sqrt_and_inv(cov, damp)
     w = weight.detach().to(torch.float64).cpu()
     return low_rank_frobenius(w @ s_mat, rank) @ s_inv
+
+
+# --------------------------------------------------------------------------- #
+# Stabilizer structure ("magic")
+# --------------------------------------------------------------------------- #
+# Bond entropy cannot see Clifford structure: a random stabilizer state has
+# near-maximal entanglement across any cut yet needs ZERO continuous parameters.
+# The stabilizer Renyi entropy closes that blind spot. For a pure state, the Pauli
+# spectrum Xi_P = <psi|P|psi>^2 / d is a probability distribution; it is flat over
+# the d elements of the stabilizer group for a stabilizer state (giving M2 = 0) and
+# spread over all 4^n Paulis for a generic state (giving M2 > 0).
+def _pauli_coefficients(rho: torch.Tensor) -> torch.Tensor:
+    """All 4^n Pauli coefficients of a 2^n x 2^n matrix, by fast transform.
+
+    ``rho = sum_P c_P P``. The change of basis factorizes over qubits, so this is
+    n applications of one 4x4 map rather than a sum over 4^n Paulis -- O(d^2 log d)
+    instead of O(4^n d).
+    """
+    d = rho.shape[0]
+    n = int(round(math.log2(d)))
+    # [m00, m01, m10, m11] -> [c_I, c_X, c_Y, c_Z]
+    t = torch.tensor([[0.5, 0, 0, 0.5],
+                      [0, 0.5, 0.5, 0],
+                      [0, 0.5j, -0.5j, 0],
+                      [0.5, 0, 0, -0.5]], dtype=torch.complex128)
+    x = rho.to(torch.complex128).reshape([2] * (2 * n))
+    x = x.permute(*[i for q in range(n) for i in (q, n + q)]).contiguous()
+    x = x.reshape([4] * n)
+    for ax in range(n):
+        x = torch.movedim(x, ax, 0).reshape(4, -1)
+        x = (t @ x).reshape([4] + [4] * (n - 1))
+        x = torch.movedim(x, 0, ax)
+    return x.reshape(-1)
+
+
+def stabilizer_renyi_entropy(vec: torch.Tensor) -> float:
+    """``M2`` of a real vector, in bits: 0 for a stabilizer state, larger for generic.
+
+    The vector is cropped to the largest power-of-two prefix, as elsewhere. This is
+    the quantity that decides whether a Clifford-like (zero continuous parameter)
+    ansatz could encode the vector -- something entanglement entropy provably
+    cannot detect.
+    """
+    q = int(math.floor(math.log2(vec.numel())))
+    v = vec[: 1 << q].to(torch.float64)
+    nrm = float(torch.linalg.norm(v))
+    if nrm <= 0:
+        return float("nan")
+    v = v / nrm
+    d = v.numel()
+    c = _pauli_coefficients(torch.outer(v, v))
+    xi = d * (c.abs() ** 2)                     # sums to 1 for a pure state
+    s = float((xi ** 2).sum())
+    if s <= 0:
+        return float("nan")
+    return float(-math.log2(s) - math.log2(d))

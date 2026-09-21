@@ -33,6 +33,7 @@ from qllm.activation_stats import (
     low_rank_frobenius,
     low_rank_whitened,
     output_relative_error,
+    stabilizer_renyi_entropy,
 )
 from qllm.compactifai import relative_error
 from qllm.layer_analysis import parse_layer_info
@@ -516,6 +517,94 @@ def cmd_vectors(args):
               f"offer is small.")
 
 
+# --------------------------------------------------------------------------- #
+def _magic_null(dim: int, reps: int, seed: int, cache={}):
+    """Mean M2 of Haar-random real vectors of this length."""
+    key = (dim, reps, seed)
+    if key in cache:
+        return cache[key]
+    g = torch.Generator().manual_seed(seed)
+    import statistics as st
+    vals = [stabilizer_renyi_entropy(torch.randn(dim, generator=g, dtype=torch.float64))
+            for _ in range(reps)]
+    cache[key] = st.mean(vals)
+    return cache[key]
+
+
+def cmd_magic(args):
+    """Do the whitened singular vectors have Clifford (stabilizer) structure?
+
+    Entanglement entropy provably cannot answer this: a random stabilizer state has
+    near-maximal entanglement across any cut yet costs ZERO continuous parameters,
+    so the `vectors` diagnostic reads it as generic. The stabilizer Renyi entropy
+    M2 closes that gap -- it is exactly 0 for a stabilizer state and large for a
+    generic one.
+
+    A ratio near 0 would mean the dominant subspace is Clifford-like and could be
+    prepared essentially for free, which is precisely the class a measurement-based
+    or ancilla-assisted ansatz reaches and the earlier diagnostics were blind to.
+    """
+    from safetensors.torch import load_file
+
+    covdir = Path(args.cov)
+    cov = {}
+    for r in csv.DictReader(open(covdir / "manifest.csv")):
+        cov[r["param_name"]] = next(iter(load_file(covdir / r["file"]).values()))
+    layers = [(n, w) for n, w in _load_layers(args) if n in cov]
+    if not layers:
+        raise SystemExit("No layer had a matching covariance.")
+
+    rows = []
+    print(f"{'layer':<17}{'d':>3}{'side':>9}{'rank':>6}{'M2 (bits)':>12}"
+          f"{'null':>9}{'ratio':>9}")
+    for name, W in layers:
+        lt, dep = parse_layer_info(name)
+        S, _inv = _sqrt_and_inv(cov[name], args.damp)
+        u, sv, vh = torch.linalg.svd(W.double() @ S, full_matrices=False)
+        for side, mat in (("left(U)", u.T), ("right(V)", vh)):
+            dim = mat.shape[1]
+            null = _magic_null(dim, args.null_reps, args.seed)
+            for r in args.ranks:
+                r = min(r, mat.shape[0])
+                vals = [stabilizer_renyi_entropy(mat[i]) for i in range(r)]
+                m2 = sum(vals) / r
+                rows.append(dict(layer_type=lt, depth=dep, side=side, rank=r, dim=dim,
+                                 m2_bits=round(m2, 4), null_bits=round(null, 4),
+                                 magic_ratio=round(m2 / null, 4) if null > 0 else float("nan")))
+                print(f"{lt:<17}{dep:>3}{side:>9}{r:>6}{m2:>12.3f}{null:>9.3f}"
+                      f"{m2 / null:>8.2f}x")
+    with open(args.out, "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    print(f"\nWrote {len(rows)} rows to {Path(args.out).resolve()}")
+
+    import statistics as st
+    print(f"\n{'layer type':<20}{'mean magic ratio':>20}{'lowest @ rank>=4':>20}")
+    lowest = {}
+    for lt in sorted({r["layer_type"] for r in rows}):
+        sel = [r for r in rows if r["layer_type"] == lt]
+        deep = [r["magic_ratio"] for r in sel if r["rank"] >= 4]
+        lo = min(deep) if deep else float("nan")
+        lowest[lt] = lo
+        print(f"{lt:<20}{st.mean(r['magic_ratio'] for r in sel):>19.2f}x{lo:>19.2f}x")
+    print("(0 = a stabilizer state, free to prepare with Clifford gates; "
+          "1 = as generic as Haar random)")
+    cand = {lt: v for lt, v in lowest.items() if v == v and v < 0.5}
+    if cand:
+        print("\nVERDICT: Clifford-like structure in " + ", ".join(
+            f"{lt} ({v:.2f}x)" for lt, v in sorted(cand.items()))
+            + ".\n  The earlier diagnostics were blind to this, and it is exactly what "
+              "an ancilla /\n  measurement-based ansatz can exploit cheaply. Worth "
+              "pursuing.")
+    else:
+        b = min((v for v in lowest.values() if v == v), default=float("nan"))
+        print(f"\nVERDICT: no stabilizer structure (lowest {b:.2f}x of the Haar null). "
+              f"The dominant\n  subspace is generic in magic as well as in "
+              f"entanglement and sparsity, closing the\n  one identified blind spot "
+              f"in the earlier analysis.")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -583,6 +672,18 @@ def main():
     ve.add_argument("--seed", type=int, default=0)
     ve.add_argument("--out", default="activation_vectors.csv")
     ve.set_defaults(func=cmd_vectors)
+
+    mg = sub.add_parser("magic", help="do the whitened vectors have Clifford structure?")
+    mg.add_argument("--layers-dir", required=True)
+    mg.add_argument("--cov", required=True)
+    mg.add_argument("--types", nargs="+", default=None)
+    mg.add_argument("--depths", type=int, nargs="+", default=None)
+    mg.add_argument("--ranks", type=int, nargs="+", default=[1, 4, 8])
+    mg.add_argument("--null-reps", type=int, default=8)
+    mg.add_argument("--damp", type=float, default=1e-6)
+    mg.add_argument("--seed", type=int, default=0)
+    mg.add_argument("--out", default="activation_magic.csv")
+    mg.set_defaults(func=cmd_magic)
 
     args = ap.parse_args()
     return args.func(args)

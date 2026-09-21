@@ -135,6 +135,52 @@ def main():
     print(f"  structure measures: one-hot {sp:.3f}x/{be:.3f}x, product state "
           f"{sp_p:.2f}x sparsity but {be_p:.3f}x bond entropy, Haar {sp_r:.2f}x/{be_r:.2f}x")
 
+    # --- 7. stabilizer Renyi entropy: the blind spot bond entropy cannot see ---
+    # A random stabilizer state has near-maximal entanglement yet costs ZERO
+    # continuous parameters, so M2 must read exactly 0 for it and large for generic
+    # states -- otherwise the Clifford blind spot is not actually closed.
+    from qllm.activation_stats import stabilizer_renyi_entropy as _m2
+    nq = 7
+    dd2 = 1 << nq
+    had = torch.tensor([[1., 1.], [1., -1.]], dtype=torch.float64) / 2 ** 0.5
+
+    def _ap(v, g, q):
+        v = v.reshape(2 ** q, 2, -1)
+        return torch.einsum("ab,ibj->iaj", g, v).reshape(-1)
+
+    def _cx(v, c, t):
+        v = v.reshape([2] * nq).clone()
+        idx = [slice(None)] * nq
+        idx[c] = 1
+        sub = v[tuple(idx)]
+        v[tuple(idx)] = sub.roll(1, dims=(t - 1 if t > c else t))
+        return v.reshape(-1)
+
+    gen = torch.Generator().manual_seed(0)
+    stab = torch.zeros(dd2, dtype=torch.float64)
+    stab[0] = 1.0
+    for _ in range(150):
+        if torch.rand(1, generator=gen).item() < 0.45:
+            stab = _ap(stab, had, int(torch.randint(0, nq, (1,), generator=gen)))
+        else:
+            a, b = torch.randperm(nq, generator=gen)[:2].tolist()
+            stab = _cx(stab, a, b)
+    stab = stab / torch.linalg.norm(stab)
+    m_stab = _m2(stab)
+    basis = torch.zeros(dd2, dtype=torch.float64)
+    basis[3] = 1.0
+    m_haar = _m2(torch.randn(dd2, generator=gen, dtype=torch.float64))
+    assert abs(m_stab) < 1e-6, f"stabilizer state must read M2 = 0, got {m_stab}"
+    assert abs(_m2(basis)) < 1e-6, "computational basis state must read M2 = 0"
+    assert m_haar > 1.0, f"Haar random must carry magic, got {m_haar}"
+    # And the crucial point: entanglement CANNOT tell these apart.
+    be_stab = AA._bond_entropy(stab) / AA._null_stats(dd2, 0, 32, 0)["bond_entropy"]
+    assert be_stab > 0.4, ("a scrambled stabilizer state should look entangled -- "
+                           f"that is the blind spot, got {be_stab}")
+    print(f"  magic: stabilizer M2={m_stab:.2e}, Haar M2={m_haar:.2f} bits; that same "
+          f"stabilizer\n         state reads {be_stab:.2f}x bond entropy (the blind "
+          f"spot bond entropy cannot see)")
+
     print("\nACTIVATION SMOKE PASSED")
 
 
