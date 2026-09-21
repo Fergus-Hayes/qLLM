@@ -184,20 +184,30 @@ def cmd_score(args):
             oe = output_relative_error(W, approx, H)
             # Matched-parameter plain low-rank, scored by the SAME output metric:
             # Frobenius-optimal vs the exact H-weighted optimum (whitened).
-            r = max(1, int(cpar // (W.shape[0] + W.shape[1])))
+            # Rank whose cost r*(m+n) matches the MPO's classical parameters. The
+            # floor at 1 means that at small chi' the rank-1 map is far MORE
+            # expensive than the MPO, so the MPO-vs-low-rank comparison is not
+            # matched there and is flagged; the whitening gain is unaffected, being
+            # frobenius-optimal vs whitened-optimal at the SAME rank.
+            per_rank = W.shape[0] + W.shape[1]
+            r = max(1, int(cpar // per_rank))
+            lr_params = r * per_rank
             lr_f = output_relative_error(W, low_rank_frobenius(W, r), H)
             lr_w = output_relative_error(W, low_rank_whitened(W, H, r, args.damp), H)
             rows.append(dict(layer_type=lt, depth=dep, chi=chi, mpo_params=int(cpar),
-                             lr_rank=r, frob_err=round(fe, 6), output_err=round(oe, 6),
+                             lr_rank=r, lr_params=int(lr_params),
+                             lr_param_ratio=round(lr_params / cpar, 2) if cpar else float("nan"),
+                             matched=bool(lr_params <= 1.25 * cpar), frob_err=round(fe, 6), output_err=round(oe, 6),
                              headroom=round(fe / oe, 4) if oe > 0 else float("nan"),
                              lowrank_frob_outerr=round(lr_f, 6),
                              lowrank_whitened_outerr=round(lr_w, 6),
                              whitening_gain=round(lr_f / lr_w, 4) if lr_w > 0 else float("nan"),
                              stable_rank=round(spec["stable_rank"], 2),
                              rank90=spec["rank90"], rank99=spec["rank99"]))
+            flag = "" if lr_params <= 1.25 * cpar else f"  [LR uses {lr_params/cpar:.0f}x params]"
             print(f"{lt:<17}{dep:>3}{chi:>5}{fe:>11.4f}{oe:>12.4f}"
                   f"{fe/oe if oe>0 else float('nan'):>10.2f}{lr_f:>10.4f}{lr_w:>10.4f}"
-                  f"{lr_f/lr_w if lr_w>0 else float('nan'):>8.2f}")
+                  f"{lr_f/lr_w if lr_w>0 else float('nan'):>8.2f}{flag}")
     with open(args.out, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=list(rows[0]))
         w.writeheader()
@@ -218,7 +228,9 @@ def cmd_score(args):
         hr = st.mean(r["headroom"] for r in sel if r["headroom"] == r["headroom"])
         wg = st.mean(r["whitening_gain"] for r in sel
                      if r["whitening_gain"] == r["whitening_gain"])
-        print(f"{chi:>5}{hr:>12.2f}x{wg:>17.2f}x")
+        nm = sum(1 for r in sel if not r["matched"])
+        note = f"   (MPO vs LR not parameter-matched in {nm}/{len(sel)})" if nm else ""
+        print(f"{chi:>5}{hr:>12.2f}x{wg:>17.2f}x{note}")
         if wg > best_gain:
             best_gain, best_chi = wg, chi
 
