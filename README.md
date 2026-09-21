@@ -786,6 +786,49 @@ sweep within budget:
   always completes, and every row is checkpointed. Pass a smaller `--jobs` up
   front (e.g. `--jobs 6`) to skip the wide first attempt.
 
+### Ansatz structure diagnostics (`analyze_structure.py`)
+
+Before choosing a disentangling ansatz, ask whether the weight matrix has any
+structure an ansatz could exploit. `analyze_structure.py` answers that with no
+training at all: it treats `W` as an operator state on `n_out + n_in` qubits and
+computes the **two-qubit mutual information** `I(a;b)`, split into the three
+blocks that have different remedies here:
+
+| block | meaning | what can fix it |
+| --- | --- | --- |
+| `row-row` | correlations among row qubits | the topology of `U` |
+| `col-col` | correlations among column qubits | the topology of `V` |
+| `row-col` | correlations across the registers | the MPO site pairing / index ordering -- `U`, `V` structurally cannot |
+
+Raw MI is not evidence on its own: a finite random matrix has a nonzero MI floor,
+and zero-padding a 576-row layer into a 1024 box is itself structure. So every
+run also measures a **matched null** -- Gaussian matrices of the same shape, padded
+identically -- and reports `mi_*_ratio = signal / null`. Only a ratio meaningfully
+above 1 is structure. `--crop-pow2` cross-checks on the largest power-of-two
+sub-block, which has no padding at all (and keeps a whole number of heads when
+`head_dim` is a power of two).
+
+Because `head_dim` is typically a power of two (SmolLM2: 64 = 2^6), the qubit
+factorization already aligns with attention heads -- the low `log2(head_dim)`
+qubits are the within-head dimension and the high qubits are the head index -- so
+the MI is also attributed to head-index vs within-head couplings.
+
+```bash
+python extract_layers.py models/SmolLM2-135M --local-files-only \
+    --types k_proj o_proj q_proj v_proj --depths 10 15 20 --out layers/
+
+python analyze_structure.py layers/ --head-dim 64 --out structure.csv --save-mi mi/
+python analyze_structure.py layers/ --head-dim 64 --crop-pow2 --out structure_crop.csv
+```
+
+Per layer the CSV records the MI blocks and their null ratios, the head
+attribution, single-qubit entropies and the MPO `bond_entropy`; `--save-mi` dumps
+each full MI matrix as `.npy` for plotting. The run ends with a verdict: if
+`row-row` and `col-col` sit at the random floor, the weights are pairwise
+structureless at the qubit level and no ansatz built from pairwise statistics will
+help -- which would itself explain why only the (over-complete) all-to-all ansatz
+wins, and points to pruning that ansatz instead.
+
 ### Measure both surfaces
 
 ```bash
