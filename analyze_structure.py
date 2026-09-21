@@ -136,6 +136,33 @@ def prepare(W: torch.Tensor, mode: str):
     return pad_to_qubits(W)
 
 
+# A null draw depends only on the matrix shape and the prepare() mode, never on the
+# layer's contents, so every layer of the same shape shares one set of draws. With a
+# sweep of 12 layers spanning 2 shapes that is a 6x saving, which is what makes a
+# large --null-reps (and therefore a usable error bar) affordable.
+_NULL_CACHE: dict = {}
+
+
+def null_distribution(shape, mode: str, reps: int, seed: int) -> dict:
+    """Per-draw MI block means for Gaussian matrices of ``shape``, cached by shape."""
+    key = (int(shape[0]), int(shape[1]), mode, int(reps), int(seed))
+    if key in _NULL_CACHE:
+        return _NULL_CACHE[key]
+    gen = torch.Generator().manual_seed(seed)
+    draws = {t: [] for t in ("rr", "cc", "rc", "offdiag")}
+    for _ in range(reps):
+        G = torch.randn(int(shape[0]), int(shape[1]), generator=gen)
+        Mg, ng, mg = prepare(G, mode)
+        _s, Ig = pair_mi(operator_state(Mg), ng + mg)
+        b = block_stats(Ig, ng, mg)
+        offg = Ig[~torch.eye(ng + mg, dtype=bool)]
+        for t in ("rr", "cc", "rc"):
+            draws[t].append(b[f"mi_{t}_mean"])
+        draws["offdiag"].append(float(offg.mean()))
+    _NULL_CACHE[key] = draws
+    return draws
+
+
 def analyse(W: torch.Tensor, mode: str, head_dim: int, null_reps: int,
             seed: int) -> tuple[dict, torch.Tensor]:
     M, n, m = prepare(W, mode)
@@ -153,24 +180,29 @@ def analyse(W: torch.Tensor, mode: str, head_dim: int, null_reps: int,
     row["mi_concentration"] = float(off.max() / off.mean().clamp_min(1e-15))
 
     # Matched null: same original shape, same prepare() -> same padding artefact.
-    gen = torch.Generator().manual_seed(seed)
-    acc = {k: 0.0 for k in ("mi_rr_mean", "mi_cc_mean", "mi_rc_mean", "mi_offdiag_mean")}
-    for _ in range(null_reps):
-        G = torch.randn(W.shape[0], W.shape[1], generator=gen)
-        Mg, ng, mg = prepare(G, mode)
-        _s, Ig = pair_mi(operator_state(Mg), ng + mg)
-        b = block_stats(Ig, ng, mg)
-        offg = Ig[~torch.eye(ng + mg, dtype=bool)]
-        acc["mi_rr_mean"] += b["mi_rr_mean"]
-        acc["mi_cc_mean"] += b["mi_cc_mean"]
-        acc["mi_rc_mean"] += b["mi_rc_mean"]
-        acc["mi_offdiag_mean"] += float(offg.mean())
-    for k, v in acc.items():
-        row[f"null_{k}"] = v / max(1, null_reps)
-    # The headline falsification metric: signal / matched-null floor.
+    # The observation is a single matrix, so the uncertainty lives entirely in the
+    # null; the error bar is the spread of the null draws, and the question each
+    # block answers is "how many null sigmas above the null mean is this layer?".
+    draws = null_distribution(W.shape, mode, null_reps, seed) if null_reps > 0 else None
+    nan = float("nan")
     for tag in ("rr", "cc", "rc", "offdiag"):
-        base = row[f"null_mi_{tag}_mean"]
-        row[f"mi_{tag}_ratio"] = (row[f"mi_{tag}_mean"] / base) if base > 0 else float("nan")
+        obs = row[f"mi_{tag}_mean"]
+        vals = (draws or {}).get(tag) or []
+        if not vals:
+            for k in ("null_mi_%s_mean", "null_mi_%s_std", "mi_%s_ratio", "mi_%s_z"):
+                row[k % tag] = nan
+            row[f"mi_{tag}_exceed"], row[f"mi_{tag}_nreps"] = 0, 0
+            continue
+        v = torch.tensor(vals, dtype=torch.float64)
+        mu = float(v.mean())
+        sd = float(v.std(unbiased=True)) if len(vals) > 1 else nan
+        row[f"null_mi_{tag}_mean"] = mu
+        row[f"null_mi_{tag}_std"] = sd
+        row[f"mi_{tag}_ratio"] = (obs / mu) if mu > 0 else nan
+        row[f"mi_{tag}_z"] = ((obs - mu) / sd) if (sd == sd and sd > 0) else nan
+        # Distribution-free companion to z: null draws that reached the observation.
+        row[f"mi_{tag}_exceed"] = int(sum(1 for x in vals if x >= obs))
+        row[f"mi_{tag}_nreps"] = len(vals)
 
     # Head attribution (only when head_dim is a power of two and fits the register).
     hb_out = n - int(round(math.log2(head_dim))) if head_dim > 1 else 0
@@ -259,10 +291,11 @@ def main():
         if mi_dir is not None:
             import numpy as np
             np.save(mi_dir / f"block{depth:03d}.{lt}.mi.npy", mi.numpy())
-        print(f"  {lt:<18} d{depth:<3} {row['n_out']}q x {row['n_in']}q  "
-              f"S_bond={row['bond_entropy']:.3f}  "
-              f"MI rr/cc/rc ratio = {row['mi_rr_ratio']:.2f} / "
-              f"{row['mi_cc_ratio']:.2f} / {row['mi_rc_ratio']:.2f}")
+        def _rz(tag):
+            return f"{row[f'mi_{tag}_ratio']:6.2f} (z={row[f'mi_{tag}_z']:+7.1f})"
+        print(f"  {lt:<16} d{depth:<3} {row['n_out']}qx{row['n_in']}q "
+              f"S={row['bond_entropy']:.3f}  rr {_rz('rr')}  cc {_rz('cc')}  "
+              f"rc {_rz('rc')}")
 
     order = ["param_name", "layer_type", "depth", "rows", "cols", "mode",
              "n_out", "n_in", "q", "padded_rows", "padded_cols", "bond_entropy"]
@@ -276,21 +309,32 @@ def main():
     if mi_dir:
         print(f"MI matrices in {mi_dir.resolve()}")
 
-    # Verdict: the Phase-0 gate.
+    # Verdict: the Phase-0 gate, judged on significance rather than a bare ratio.
+    # One-sided, Bonferroni-corrected for len(rows) layers x 3 blocks: at 36 tests
+    # alpha = 0.05/36 puts the bar at z ~ 3.
     import statistics as st
-    rr = st.mean(r["mi_rr_ratio"] for r in rows)
-    cc = st.mean(r["mi_cc_ratio"] for r in rows)
-    rc = st.mean(r["mi_rc_ratio"] for r in rows)
-    print(f"\nMean MI / matched-null ratio:  row-row {rr:.2f}   col-col {cc:.2f}   "
-          f"row-col {rc:.2f}")
-    if max(rr, cc) < 1.5 and rc < 1.5:
-        print("VERDICT: no pairwise structure above the random floor. Ansatze derived "
-              "from pairwise statistics are unlikely to help -- consider the "
-              "all-to-all pruning route instead.")
+    ntest = max(1, len(rows) * 3)
+    zcrit = 3.0
+    labels = {"rr": "U (row-row)", "cc": "V (col-col)", "rc": "MPO ordering (row-col)"}
+    print(f"\n{'block':<26}{'mean ratio':>12}{'max z':>10}{'layers z>3':>12}")
+    sig = {}
+    for tag, lab in labels.items():
+        zs = [r[f"mi_{tag}_z"] for r in rows if r[f"mi_{tag}_z"] == r[f"mi_{tag}_z"]]
+        nsig = sum(1 for z in zs if z > zcrit)
+        sig[tag] = nsig
+        mr = st.mean(r[f"mi_{tag}_ratio"] for r in rows)
+        mz = max(zs) if zs else float("nan")
+        print(f"{lab:<26}{mr:>12.2f}{mz:>10.1f}{nsig:>8}/{len(rows)}")
+    reps = rows[0].get("mi_rr_nreps", 0)
+    print(f"(null: {reps} draws per shape; bar is z>{zcrit:.0f}, one-sided Bonferroni "
+          f"over {ntest} tests)")
+    hit = [labels[t] for t in ("rr", "cc", "rc") if sig[t] > 0]
+    if not hit:
+        print("VERDICT: no block is significantly above the matched-null floor in any "
+              "layer. Ansatze derived from pairwise statistics are unlikely to help -- "
+              "consider the all-to-all pruning route instead.")
     else:
-        which = [t for t, v in (("U (row-row)", rr), ("V (col-col)", cc),
-                                ("MPO ordering (row-col)", rc)) if v >= 1.5]
-        print("VERDICT: structure above the random floor in: " + ", ".join(which))
+        print("VERDICT: significant structure in: " + ", ".join(hit))
 
 
 if __name__ == "__main__":
