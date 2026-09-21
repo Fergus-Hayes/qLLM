@@ -999,4 +999,28 @@ shutil.rmtree(_ld, ignore_errors=True)
 print(f"  --layers-dir: {len(_got)} layer(s) selected from files (q_proj @ depths 0,2); "
       f"manifest and glob paths agree")
 
+print("\n=== 19. Head-block ansatz (head-aligned gate layout) ===")
+# The head-index qubits are the HIGH bits (qubit 0 = MSB), so they form a
+# contiguous block at the start of the register and "dense on the head index" is an
+# ordinary gate (0, head_bits) -- expressible in the existing Gate machinery.
+from qllm.disentangler import head_block_positions, quantum_param_count as _qpc  # noqa: E402
+assert head_block_positions(10, 64, 0, 0) == [(0, 4)], head_block_positions(10, 64, 0, 0)
+assert head_block_positions(8, 64, 0, 0) == [(0, 2)], head_block_positions(8, 64, 0, 0)
+assert head_block_positions(6, 64, 0, 0) == [], "head_dim == register -> no head bits"
+# Optional within-head brickwall lands entirely above the head bits.
+_hp = head_block_positions(10, 64, 2, 2)
+assert _hp[0] == (0, 4) and all(s >= 4 for s, _k in _hp[1:]), _hp
+# Q = 2 * dim SO(2^4) = 2 * 120 for a 10q x 10q layer.
+assert _qpc(10, 10, 0, 0, "manifold", "head-block", 64) == 240
+# The brickwall path is untouched by the new parameters.
+assert gate_positions(10, 2, 4) == gate_positions(10, 2, 4, "brickwall", 0)
+# And it actually disentangles: identity init means it can only improve on the MPO.
+_wq = torch.randn(64, 64)
+_rh = disentangle(_wq, gate_size=0, depth=0, target_chi=1, tensorization="qubit",
+                    sweeps=5, ansatz="head-block", head_dim=16)
+assert _rh.quantum_params == 2 * (4 * 3 // 2), _rh.quantum_params
+assert _rh.retained >= _rh.retained_classical - 1e-6, "head-block fell below the MPO"
+print(f"  head-block on 10q/head_dim 64 -> [(0,4)], Q=240; 6q/head_dim 16 -> "
+      f"Q={_rh.quantum_params}, retained {_rh.retained_classical:.4f} -> {_rh.retained:.4f}")
+
 print("\nALL HYBRID SMOKE STAGES PASSED")

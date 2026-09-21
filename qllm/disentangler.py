@@ -119,7 +119,46 @@ class Gate:
             wires=self.wires, unitary_check=False)
 
 
-def gate_positions(n_qubits: int, gate_size: int, depth: int) -> list[tuple[int, int]]:
+ANSATZE = ("brickwall", "head-block")
+
+
+def head_block_positions(n_qubits: int, head_dim: int, gate_size: int,
+                         depth: int) -> list[tuple[int, int]]:
+    """``(start, k)`` for the head-aligned ansatz: one dense gate on the head index.
+
+    With a power-of-two ``head_dim`` the qubit factorization already lines up with
+    attention heads: the low ``log2(head_dim)`` qubits index the dimension *within*
+    a head and the remaining high qubits index *which* head. Because qubit 0 is the
+    most significant bit, those head-index qubits are a contiguous block at the
+    start of the register, so "dense on the head index" is just an ordinary gate
+    ``(0, head_bits)`` -- no new gate type, and every downstream consumer (parameter
+    counting, the environment sweep, the gradient) works unchanged.
+
+    The structure diagnostic (``analyze_structure.py``) found the mutual information
+    of q_proj/o_proj concentrated 11-45x on exactly these qubits, which is what this
+    ansatz is built to exploit: ``dim SO(2^head_bits)`` parameters instead of a
+    brickwall's depth-times-width.
+
+    ``gate_size`` and ``depth`` optionally add a brickwall over the *within-head*
+    qubits on top; ``depth <= 0`` or ``gate_size <= 0`` leaves them untouched.
+    """
+    if n_qubits <= 0 or head_dim <= 1:
+        return []
+    within = int(round(math.log2(head_dim)))
+    head_bits = n_qubits - within
+    positions: list[tuple[int, int]] = []
+    if head_bits >= 2:                       # a 1-qubit "block" has no SO(2) freedom
+        positions.append((0, head_bits))
+    elif head_bits < 0:                      # head_dim wider than the register
+        return []
+    if gate_size > 0 and depth > 0 and within >= 2:
+        for s, k in gate_positions(within, gate_size, depth):
+            positions.append((s + head_bits, k))
+    return positions
+
+
+def gate_positions(n_qubits: int, gate_size: int, depth: int,
+                   ansatz: str = "brickwall", head_dim: int = 0) -> list[tuple[int, int]]:
     """``(start, k)`` of every gate of a brickwall, in application order.
 
     Layers alternate between offset 0 and offset ``k // 2`` so that consecutive
@@ -128,7 +167,12 @@ def gate_positions(n_qubits: int, gate_size: int, depth: int) -> list[tuple[int,
     (``k >= n``) already covers everything and stacking more of them only
     multiplies orthogonal matrices together, so that case collapses to a single
     gate (the paper's "10qU, 8qV, L=1" configuration).
+
+    ``ansatz="head-block"`` instead lays the gates out along the attention-head
+    split -- see :func:`head_block_positions` -- using ``head_dim``.
     """
+    if ansatz == "head-block":
+        return head_block_positions(n_qubits, head_dim, gate_size, depth)
     if n_qubits <= 0 or depth <= 0 or gate_size <= 0:
         return []
     k = min(gate_size, n_qubits)
@@ -160,17 +204,19 @@ def gate_param_count(k: int, counting: str = "manifold") -> int:
 
 
 def circuit_param_count(n_qubits: int, gate_size: int, depth: int,
-                        counting: str = "manifold") -> int:
-    """Total variational parameters of a brickwall circuit -- the ``Q(D)`` term."""
+                        counting: str = "manifold", ansatz: str = "brickwall",
+                        head_dim: int = 0) -> int:
+    """Total variational parameters of the circuit -- the ``Q(D)`` term."""
     return sum(gate_param_count(k, counting)
-               for _s, k in gate_positions(n_qubits, gate_size, depth))
+               for _s, k in gate_positions(n_qubits, gate_size, depth, ansatz, head_dim))
 
 
 def quantum_param_count(n_out_qubits: int, n_in_qubits: int, gate_size: int,
-                        depth: int, counting: str = "manifold") -> int:
+                        depth: int, counting: str = "manifold",
+                        ansatz: str = "brickwall", head_dim: int = 0) -> int:
     """``Q(D)``: parameters of both disentangling circuits ``U`` and ``V``."""
-    return (circuit_param_count(n_out_qubits, gate_size, depth, counting)
-            + circuit_param_count(n_in_qubits, gate_size, depth, counting))
+    return (circuit_param_count(n_out_qubits, gate_size, depth, counting, ansatz, head_dim)
+            + circuit_param_count(n_in_qubits, gate_size, depth, counting, ansatz, head_dim))
 
 
 def _identity_gate(k: int) -> torch.Tensor:
@@ -184,7 +230,8 @@ def _random_gate(k: int, generator: torch.Generator | None) -> torch.Tensor:
 
 
 def build_circuit(n_qubits: int, gate_size: int, depth: int, init: str = "identity",
-                  generator: torch.Generator | None = None) -> list[Gate]:
+                  generator: torch.Generator | None = None,
+                  ansatz: str = "brickwall", head_dim: int = 0) -> list[Gate]:
     """Brickwall of real orthogonal gates, initialised to identity or Haar-random.
 
     ``identity`` makes the circuit a no-op, so the hybrid layer starts exactly at
@@ -192,7 +239,7 @@ def build_circuit(n_qubits: int, gate_size: int, depth: int, init: str = "identi
     paper's "the hybrid model departs from the classical baseline".
     """
     gates = []
-    for start, k in gate_positions(n_qubits, gate_size, depth):
+    for start, k in gate_positions(n_qubits, gate_size, depth, ansatz, head_dim):
         mat = _identity_gate(k) if init == "identity" else _random_gate(k, generator)
         gates.append(Gate(start=start, k=k, matrix=mat))
     return gates
@@ -535,7 +582,8 @@ def relative_error_loss(current: torch.Tensor, out_dims: list[int], in_dims: lis
 
 def _train_gradient(padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
                     steps, lr, init, seed, log, base_u=None, base_v=None,
-                    fast=False, objective="disentangle-loss"):
+                    fast=False, objective="disentangle-loss",
+                    ansatz="brickwall", head_dim=0):
     """Optimize the gate angles by Adam to minimize the chosen ``objective``.
 
     Returns ``(u_gates, v_gates, steps_run, history)`` with the trained gates as
@@ -562,8 +610,8 @@ def _train_gradient(padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
     path is several times faster per step and much lighter on memory for wide
     registers. The default keeps the PennyLane path (``qml.matrix``).
     """
-    pos_u = gate_positions(n_out, gate_size, depth)
-    pos_v = gate_positions(n_in, gate_size, depth)
+    pos_u = gate_positions(n_out, gate_size, depth, ansatz, head_dim)
+    pos_v = gate_positions(n_in, gate_size, depth, ansatz, head_dim)
     gen = torch.Generator().manual_seed(seed)
     refine = base_u is not None                      # warm-start from base gates
     bases_u = [g.matrix for g in base_u] if refine else None
@@ -675,8 +723,10 @@ def _build_result(weight, padded, u_gates, v_gates, n_out, n_in, gate_size, dept
         gate_size=gate_size, depth=depth,
         shape=(int(weight.shape[0]), int(weight.shape[1])),
         padded_shape=(1 << n_out, 1 << n_in), plan=plan, operator=current,
-        quantum_params=quantum_param_count(n_out, n_in, gate_size, depth,
-                                           param_counting),
+        # Counted from the gates that were actually built, not re-derived from
+        # (gate_size, depth) -- so it stays correct for any ansatz layout.
+        quantum_params=sum(gate_param_count(g.k, param_counting)
+                           for g in list(u_gates) + list(v_gates)),
         target_chi=target_chi, accuracy=accuracy,
         entropy=plan_bond_entropy(current, plan), retained=retained,
         retained_classical=retained_classical, sweeps_run=sweeps_run,
@@ -694,6 +744,7 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
                       gd_steps: int = 200, gd_lr: float = 0.05,
                       fast_gradient: bool = False,
                       gradient_objective: str = "disentangle-loss",
+                      ansatz: str = "brickwall", head_dim: int = 0,
                       log: bool = False) -> DisentangleResult:
     """Disentangle ``W`` into ``U MPO_new V^T`` with brickwall circuits of depth ``D``.
 
@@ -750,7 +801,7 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
         u_gates, v_gates, steps_run, history = _train_gradient(
             padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
             gd_steps, gd_lr, init, seed, log, fast=fast_gradient,
-            objective=gradient_objective)
+            objective=gradient_objective, ansatz=ansatz, head_dim=head_dim)
         return _build_result(
             weight, padded, u_gates, v_gates, n_out, n_in, gate_size, depth,
             target_chi, _plan, param_counting, retained_classical, target_ref,
@@ -758,8 +809,8 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
 
     # --- explicit environment / SVD sweep (paper Appendix A) ---
     generator = torch.Generator().manual_seed(seed)
-    u_gates = build_circuit(n_out, gate_size, depth, init, generator)
-    v_gates = build_circuit(n_in, gate_size, depth, init, generator)
+    u_gates = build_circuit(n_out, gate_size, depth, init, generator, ansatz, head_dim)
+    v_gates = build_circuit(n_in, gate_size, depth, init, generator, ansatz, head_dim)
 
     current = padded                             # U^T W V, starts at W (identity gates)
     history: list[float] = []
@@ -805,7 +856,8 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
         u_gates, v_gates, gd_run, gd_hist = _train_gradient(
             padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
             gd_steps, gd_lr, init, seed, log, base_u=u_gates, base_v=v_gates,
-            fast=fast_gradient, objective=gradient_objective)
+            fast=fast_gradient, objective=gradient_objective,
+            ansatz=ansatz, head_dim=head_dim)
         history = history + gd_hist
         label = "explicit+gradient"
 
@@ -845,6 +897,7 @@ def disentangle(weight: torch.Tensor, gate_size: int, depth: int,
                 optimizer: str = "explicit", gd_steps: int = 200, gd_lr: float = 0.05,
                 restarts: int = 1, fast_gradient: bool = False,
                 gradient_objective: str = "disentangle-loss",
+                ansatz: str = "brickwall", head_dim: int = 0,
                 log: bool = False) -> DisentangleResult:
     """Disentangle ``W``, keeping the best of ``restarts`` initializations.
 
@@ -866,7 +919,8 @@ def disentangle(weight: torch.Tensor, gate_size: int, depth: int,
         return _disentangle_once(
             weight, gate_size, depth, target_chi, n_sites, sweeps, tol, this_init,
             this_seed, param_counting, target_mode, tensorization, qubit_align,
-            optimizer, gd_steps, gd_lr, fast_gradient, gradient_objective, log)
+            optimizer, gd_steps, gd_lr, fast_gradient, gradient_objective,
+            ansatz, head_dim, log)
 
     best = _run(init, seed)
     for extra in range(1, max(1, restarts)):
