@@ -32,6 +32,7 @@ from qllm.activation_stats import (
     input_covariance,
     low_rank_frobenius,
     low_rank_whitened,
+    magic_matched_null,
     output_relative_error,
     stabilizer_renyi_entropy,
 )
@@ -555,8 +556,8 @@ def cmd_magic(args):
         raise SystemExit("No layer had a matching covariance.")
 
     rows = []
-    print(f"{'layer':<17}{'d':>3}{'side':>9}{'rank':>6}{'M2 (bits)':>12}"
-          f"{'null':>9}{'ratio':>9}")
+    print(f"{'layer':<17}{'d':>3}{'side':>9}{'rank':>6}{'M2':>8}{'haar':>8}"
+          f"{'matched':>9}{'vs haar':>9}{'vs matched':>12}")
     for name, W in layers:
         lt, dep = parse_layer_info(name)
         S, _inv = _sqrt_and_inv(cov[name], args.damp)
@@ -567,12 +568,18 @@ def cmd_magic(args):
             for r in args.ranks:
                 r = min(r, mat.shape[0])
                 vals = [stabilizer_renyi_entropy(mat[i]) for i in range(r)]
+                mn = [magic_matched_null(mat[i], args.matched_reps, args.seed)
+                      for i in range(r)]
                 m2 = sum(vals) / r
+                mnull = sum(mn) / r
                 rows.append(dict(layer_type=lt, depth=dep, side=side, rank=r, dim=dim,
-                                 m2_bits=round(m2, 4), null_bits=round(null, 4),
-                                 magic_ratio=round(m2 / null, 4) if null > 0 else float("nan")))
-                print(f"{lt:<17}{dep:>3}{side:>9}{r:>6}{m2:>12.3f}{null:>9.3f}"
-                      f"{m2 / null:>8.2f}x")
+                                 m2_bits=round(m2, 4), haar_null_bits=round(null, 4),
+                                 matched_null_bits=round(mnull, 4),
+                                 magic_ratio_haar=round(m2 / null, 4) if null > 0 else float("nan"),
+                                 magic_ratio=round(m2 / mnull, 4) if mnull > 0 else float("nan")))
+                print(f"{lt:<17}{dep:>3}{side:>9}{r:>6}{m2:>8.2f}{null:>8.2f}"
+                      f"{mnull:>9.2f}{m2 / null:>8.2f}x"
+                      f"{(m2 / mnull if mnull > 0 else float('nan')):>11.2f}x")
     with open(args.out, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=list(rows[0]))
         w.writeheader()
@@ -580,7 +587,7 @@ def cmd_magic(args):
     print(f"\nWrote {len(rows)} rows to {Path(args.out).resolve()}")
 
     import statistics as st
-    print(f"\n{'layer type':<20}{'mean magic ratio':>20}{'lowest @ rank>=4':>20}")
+    print(f"\n{'layer type':<20}{'mean vs matched':>18}{'lowest @ rank>=4':>20}")
     lowest = {}
     for lt in sorted({r["layer_type"] for r in rows}):
         sel = [r for r in rows if r["layer_type"] == lt]
@@ -588,8 +595,12 @@ def cmd_magic(args):
         lo = min(deep) if deep else float("nan")
         lowest[lt] = lo
         print(f"{lt:<20}{st.mean(r['magic_ratio'] for r in sel):>19.2f}x{lo:>19.2f}x")
-    print("(0 = a stabilizer state, free to prepare with Clifford gates; "
-          "1 = as generic as Haar random)")
+    print("(ratios are against a SPARSITY-MATCHED null -- the observed magnitudes\n"
+          " randomly rearranged. A Haar null is wrong here: a spike is a basis state,\n"
+          " so any sparse vector scores low for reasons unrelated to Clifford\n"
+          " structure -- a random 4-sparse vector reads 0.10x of Haar but 1.00x of\n"
+          " matched. 0 = genuine stabilizer structure; 1 = magic fully explained by\n"
+          " the magnitude profile.)")
     cand = {lt: v for lt, v in lowest.items() if v == v and v < 0.5}
     if cand:
         print("\nVERDICT: Clifford-like structure in " + ", ".join(
@@ -680,6 +691,8 @@ def main():
     mg.add_argument("--depths", type=int, nargs="+", default=None)
     mg.add_argument("--ranks", type=int, nargs="+", default=[1, 4, 8])
     mg.add_argument("--null-reps", type=int, default=8)
+    mg.add_argument("--matched-reps", type=int, default=3,
+                    help="draws for the sparsity-matched null (the deciding control)")
     mg.add_argument("--damp", type=float, default=1e-6)
     mg.add_argument("--seed", type=int, default=0)
     mg.add_argument("--out", default="activation_magic.csv")

@@ -202,3 +202,27 @@ def stabilizer_renyi_entropy(vec: torch.Tensor) -> float:
     if s <= 0:
         return float("nan")
     return float(-math.log2(s) - math.log2(d))
+
+
+def magic_matched_null(vec: torch.Tensor, reps: int = 8, seed: int = 0) -> float:
+    """Mean ``M2`` of vectors with the SAME magnitude profile, randomly arranged.
+
+    A Haar null is the wrong control for magic. A spike is a computational basis
+    state, hence a stabilizer state with ``M2 = 0``, so *any* sparse vector scores
+    low for reasons that have nothing to do with Clifford structure -- a random
+    4-sparse vector reads 0.10x of Haar. Permuting the observed magnitudes and
+    randomizing signs holds sparsity fixed and destroys everything else, so the
+    ratio against this null isolates genuine stabilizer structure: ~1 means the
+    magic is fully explained by the magnitude profile, and well below 1 means
+    there is Clifford structure beyond it.
+    """
+    q = int(math.floor(math.log2(vec.numel())))
+    v = vec[: 1 << q].to(torch.float64)
+    mags = v.abs()
+    g = torch.Generator().manual_seed(seed)
+    vals = []
+    for _ in range(max(1, reps)):
+        perm = torch.randperm(mags.numel(), generator=g)
+        sign = torch.where(torch.rand(mags.numel(), generator=g) < 0.5, -1.0, 1.0)
+        vals.append(stabilizer_renyi_entropy(mags[perm] * sign.to(torch.float64)))
+    return sum(vals) / len(vals)
