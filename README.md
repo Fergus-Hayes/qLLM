@@ -786,6 +786,52 @@ sweep within budget:
   always completes, and every row is checkpointed. Pass a smaller `--jobs` up
   front (e.g. `--jobs 6`) to skip the wide first attempt.
 
+### Activation-aware compression (`activation_aware.py`)
+
+The sweep minimizes `||W - W'||_F`, which treats every input direction as equally
+important. What capability depends on is the layer's *output* on the inputs that
+actually occur, and that error is
+
+```
+E_x ||Wx - W'x||^2  =  tr[(W - W') H (W - W')^T],     H = E[x x^T]
+```
+
+so the entire input distribution enters as one `d_in x d_in` second-moment matrix.
+This is the activation-aware weighting behind GPTQ / SparseGPT (Hessian), AWQ and
+the whitened SVD of SVD-LLM / ASVD. Two properties decide what is implementable:
+
+* **Whitening is an exact reduction only for the plain low-rank class.**
+  `{W' : rank <= r}` is closed under right multiplication by an invertible matrix,
+  so "truncate `W H^(1/2)`, map back with `H^(-1/2)`" is exactly optimal. The
+  MPO-with-bond-chi class is *not* closed under that operation, so the recipe does
+  not transfer -- a weighted objective has to be optimized directly there.
+* **The paper's closed-form gate update does not survive the weighting.** The
+  env-SVD polar step works because the Frobenius norm is orthogonally invariant, so
+  minimizing the error is the same as maximizing an overlap that is linear in each
+  gate. With `H` in the middle that equivalence breaks, so an output-error
+  objective belongs on the gradient path, not the explicit sweep.
+
+```bash
+# 1. capture H over calibration text (needs the model)
+python activation_aware.py capture models/SmolLM2-135M --local-files-only \
+    --types k_proj o_proj q_proj v_proj --depths 10 15 20 --out cov/
+
+# 2. re-score compressions under both metrics (needs only weights + H)
+python activation_aware.py score --layers-dir models/SmolLM2-135M/layers \
+    --cov cov/ --out activation_aware.csv
+```
+
+`score` reports, per layer and bond dimension, the Frobenius error next to the
+output error, and -- at matched parameter count -- the best plain low-rank
+approximation against the best **whitened** one. Read the **whitening gain**, not
+the headroom: headroom compares the same approximation under two metrics, so it
+only departs from 1 when the compression error happens to lie in low-energy input
+directions, and a roughly isotropic truncation error leaves it at 1 even when `H`
+is strongly anisotropic. The gain compares the best data-blind approximation with
+the best data-aware one at equal parameters, which is the question actually being
+asked. Both are aggregated **per chi'**, never across it, because there is nothing
+to exploit at `chi'=1` and potentially a lot at large `chi'`.
+
 ### Ansatz structure diagnostics (`analyze_structure.py`)
 
 Before choosing a disentangling ansatz, ask whether the weight matrix has any
