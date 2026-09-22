@@ -12,7 +12,9 @@ Checks the properties the experiment's verdict depends on:
 * tying across heads really costs ``head_dim/2`` and untying costs ``dim/2``;
 * identity init leaves the circuit a no-op, so the hybrid starts at the classical
   MPO and any gain is a gain;
-* the ansatz is refused on the gradient path, which cannot honour the constraint.
+* the gradient path keeps the gate inside its blocks and at its own parameter
+  count, so a pairing can be trained by Adam without silently becoming a dense
+  register-wide rotation.
 """
 import math
 import os
@@ -89,16 +91,22 @@ def main():
     assert r.quantum_params == 4, f"Q={r.quantum_params}, want head_dim/2 = 4"
     assert r.retained >= r.retained_classical - 1e-6, "the sweep lost to its own start"
 
-    # --- 5. the gradient path refuses the constraint ------------------------
+    # --- 5. the gradient path honours the constraint ------------------------
+    # It used to refuse these outright, because expm(skew(theta)) over the whole
+    # register would have dropped the block structure and trained dim SO(2^k)
+    # angles. The constrained parameterization makes them trainable at their own
+    # price, which is what stage 2 needs.
     for ansatz in PAIR_ANSATZE:
-        try:
-            disentangle(W, gate_size=0, depth=0, target_chi=2, sweeps=1,
+        r = disentangle(W, gate_size=0, depth=0, target_chi=2, sweeps=1,
                         tensorization="qubit", ansatz=ansatz, head_dim=8,
-                        optimizer="gradient", gd_steps=1)
-        except ValueError as exc:
-            assert "explicit" in str(exc), f"{ansatz}: unhelpful refusal {exc}"
-        else:
-            raise AssertionError(f"{ansatz} was accepted on the gradient path")
+                        optimizer="gradient", gd_steps=10)
+        assert r.quantum_params == 4, f"{ansatz}: Q={r.quantum_params} after Adam"
+        gm = r.u_gates[0].matrix
+        assert float((gm @ gm.T - torch.eye(gm.shape[0])).abs().max()) < 1e-4
+        leaked = gm.clone()
+        for a, b in r.u_gates[0].groups:
+            leaked[a, a] = leaked[a, b] = leaked[b, a] = leaked[b, b] = 0.0
+        assert float(leaked.abs().max()) == 0.0, f"{ansatz}: Adam left its blocks"
 
     print(f"  pairing partitions the register: 1024/1024 covered, 32 tie classes")
     print(f"  structured polar optimal over 3000 random feasible points")

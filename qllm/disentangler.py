@@ -656,9 +656,65 @@ def _gate_from_angles(theta: torch.Tensor, k: int) -> torch.Tensor:
     return torch.linalg.matrix_exp(_skew(theta, 1 << k))
 
 
+def structured_angle_count(groups, ties) -> int:
+    """Angles a block-diagonal gate carries: ``dim SO(|G|)`` per distinct tie class."""
+    seen, total = set(), 0
+    for gi, grp in enumerate(groups):
+        lab = ties[gi] if ties is not None else gi
+        if lab in seen:
+            continue
+        seen.add(lab)
+        total += len(grp) * (len(grp) - 1) // 2
+    return total
+
+
+def _structured_from_angles(theta: torch.Tensor, k: int, groups, ties) -> torch.Tensor:
+    """Differentiable block-diagonal orthogonal from one angle block per tie class.
+
+    The constraint has to live in the *parameterization*, not in a projection after
+    the fact: ``expm(skew(theta))`` over the whole register would train
+    ``dim SO(2^k)`` angles and leave the block structure only approximately intact.
+    Here each tie class owns ``dim SO(|G|)`` angles, its block is
+    ``expm(skew(.))``, and the blocks are scattered into an identity -- so the gate
+    is exactly orthogonal, exactly block diagonal, and carries exactly the
+    parameters :meth:`Gate.param_count` charges it for, at every point of the
+    optimisation rather than only at the end.
+
+    Written without a Python loop over groups: a pair ansatz on a 10-qubit register
+    has 512 of them and this runs inside every Adam step.
+    """
+    sizes = {len(g) for g in groups}
+    if len(sizes) != 1:                       # pragma: no cover - pairings are uniform
+        raise ValueError(f"block sizes must be uniform, got {sorted(sizes)}")
+    n = sizes.pop()
+    labels = sorted({(ties[gi] if ties is not None else gi)
+                     for gi in range(len(groups))})
+    per = n * (n - 1) // 2
+    blocks = torch.stack([_ortho_from_angles(theta[i * per:(i + 1) * per], n)
+                          for i in range(len(labels))])          # (classes, n, n)
+    pos = {lab: i for i, lab in enumerate(labels)}
+    take = torch.tensor([pos[ties[gi] if ties is not None else gi]
+                         for gi in range(len(groups))], dtype=torch.long)
+    mats = blocks[take]                                          # (groups, n, n)
+    idx = torch.tensor(groups, dtype=torch.long)                 # (groups, n)
+    rows = idx.unsqueeze(2).expand(-1, -1, n).reshape(-1)
+    cols = idx.unsqueeze(1).expand(-1, n, -1).reshape(-1)
+    eye = torch.eye(1 << k, dtype=blocks.dtype)
+    return eye.index_put((rows, cols), mats.reshape(-1))
+
+
+def _ortho_from_angles(theta: torch.Tensor, n: int) -> torch.Tensor:
+    """``expm(skew(theta))`` for an arbitrary ``n``, not just a power of two."""
+    a = torch.zeros(n, n, dtype=theta.dtype)
+    iu = torch.triu_indices(n, n, offset=1)
+    a = a.index_put((iu[0], iu[1]), theta)
+    return torch.linalg.matrix_exp(a - a.T)
+
+
 def _gates_from_angles(thetas: list[torch.Tensor],
                        positions: list[tuple[int, int]],
-                       bases: list[torch.Tensor] | None = None) -> list[Gate]:
+                       bases: list[torch.Tensor] | None = None,
+                       structures: list | None = None) -> list[Gate]:
     """Build :class:`Gate` objects (differentiable matrices) from angle tensors.
 
     Without ``bases`` each gate is ``expm(skew(theta))`` (identity at theta=0).
@@ -668,11 +724,19 @@ def _gates_from_angles(thetas: list[torch.Tensor],
     sweep's gates (the same parameterization :class:`~qllm.hybrid_heal.HybridAdapter`
     uses to heal circuits).
     """
-    if bases is None:
-        return [Gate(s, k, _gate_from_angles(t, k))
-                for t, (s, k) in zip(thetas, positions)]
-    return [Gate(s, k, b @ _gate_from_angles(t, k))
-            for t, (s, k), b in zip(thetas, positions, bases)]
+    structures = structures or [(None, None)] * len(positions)
+    out = []
+    for i, (t, (st, k)) in enumerate(zip(thetas, positions)):
+        groups, ties = structures[i]
+        # A structured gate stays structured under warm start too: the base is
+        # block diagonal on the same partition and the refinement is built on that
+        # same partition, so the product is as well.
+        mat = (_structured_from_angles(t, k, groups, ties) if groups is not None
+               else _gate_from_angles(t, k))
+        if bases is not None:
+            mat = bases[i] @ mat
+        out.append(Gate(st, k, mat, groups=groups, ties=ties))
+    return out
 
 
 def disentangle_loss(current: torch.Tensor, out_dims: list[int], in_dims: list[int],
@@ -752,10 +816,30 @@ def relative_error_loss(current: torch.Tensor, out_dims: list[int], in_dims: lis
     return torch.linalg.norm(current - recon) / denom
 
 
+def activation_error_loss(current, ug, vg, n_out, n_in, out_dims, in_dims,
+                          n_sites, chi, weight, cov, denom):
+    """Differentiable ``sqrt(tr[D H D^T] / tr[W H W^T])`` for the *cropped* layer.
+
+    The Frobenius objectives can be evaluated on the disentangled operator alone,
+    because ``U``/``V`` are orthogonal and the norm does not see them. The
+    activation-weighted error can not: ``H`` sits between the factors, so the
+    reconstruction has to be carried back through the circuits and cropped to the
+    original shape before it is scored. That costs two extra circuit applications
+    per step and is the price of optimising the quantity that actually matters.
+    """
+    recon = _truncated_dense(current, out_dims, in_dims, n_sites, chi)
+    dense = apply_right(vg, apply_circuit(ug, recon, n_out), n_in)
+    d = weight - dense[:weight.shape[0], :weight.shape[1]]
+    num = ((d @ cov) * d).sum()
+    return torch.sqrt(torch.clamp(num, min=0.0) / denom)
+
+
 def _train_gradient(padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
                     steps, lr, init, seed, log, base_u=None, base_v=None,
                     fast=False, objective="disentangle-loss",
-                    ansatz="brickwall", head_dim=0):
+                    ansatz="brickwall", head_dim=0, share_heads=True,
+                    rope_side="out", pair_seed=0, cov=None, weight=None,
+                    train_side="both"):
     """Optimize the gate angles by Adam to minimize the chosen ``objective``.
 
     Returns ``(u_gates, v_gates, steps_run, history)`` with the trained gates as
@@ -782,37 +866,58 @@ def _train_gradient(padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
     path is several times faster per step and much lighter on memory for wide
     registers. The default keeps the PennyLane path (``qml.matrix``).
     """
-    if ansatz in PAIR_ANSATZE:
-        raise ValueError(
-            f"the {ansatz!r} ansatz is only implemented for optimizer='explicit'. "
-            "Its gates are block diagonal, which the environment-SVD sweep solves "
-            "exactly per block; the Adam path parameterises a gate as "
-            "expm(skew(theta)) over the whole register, which would drop the "
-            "constraint and train 523776 angles where the ansatz has 32.")
-    pos_u = gate_positions(n_out, gate_size, depth, ansatz, head_dim)
-    pos_v = gate_positions(n_in, gate_size, depth, ansatz, head_dim)
+    if objective == "activation-mse" and (cov is None or weight is None):
+        raise ValueError("objective='activation-mse' needs both `cov` (H) and "
+                         "`weight` (the uncropped W); without them there is "
+                         "nothing to weight the error by.")
+    struct_u = gate_structures(n_out, gate_size, depth, ansatz, head_dim,
+                               share_heads, "out", pair_seed)
+    struct_v = gate_structures(n_in, gate_size, depth, ansatz, head_dim,
+                               share_heads, "out" if rope_side == "both" else "in",
+                               pair_seed)
+    pos_u = [(st, k) for st, k, _g, _t in struct_u]
+    pos_v = [(st, k) for st, k, _g, _t in struct_v]
+    sgr_u = [(g, t) for _s, _k, g, t in struct_u]
+    sgr_v = [(g, t) for _s, _k, g, t in struct_v]
     gen = torch.Generator().manual_seed(seed)
     refine = base_u is not None                      # warm-start from base gates
     bases_u = [g.matrix for g in base_u] if refine else None
     bases_v = [g.matrix for g in base_v] if refine else None
 
-    def _init(positions):
+    def _init(positions, structures, trainable):
         out = []
-        for _s, k in positions:
-            m = (1 << k) * ((1 << k) - 1) // 2
+        for (_s, k), (groups, ties) in zip(positions, structures):
+            # A structured gate is sized by its own partition, not by the register:
+            # 32 angles for a tied pairing where the unconstrained gate would want
+            # dim SO(2^k). This is the whole point of the constrained parameterization.
+            m = (structured_angle_count(groups, ties) if groups is not None
+                 else (1 << k) * ((1 << k) - 1) // 2)
             if refine or init != "random":
-                out.append(torch.zeros(m, requires_grad=True))  # start at base/identity
+                t = torch.zeros(m)                     # start at base/identity
             else:
-                out.append((0.1 * torch.randn(m, generator=gen)).requires_grad_(True))
+                t = 0.1 * torch.randn(m, generator=gen)
+            out.append(t.requires_grad_(trainable))
         return out
 
-    theta_u, theta_v = _init(pos_u), _init(pos_v)
-    params = theta_u + theta_v
+    # train_side freezes one circuit. With the H-weighted objective the U update is
+    # still a closed-form polar problem (the U-dependent quadratic cancels under the
+    # trace) while the V one is not, so "train V only, on top of the explicit sweep"
+    # is the cheap mixed scheme -- worth measuring against training both.
+    theta_u = _init(pos_u, sgr_u, train_side in ("both", "u"))
+    theta_v = _init(pos_v, sgr_v, train_side in ("both", "v"))
+    params = [t for t in theta_u + theta_v if t.requires_grad]
     history: list[float] = []
     if not params:                                   # depth 0: no gates to train
         return (base_u or []), (base_v or []), 0, history
 
     out_dims, in_dims, n_sites = plan_pad.out_dims, plan_pad.in_dims, plan_pad.n_sites
+    act_denom = None
+    if objective == "activation-mse":
+        w64 = weight.to(torch.float64)
+        act_denom = float(((w64 @ cov.to(torch.float64)) * w64).sum())
+        if not act_denom > 0:
+            raise ValueError("tr[W H W^T] is not positive; H is degenerate here.")
+        act_denom = torch.tensor(act_denom, dtype=weight.dtype)
     opt = torch.optim.Adam(params, lr=lr)
     # Keep the best (lowest-loss) *finite* iterate and restore it at the end. The
     # differentiable SVD in the relative-error objective is ill-conditioned near
@@ -829,8 +934,8 @@ def _train_gradient(padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
         # Build the disentangled operator U^T W V from the current angles. The
         # gate matrices carry autograd either way; ``fast`` chooses how they are
         # contracted into ``current``.
-        ug = _gates_from_angles(theta_u, pos_u, bases_u)
-        vg = _gates_from_angles(theta_v, pos_v, bases_v)
+        ug = _gates_from_angles(theta_u, pos_u, bases_u, sgr_u)
+        vg = _gates_from_angles(theta_v, pos_v, bases_v, sgr_v)
         if fast:
             # Pure-torch local contractions -- O(#gates), no register unitary. For a
             # deep circuit the retained autograd graph (one activation per gate) is
@@ -851,7 +956,11 @@ def _train_gradient(padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
         if not torch.isfinite(current).all():
             break                                    # angles diverged; keep best
         try:
-            if objective == "relative-error":
+            if objective == "activation-mse":
+                loss = activation_error_loss(current, ug, vg, n_out, n_in, out_dims,
+                                             in_dims, n_sites, target_chi,
+                                             weight, cov, act_denom)
+            elif objective == "relative-error":
                 loss = relative_error_loss(current, out_dims, in_dims, n_sites, target_chi)
             else:
                 loss = disentangle_loss(current, out_dims, in_dims, n_sites, target_chi)
@@ -878,10 +987,12 @@ def _train_gradient(padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
             t.copy_(b)
         for t, b in zip(theta_v, best_v):
             t.copy_(b)
-        u_gates = [Gate(g.start, g.k, g.matrix.detach())
-                   for g in _gates_from_angles(theta_u, pos_u, bases_u)]
-        v_gates = [Gate(g.start, g.k, g.matrix.detach())
-                   for g in _gates_from_angles(theta_v, pos_v, bases_v)]
+        # Keep groups/ties on the returned gates: Gate.param_count reads them, so
+        # dropping them here would silently price a 32-angle pairing at dim SO(2^k).
+        u_gates = [Gate(g.start, g.k, g.matrix.detach(), g.groups, g.ties)
+                   for g in _gates_from_angles(theta_u, pos_u, bases_u, sgr_u)]
+        v_gates = [Gate(g.start, g.k, g.matrix.detach(), g.groups, g.ties)
+                   for g in _gates_from_angles(theta_v, pos_v, bases_v, sgr_v)]
     return u_gates, v_gates, max(1, steps), history
 
 
@@ -925,7 +1036,7 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
                       gradient_objective: str = "disentangle-loss",
                       ansatz: str = "brickwall", head_dim: int = 0,
                       share_heads: bool = True, rope_side: str = "out",
-                      pair_seed: int = 0,
+                      pair_seed: int = 0, cov=None, train_side: str = "both",
                       log: bool = False) -> DisentangleResult:
     """Disentangle ``W`` into ``U MPO_new V^T`` with brickwall circuits of depth ``D``.
 
@@ -982,7 +1093,9 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
         u_gates, v_gates, steps_run, history = _train_gradient(
             padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
             gd_steps, gd_lr, init, seed, log, fast=fast_gradient,
-            objective=gradient_objective, ansatz=ansatz, head_dim=head_dim)
+            objective=gradient_objective, ansatz=ansatz, head_dim=head_dim,
+            share_heads=share_heads, rope_side=rope_side, pair_seed=pair_seed,
+            cov=cov, weight=weight, train_side=train_side)
         return _build_result(
             weight, padded, u_gates, v_gates, n_out, n_in, gate_size, depth,
             target_chi, _plan, param_counting, retained_classical, target_ref,
@@ -1041,7 +1154,9 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
             padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
             gd_steps, gd_lr, init, seed, log, base_u=u_gates, base_v=v_gates,
             fast=fast_gradient, objective=gradient_objective,
-            ansatz=ansatz, head_dim=head_dim)
+            ansatz=ansatz, head_dim=head_dim, share_heads=share_heads,
+            rope_side=rope_side, pair_seed=pair_seed, cov=cov, weight=weight,
+            train_side=train_side)
         history = history + gd_hist
         label = "explicit+gradient"
 
@@ -1083,7 +1198,7 @@ def disentangle(weight: torch.Tensor, gate_size: int, depth: int,
                 gradient_objective: str = "disentangle-loss",
                 ansatz: str = "brickwall", head_dim: int = 0,
                 share_heads: bool = True, rope_side: str = "out",
-                pair_seed: int = 0,
+                pair_seed: int = 0, cov=None, train_side: str = "both",
                 log: bool = False) -> DisentangleResult:
     """Disentangle ``W``, keeping the best of ``restarts`` initializations.
 
@@ -1106,7 +1221,8 @@ def disentangle(weight: torch.Tensor, gate_size: int, depth: int,
             weight, gate_size, depth, target_chi, n_sites, sweeps, tol, this_init,
             this_seed, param_counting, target_mode, tensorization, qubit_align,
             optimizer, gd_steps, gd_lr, fast_gradient, gradient_objective,
-            ansatz, head_dim, share_heads, rope_side, pair_seed, log)
+            ansatz, head_dim, share_heads, rope_side, pair_seed, cov,
+            train_side, log)
 
     best = _run(init, seed)
     for extra in range(1, max(1, restarts)):
