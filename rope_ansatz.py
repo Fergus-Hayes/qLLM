@@ -9,11 +9,22 @@ depends on ``i`` and is shared across heads. That is exactly a uniformly-control
 ``head_dim/2`` parameters for the whole register.
 
 The claim to test is not "a rotation helps". Any orthogonal circuit has some
-freedom, and freedom bought with parameters is not structure. The claim is that the
-*RoPE* pairing helps more than an equally sized rotation of the same shape, so the
-deciding control is ``random-pair``: identical group count, identical group size,
-identical tie structure, identical parameter count -- only which coordinates are
-paired is destroyed. ``adjacent-pair`` is a second control with a different stride.
+freedom, and freedom bought with parameters is not structure.
+
+``random-pair`` matches the group count, group size, tie structure and parameter
+count, destroying only which coordinates pair -- but it is **not** the deciding
+control, because it is confounded. RoPE joins ``i`` with ``i + head_dim/2``, indices
+differing in exactly one bit, so the RoPE gate is qubit-*local* by construction; a
+random pairing joins indices differing in many bits and is not. Scoring against it
+measures "local vs non-local pairing" as much as "RoPE vs not".
+
+The deciding control is therefore ``adjacent-pair``: ``(2i, 2i+1)`` is also a
+single-bit pairing at the same cost, so it differs from RoPE only in *which* bit is
+paired. Both are reported, and the verdict reads the unconfounded one.
+
+Effect size is reported next to significance on purpose. The null's spread here is
+tiny, so a difference far below any practical relevance still produces a large z --
+in the first run a z of +21 corresponded to removing 0.14% of the error.
 
 The layers without RoPE (v_proj, o_proj) are the negative control: the pairing is
 meaningless there, so a gain that shows up on them too is a gain from the ansatz
@@ -122,10 +133,13 @@ def main():
     # The verdict is the z of rope-pair against its own matched null, split by
     # whether the layer actually has RoPE. A pairing effect that shows up on
     # v_proj/o_proj as well is not a RoPE effect.
-    print("\nRoPE pairing vs the matched random-pair null (z = nulls better by ...sd)")
+    print("\nRoPE pairing vs its controls. 'vs adj' is the deciding column: both are\n"
+          "single-bit pairings at the same cost, differing only in which bit.")
     print(f"{'layer':<18}{'depth':>6}{'chi':>5}{'rope?':>7}"
-          f"{'rope err':>11}{'null mean':>11}{'z':>8}{'err/param gain':>16}")
+          f"{'rope err':>11}{'z vs rand':>11}{'vs rand':>10}{'vs adj':>10}"
+          f"{'err/param':>12}")
     zs = {1: [], 0: []}
+    adv = {1: [], 0: []}
     for lt, dep, W in layers:
         for chi in args.chis:
             sel = [r for r in rows if r["layer_type"] == lt and r["depth"] == dep
@@ -133,33 +147,56 @@ def main():
             rope = next(r for r in sel if r["ansatz"] == "rope-pair")
             base = next(r for r in sel if r["ansatz"] == "classical")
             brick = next(r for r in sel if r["ansatz"] == "brickwall")
+            adj = next(r for r in sel if r["ansatz"] == "adjacent-pair")
             ne = [r["err"] for r in sel if r["ansatz"] == "random-pair"]
             mu = st.mean(ne)
             sd = st.pstdev(ne) if len(ne) > 1 else 0.0
             z = (mu - rope["err"]) / sd if sd > 0 else float("nan")
             zs[rope["rope_layer"]].append(z)
+            # Effect sizes: error removed relative to each control, as a percent.
+            d_rand = (mu - rope["err"]) / mu * 100 if mu > 0 else float("nan")
+            d_adj = ((adj["err"] - rope["err"]) / adj["err"] * 100
+                     if adj["err"] > 0 else float("nan"))
+            adv[rope["rope_layer"]].append(d_adj)
             # error removed per quantum parameter, rope vs brickwall
             gr = (base["err"] - rope["err"]) / max(1, rope["q"])
             gb = (base["err"] - brick["err"]) / max(1, brick["q"])
             ratio = gr / gb if gb > 0 else float("nan")
             print(f"{lt:<18}{dep:>6}{chi:>5}{'yes' if rope['rope_layer'] else 'no':>7}"
-                  f"{rope['err']:>11.5f}{mu:>11.5f}{z:>8.2f}"
-                  + ("             n/a" if ratio != ratio else f"{ratio:>15.2f}x"))
+                  f"{rope['err']:>11.5f}{z:>11.2f}{d_rand:>+9.3f}%{d_adj:>+9.3f}%"
+                  + ("         n/a" if ratio != ratio else f"{ratio:>11.2f}x"))
 
-    def _fmt(v):
-        return f"{st.mean(v):+.2f}" if v else "n/a"
-    live = [z for z in zs[1] if z == z]
-    ctrl = [z for z in zs[0] if z == z]
-    print(f"\nmean z on RoPE layers (q/k): {_fmt(live)}   "
-          f"on non-RoPE layers (v/o): {_fmt(ctrl)}")
-    if live and st.mean(live) > 2.0 and (not ctrl or st.mean(live) > st.mean(ctrl) + 2.0):
-        print("\nVERDICT: the RoPE pairing beats an identically shaped random pairing "
-              "on the\n  layers RoPE acts on, and does not on the layers it does not. "
-              "That is a real\n  structural ansatz, not a parameter count.")
+    live_z = [z for z in zs[1] if z == z]
+    ctrl_z = [z for z in zs[0] if z == z]
+    live = [d for d in adv[1] if d == d]
+    ctrl = [d for d in adv[0] if d == d]
+
+    def _f(v, fmt="{:+.2f}"):
+        return fmt.format(st.mean(v)) if v else "n/a"
+    print(f"\nmean z vs the (confounded) random null -- RoPE layers {_f(live_z)}, "
+          f"controls {_f(ctrl_z)}")
+    print(f"mean advantage over the adjacent pairing  -- RoPE layers "
+          f"{_f(live, '{:+.3f}%')}, controls {_f(ctrl, '{:+.3f}%')}")
+
+    sep = (st.mean(live) - st.mean(ctrl)) if (live and ctrl) else float("nan")
+    # Significance and size are separate questions and both have to pass. The null's
+    # spread is small enough that a negligible difference still clears any z bar.
+    if sep == sep and sep > 0 and st.mean(live) > 0.5:
+        print(f"\nVERDICT: the RoPE pairing beats an equally local, equally priced "
+              f"pairing by\n  {st.mean(live):+.3f}% on the layers RoPE acts on "
+              f"against {st.mean(ctrl):+.3f}% on the layers it does\n  not. Real "
+              f"structure, and large enough to matter.")
+    elif sep == sep and sep > 0:
+        print(f"\nVERDICT: directionally RoPE-specific but negligible. The pairing "
+              f"beats an\n  equally local one by {st.mean(live):+.3f}% on RoPE "
+              f"layers against {st.mean(ctrl):+.3f}% on the controls --\n  the right "
+              f"sign, replicated, and far too small to change any compression "
+              f"decision.\n  Large z against the random null reflects that null's "
+              f"tiny spread, not effect size.")
     else:
-        print("\nVERDICT: no RoPE-specific effect. Whatever the pair ansatz buys, an "
-              "identically\n  shaped random pairing buys too, so it is the shape of "
-              "the rotation and not the\n  RoPE structure that is doing the work.")
+        print("\nVERDICT: no RoPE-specific effect. An equally local pairing at the "
+              "same cost does\n  as well, so it is the shape of the rotation and not "
+              "the RoPE structure doing\n  the work.")
 
 
 if __name__ == "__main__":
