@@ -74,8 +74,12 @@ def main():
     ap.add_argument("--layers-dir", required=True)
     ap.add_argument("--types", nargs="+", default=None)
     ap.add_argument("--depths", type=int, nargs="+", default=None)
-    ap.add_argument("--cov", default=None, help="H directory; enables the "
-                                                "activation-mse regime")
+    ap.add_argument("--cov", default=None,
+                    help="directory of captured H matrices. The activation-MSE "
+                         "loss tr[D H D^T]/tr[W H W^T] reads the whole input "
+                         "distribution out of one stored d_in x d_in matrix, so "
+                         "no model is needed here -- but without --cov the "
+                         "regimes that use it are skipped, not approximated")
     ap.add_argument("--ansatze", nargs="+",
                     default=["brickwall-k4D2", "brickwall-k2D4", "rope-pair"])
     ap.add_argument("--regimes", nargs="+", default=list(REGIMES))

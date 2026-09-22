@@ -5,8 +5,8 @@
         --layers-dir models/SmolLM2-135M/layers --token-ids ids.pt \
         --types q_proj k_proj v_proj o_proj --depths 10 20 --offline
 
-Convergence first (it needs no model and fails fast), then the perplexity
-correlation. Either can veto the stages, for different reasons:
+Convergence first (it loads the model only through ``cov/`` and so fails fast),
+then the perplexity correlation. Either can veto the stages, for different reasons:
 
 * a regime that has not converged at the stage budget produces numbers that
   understate what its ansatz can do, so stage comparisons between regimes would
@@ -36,8 +36,11 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("model", help="model dir or hub id (the correlation needs it)")
     ap.add_argument("--layers-dir", required=True)
-    ap.add_argument("--cov", default=None, help="H directory for the "
-                                                "activation-mse regime")
+    ap.add_argument("--cov", default=None,
+                    help="directory of captured H matrices (activation_aware.py "
+                         "capture). WITHOUT it the activation-MSE regime is "
+                         "silently skipped -- the loss tr[D H D^T] needs H, and "
+                         "nothing else reconstructs it")
     ap.add_argument("--types", nargs="+", default=["q_proj", "v_proj"])
     ap.add_argument("--depths", type=int, nargs="+", default=None)
     ap.add_argument("--token-ids", default=None)
@@ -67,6 +70,11 @@ def main():
     figs = out / "figs"
     codes = {}
 
+    if args.cov is None and "convergence" not in args.skip:
+        print("NOTE: no --cov, so the activation-MSE regime will be skipped by the\n"
+              "      convergence check. H is a stored d_in x d_in matrix, not "
+              "something the\n      check can recompute: run "
+              "'activation_aware.py capture' first to cover it.\n")
     if "convergence" not in args.skip:
         cmd = ["convergence.py", "--layers-dir", args.layers_dir,
                "--types", *args.types, "--ansatze", *args.ansatze,
