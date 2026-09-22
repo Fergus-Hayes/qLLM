@@ -161,6 +161,46 @@ def main():
         assert made == ["convergence_doubling.png", "convergence_lr.png",
                         "ppl_rho.png", "ppl_scatter.png"], made
 
+    # --- 10. the per-iteration trace is structured and persists -------------
+    import tempfile as _tf
+    from qllm.trace_log import TraceWriter, read_traces
+    for opt, phases in (("explicit", {"explicit"}), ("gradient", {"gradient"}),
+                        ("explicit+gradient", {"explicit", "gradient"})):
+        rt = disentangle(W, gate_size=2, depth=2, target_chi=2, sweeps=4,
+                         tensorization="qubit", optimizer=opt, gd_steps=6,
+                         gradient_objective="relative-error")
+        got = {t["phase"] for t in rt.trace}
+        assert got == phases, f"{opt}: trace phases {got}, want {phases}"
+        # iter is 1-based WITHIN the phase, so the two phases both start at 1
+        for ph in phases:
+            its = [t["iter"] for t in rt.trace if t["phase"] == ph]
+            assert its == list(range(1, len(its) + 1)), f"{opt}/{ph}: {its}"
+        # the loss a gradient row reports is the objective it was given
+        gr = [t for t in rt.trace if t["phase"] == "gradient"]
+        assert all(t["objective"] == "relative-error" for t in gr), opt
+        assert any(t["best"] for t in rt.trace), f"{opt}: no best-so-far marked"
+
+    with _tf.TemporaryDirectory() as td:
+        path = Path(td) / "tr.csv"
+        with TraceWriter(path, every=2) as tw:
+            tw.add(rt, layer_type="q", depth=0, chi=2, ansatz="a", regime="r")
+        back = read_traces(path)
+        assert back and all(r["run_id"] == "q|0|2|a|r" for r in back)
+        # thinning touches the gradient phase only, and keeps both endpoints
+        sw = [r for r in back if r["phase"] == "explicit"]
+        gd = [r for r in back if r["phase"] == "gradient"]
+        assert len(sw) == len([t for t in rt.trace if t["phase"] == "explicit"]), (
+            "the sweep phase was thinned; it should never be")
+        raw_gd = [t["iter"] for t in rt.trace if t["phase"] == "gradient"]
+        assert gd[0]["iter"] == raw_gd[0] and gd[-1]["iter"] == raw_gd[-1], (
+            "thinning dropped an endpoint of the gradient curve")
+        assert len(gd) < len(raw_gd), "every=2 did not thin anything"
+    # a writer with no path writes nothing and leaves no file behind
+    quiet = TraceWriter(None)
+    quiet.add(rt, layer_type="q")
+    quiet.close()
+    assert quiet.n_rows == 0
+
     print(f"  constrained gates: {n} angles, orthogonal to 1e-12, "
           f"off-block mass exactly 0, differentiable")
     print(f"  activation objective {e_a:.5f} beats Frobenius {e_f:.5f} on the "
@@ -170,6 +210,8 @@ def main():
     print("  ansatz ranking ignores the chi'=1 corner")
     print("  Spearman is signed (+1 / -1 / ties) and the ppl verdict reads the sign")
     print("  all four figures render")
+    print("  traces: phases separated, iters 1-based per phase, thinning keeps "
+          "endpoints")
     print("\nSTAGES SMOKE PASSED")
 
 

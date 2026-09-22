@@ -608,6 +608,13 @@ class DisentangleResult:
     seconds: float
     optimizer: str = "explicit"            # 'explicit' (env-SVD) or 'gradient'
     history: list[float] = field(default_factory=list)
+    # Per-iteration record of the optimisation, in tidy form. ``history`` is a
+    # flat list of mixed quantities kept for backward compatibility; this is the
+    # one to read. Each row: phase ('explicit' | 'gradient'), iter (1-based
+    # WITHIN the phase), objective (what `loss` is), loss (lower is better, the
+    # quantity actually minimised), score (higher is better: retained weight for
+    # the sweep), best (was this a new best-so-far).
+    trace: list[dict] = field(default_factory=list)
 
     @property
     def max_chi(self) -> int:
@@ -903,12 +910,13 @@ def _train_gradient(padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
     # still a closed-form polar problem (the U-dependent quadratic cancels under the
     # trace) while the V one is not, so "train V only, on top of the explicit sweep"
     # is the cheap mixed scheme -- worth measuring against training both.
+    trace: list[dict] = []
     theta_u = _init(pos_u, sgr_u, train_side in ("both", "u"))
     theta_v = _init(pos_v, sgr_v, train_side in ("both", "v"))
     params = [t for t in theta_u + theta_v if t.requires_grad]
     history: list[float] = []
     if not params:                                   # depth 0: no gates to train
-        return (base_u or []), (base_v or []), 0, history
+        return (base_u or []), (base_v or []), 0, history, trace
 
     out_dims, in_dims, n_sites = plan_pad.out_dims, plan_pad.in_dims, plan_pad.n_sites
     act_denom = None
@@ -967,7 +975,11 @@ def _train_gradient(padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
             lval = float(loss.detach())
             if not math.isfinite(lval):
                 break
-            if lval < best_loss:                     # snapshot the best-so-far
+            improved = lval < best_loss
+            trace.append(dict(phase="gradient", iter=step + 1,
+                              objective=objective, loss=lval,
+                              score=float("nan"), best=int(improved)))
+            if improved:                             # snapshot the best-so-far
                 best_loss = lval
                 best_u = [t.detach().clone() for t in theta_u]
                 best_v = [t.detach().clone() for t in theta_v]
@@ -993,12 +1005,13 @@ def _train_gradient(padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
                    for g in _gates_from_angles(theta_u, pos_u, bases_u, sgr_u)]
         v_gates = [Gate(g.start, g.k, g.matrix.detach(), g.groups, g.ties)
                    for g in _gates_from_angles(theta_v, pos_v, bases_v, sgr_v)]
-    return u_gates, v_gates, max(1, steps), history
+    return u_gates, v_gates, max(1, steps), history, trace
 
 
 def _build_result(weight, padded, u_gates, v_gates, n_out, n_in, gate_size, depth,
                   target_chi, plan_fn, param_counting, retained_classical, target_ref,
-                  ref_norm, norm, sweeps_run, t0, history, optimizer) -> DisentangleResult:
+                  ref_norm, norm, sweeps_run, t0, history, optimizer,
+                  trace=None) -> DisentangleResult:
     """Assemble a :class:`DisentangleResult` from trained gates (shared by both schemes)."""
     current = apply_right(v_gates,
                           apply_circuit(u_gates, padded, n_out, transpose=True),
@@ -1022,6 +1035,7 @@ def _build_result(weight, padded, u_gates, v_gates, n_out, n_in, gate_size, dept
         retained_classical=retained_classical, sweeps_run=sweeps_run,
         seconds=time.perf_counter() - t0, optimizer=optimizer,
         history=list(history) + [retained],
+        trace=list(trace or []),
     )
 
 
@@ -1090,7 +1104,7 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
     ref_norm = float(torch.linalg.norm(target_ref))
 
     if optimizer == "gradient":
-        u_gates, v_gates, steps_run, history = _train_gradient(
+        u_gates, v_gates, steps_run, history, trace = _train_gradient(
             padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
             gd_steps, gd_lr, init, seed, log, fast=fast_gradient,
             objective=gradient_objective, ansatz=ansatz, head_dim=head_dim,
@@ -1099,7 +1113,7 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
         return _build_result(
             weight, padded, u_gates, v_gates, n_out, n_in, gate_size, depth,
             target_chi, _plan, param_counting, retained_classical, target_ref,
-            ref_norm, norm, steps_run, t0, history, "gradient")
+            ref_norm, norm, steps_run, t0, history, "gradient", trace)
 
     # --- explicit environment / SVD sweep (paper Appendix A) ---
     generator = torch.Generator().manual_seed(seed)
@@ -1111,6 +1125,8 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
 
     current = padded                             # U^T W V, starts at W (identity gates)
     history: list[float] = []
+    trace: list[dict] = []
+    best_retained = -math.inf
     score = -math.inf
     sweeps_run = 0
     for sweep in range(max(1, sweeps)):
@@ -1119,6 +1135,11 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
         truncated, _ = plan_compress(current, plan, target_chi)
         retained = float(torch.linalg.norm(truncated)) / norm if norm else 0.0
         history.append(retained)
+        # The sweep maximises retained weight, so its natural loss is 1 - that.
+        trace.append(dict(phase="explicit", iter=sweep + 1,
+                          objective="retained-weight", loss=1.0 - retained,
+                          score=retained, best=int(retained > best_retained)))
+        best_retained = max(best_retained, retained)
         if not u_gates and not v_gates:
             break                                # depth 0: nothing to optimize
         # The paper's Eq. (4) freezes the target at the ORIGINAL operator's
@@ -1150,7 +1171,7 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
     # only a proxy for retained/accuracy on the multi-site qubit MPO, so the polish
     # can move those either way; on a single-bond (balanced) plan it aligns.
     if optimizer == "explicit+gradient" and (u_gates or v_gates):
-        u_gates, v_gates, gd_run, gd_hist = _train_gradient(
+        u_gates, v_gates, gd_run, gd_hist, gd_trace = _train_gradient(
             padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
             gd_steps, gd_lr, init, seed, log, base_u=u_gates, base_v=v_gates,
             fast=fast_gradient, objective=gradient_objective,
@@ -1158,12 +1179,13 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
             rope_side=rope_side, pair_seed=pair_seed, cov=cov, weight=weight,
             train_side=train_side)
         history = history + gd_hist
+        trace = trace + gd_trace
         label = "explicit+gradient"
 
     return _build_result(
         weight, padded, u_gates, v_gates, n_out, n_in, gate_size, depth,
         target_chi, _plan, param_counting, retained_classical, target_ref,
-        ref_norm, norm, sweeps_run, t0, history, label)
+        ref_norm, norm, sweeps_run, t0, history, label, trace)
 
 
 def hybrid_weight(result: DisentangleResult, chi: int) -> tuple[torch.Tensor, int]:

@@ -80,7 +80,8 @@ def main():
                "--types", *args.types, "--ansatze", *args.ansatze,
                "--chis", *[str(c) for c in args.chis],
                "--gd-steps", str(args.gd_steps),
-               "--out", str(out / "convergence.csv"), "--figs", str(figs)]
+               "--out", str(out / "convergence.csv"), "--figs", str(figs),
+               "--trace", str(out / "convergence_trace.csv")]
         if args.depths:
             cmd += ["--depths", *[str(d) for d in args.depths]]
         if args.cov:

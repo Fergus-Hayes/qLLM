@@ -43,6 +43,7 @@ from qllm.compactifai import log_spaced_ints, relative_error
 from qllm.activation_stats import output_relative_error
 from qllm.disentangler import classical_param_count, disentangle, hybrid_weight
 from qllm.qubit_mpo import make_plan, plan_compress
+from qllm.trace_log import TraceWriter
 
 # --------------------------------------------------------------------------- #
 # Ansatz catalogue. Stage 1 searches gate width x depth because that, not Q, was
@@ -114,12 +115,14 @@ def assert_identity_is_classical(W, chi, cov=None):
                          f"not nested and no ratio from this run is meaningful.")
 
 
-def run_point(W, chi, name, sweeps, cov=None, **extra):
+def run_point(W, chi, name, sweeps, cov=None, writer=None, key=None, **extra):
     """One trained configuration, scored at the chi' it was trained at."""
     kw = dict(ANSATZE[name]); kw.update(extra)
     t0 = time.time()
     r = disentangle(W, target_chi=chi, n_sites=2, sweeps=sweeps,
                     tensorization="qubit", cov=cov, **kw)
+    if writer:
+        writer.add(r, **(key or {}))
     approx, _ = hybrid_weight(r, chi)
     err = (float(relative_error(W, approx)) if cov is None
            else output_relative_error(W, approx, cov))
@@ -171,6 +174,7 @@ def cmd_stage1(args):
     layers = load_layers(args)
     names = args.ansatze or list(ANSATZE)
     rows, curves = [], {}
+    tracer = TraceWriter(args.trace, args.trace_every)
     for pname, lt, dep, W in layers:
         curves[(lt, dep)] = cc = classical_curve(W)
         assert_identity_is_classical(W, min(8, cc[-1][0]))
@@ -180,7 +184,10 @@ def cmd_stage1(args):
         for name in names:
             got = []
             for chi in grid:
-                p = run_point(W, chi, name, args.sweeps)
+                p = run_point(W, chi, name, args.sweeps, writer=tracer,
+                              key=dict(layer_type=lt, depth=dep, chi=chi,
+                                       ansatz=name, regime="explicit",
+                                       objective="frobenius", seed=0))
                 rows.append(dict(stage=1, layer_type=lt, depth=dep, ansatz=name,
                                  regime="explicit", objective="frobenius", seed=0, **p))
                 a = cheapest(cc, p["err"])
@@ -189,6 +196,7 @@ def cmd_stage1(args):
             print(f"  {name:<22} Q={rows[-1]['q']:<7} "
                   f"median ratio {st.median(got) if got else float('nan'):.3f}x "
                   f"({sum(1 for g in got if g > 1)}/{len(got)} win)", flush=True)
+    tracer.close()
     write(rows, args.out)
     order = print_bands(rows, curves, "ansatz", names)
     top = sorted(order, key=lambda k: -order[k])[:args.top]
@@ -210,6 +218,7 @@ def cmd_stage2(args):
                ("explicit+gradient-re", dict(optimizer="explicit+gradient",
                                              gradient_objective="relative-error"))]
     rows, curves = [], {}
+    tracer = TraceWriter(args.trace, args.trace_every)
     for pname, lt, dep, W in layers:
         curves[(lt, dep)] = cc = classical_curve(W)
         assert_identity_is_classical(W, min(8, cc[-1][0]))
@@ -226,7 +235,11 @@ def cmd_stage2(args):
                     for chi in grid:
                         p = run_point(W, chi, name, args.sweeps, seed=seed,
                                       gd_steps=args.gd_steps, gd_lr=args.gd_lr,
-                                      fast_gradient=True, **rkw)
+                                      fast_gradient=True, writer=tracer,
+                                      key=dict(layer_type=lt, depth=dep, chi=chi,
+                                               ansatz=name, regime=rname,
+                                               objective="frobenius", seed=seed),
+                                      **rkw)
                         rows.append(dict(stage=2, layer_type=lt, depth=dep,
                                          ansatz=name, regime=rname,
                                          objective="frobenius", seed=seed, **p))
@@ -235,6 +248,7 @@ def cmd_stage2(args):
                             got.append(a / (p["c"] + p["q"]))
                 print(f"  {name:<20} {rname:<22} median "
                       f"{st.median(got) if got else float('nan'):.3f}x", flush=True)
+    tracer.close()
     write(rows, args.out)
     print_bands(rows, curves, "regime", [r for r, _ in regimes])
 
@@ -261,6 +275,7 @@ def cmd_stage3(args):
               ("activation/V-only", dict(gradient_objective="activation-mse",
                                          train_side="v"))]
     rows, curves = [], {}
+    tracer = TraceWriter(args.trace, args.trace_every)
     for pname, lt, dep, W in layers:
         H = cov[pname]
         curves[(lt, dep)] = cc = classical_curve(W, H)
@@ -275,7 +290,12 @@ def cmd_stage3(args):
                         p = run_point(W, chi, name, args.sweeps, cov=H, seed=seed,
                                       optimizer="explicit+gradient",
                                       gd_steps=args.gd_steps, gd_lr=args.gd_lr,
-                                      fast_gradient=True, **skw)
+                                      fast_gradient=True, writer=tracer,
+                                      key=dict(layer_type=lt, depth=dep, chi=chi,
+                                               ansatz=name,
+                                               regime="explicit+gradient",
+                                               objective=sname, seed=seed),
+                                      **skw)
                         rows.append(dict(stage=3, layer_type=lt, depth=dep,
                                          ansatz=name, regime="explicit+gradient",
                                          objective=sname, seed=seed, **p))
@@ -284,6 +304,7 @@ def cmd_stage3(args):
                             got.append(a / (p["c"] + p["q"]))
                 print(f"  {name:<20} {sname:<20} median "
                       f"{st.median(got) if got else float('nan'):.3f}x", flush=True)
+    tracer.close()
     write(rows, args.out)
     print_bands(rows, curves, "objective", [s for s, _ in setups])
     print("\n(errors and the classical baseline are BOTH under H here, so the "
@@ -311,6 +332,11 @@ def main():
         p.add_argument("--points", type=int, default=10, help="chi' grid points")
         p.add_argument("--sweeps", type=int, default=12)
         p.add_argument("--out", default=f"{nm}.csv")
+        p.add_argument("--trace", default=None,
+                       help="write every optimisation's per-iteration trace to "
+                            "this CSV (one tidy long-format file)")
+        p.add_argument("--trace-every", type=int, default=5,
+                       help="keep every Nth Adam step (endpoints always kept)")
         if nm != "stage1":
             p.add_argument("--seeds", type=int, default=2)
             p.add_argument("--gd-steps", type=int, default=150)

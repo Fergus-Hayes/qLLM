@@ -243,3 +243,57 @@ def plot_ppl_rho(per_layer, out_dir):
     _style(ax)
     _save(fig, out_dir, "ppl_rho.png")
     plt.close(fig)
+
+
+def plot_traces(traces, out_dir, name="convergence_traces.png", max_curves=400):
+    """Every optimisation curve, one panel per regime, loss against iteration.
+
+    This is the direct evidence for "all runs converge": a plateaued run is a
+    curve that goes flat, and one that is still descending at the right edge is
+    visible as such without any summary statistic standing in between. Each curve
+    is normalised to its own first value, because the point is the *shape* of the
+    descent and absolute losses differ by layer and by objective.
+
+    The gradient phase only -- an environment sweep is a handful of iterations
+    and would compress to a couple of pixels beside a 150-step Adam run.
+    """
+    plt = _plt()
+    if plt is None or not traces:
+        return
+    grad = [t for t in traces if t["phase"] == "gradient"]
+    if not grad:
+        print("  (no gradient-phase rows to plot)")
+        return
+    regimes = list(dict.fromkeys(t.get("regime", t["objective"]) for t in grad))
+    fig, axes = plt.subplots(1, len(regimes), figsize=(3.1 * len(regimes) + 0.6, 3.5),
+                             sharey=True, squeeze=False)
+    for i, regime in enumerate(regimes):
+        ax = axes[0][i]
+        runs = {}
+        for t in grad:
+            if t.get("regime", t["objective"]) != regime:
+                continue
+            runs.setdefault(t["run_id"], []).append((t["iter"], t["loss"]))
+        drawn = 0
+        for pts in runs.values():
+            if len(pts) < 2:
+                continue
+            pts.sort()
+            first = pts[0][1]
+            if not first:
+                continue
+            ax.plot([p[0] for p in pts], [p[1] / first for p in pts],
+                    color=SERIES[i % len(SERIES)], linewidth=0.9, alpha=0.45)
+            drawn += 1
+            if drawn >= max_curves:
+                break
+        ax.set_title(f"{regime}   ({drawn} runs)", fontsize=9.5, color=INK)
+        ax.set_xlabel("Adam step")
+        if i == 0:
+            ax.set_ylabel("loss / its own first value")
+        _style(ax)
+    fig.suptitle("Every optimisation curve  (flat at the right edge = converged)",
+                 fontsize=11, color=INK, x=0.02, ha="left")
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    _save(fig, out_dir, name)
+    plt.close(fig)

@@ -37,7 +37,8 @@ from safetensors.torch import load_file
 from qllm.activation_stats import output_relative_error
 from qllm.compactifai import relative_error
 from qllm.disentangler import disentangle, hybrid_weight
-from qllm.opt_plots import plot_convergence, plot_lr
+from qllm.opt_plots import plot_convergence, plot_lr, plot_traces
+from qllm.trace_log import TraceWriter, read_traces
 from stages import ANSATZE, load_layers
 
 # (label, kwargs). Mirrors the regimes stages 2-3 actually run.
@@ -52,7 +53,8 @@ REGIMES = {
 }
 
 
-def run(W, chi, ansatz, regime, sweeps, gd_steps, lr, cov=None, seed=0):
+def run(W, chi, ansatz, regime, sweeps, gd_steps, lr, cov=None, seed=0,
+        writer=None, key=None):
     kw = dict(ANSATZE[ansatz]); kw.update(REGIMES[regime])
     r = disentangle(W, target_chi=chi, n_sites=2, sweeps=sweeps, tensorization="qubit",
                     gd_steps=gd_steps, gd_lr=lr, fast_gradient=True, seed=seed,
@@ -67,6 +69,8 @@ def run(W, chi, ansatz, regime, sweeps, gd_steps, lr, cov=None, seed=0):
     # compares the two and lands on the last element for arbitrary reasons. Drop
     # it, and for a warm-started run look only at the gradient segment, since
     # "was it still improving when cut off" is a question about Adam.
+    if writer:
+        writer.add(r, **(key or {}))
     hist = list(r.history or [])[:-1]
     if r.optimizer == "explicit+gradient":
         hist = hist[int(r.sweeps_run):]
@@ -111,6 +115,12 @@ def main():
     ap.add_argument("--tail-tol", type=float, default=0.10,
                     help="flag a run whose last tenth of budget delivered more "
                          "than this fraction of its total improvement")
+    ap.add_argument("--trace", default=None,
+                    help="write every optimisation's per-iteration trace to this "
+                         "CSV (one tidy long-format file)")
+    ap.add_argument("--trace-every", type=int, default=1,
+                    help="keep every Nth Adam step in the trace (endpoints always "
+                         "kept); the sweep phase is never thinned")
     ap.add_argument("--out", default="convergence.csv")
     ap.add_argument("--figs", default="figs",
                     help="directory for the figures (--figs '' to skip plotting)")
@@ -124,6 +134,7 @@ def main():
     layers = load_layers(args)
 
     rows = []
+    tracer = TraceWriter(args.trace, args.trace_every)
     print("Budget doubling: err at the stage budget vs twice it "
           f"(not converged if the gap exceeds {args.tol:.1%})")
     print("'tail' is the share of the run's total improvement that arrived in its "
@@ -144,7 +155,10 @@ def main():
                         continue
                     c = H if needs_h else None
                     base = run(W, chi, ansatz, regime, args.sweeps, args.gd_steps,
-                               args.gd_lr, c)
+                               args.gd_lr, c, writer=tracer,
+                               key=dict(layer_type=lt, depth=dep, chi=chi,
+                                        ansatz=ansatz, regime=regime,
+                                        lr=args.gd_lr, budget="1x"))
                     dbl = run(W, chi, ansatz, regime, args.sweeps * 2,
                               args.gd_steps * 2, args.gd_lr, c)
                     gap = ((base["err"] - dbl["err"]) / base["err"]
@@ -208,9 +222,12 @@ def main():
             w.writeheader(); w.writerows(lr_rows)
         print(f"\nWrote {len(lr_rows)} lr rows to {p2.resolve()}")
     print(f"Wrote {len(rows)} rows to {Path(args.out).resolve()}")
+    tracer.close()
     if args.figs:
         plot_convergence(rows, args.tol, args.figs)
         plot_lr(lr_rows, args.gd_lr, args.figs)
+        if args.trace and Path(args.trace).exists():
+            plot_traces(read_traces(args.trace), args.figs)
 
     # ---- verdict -------------------------------------------------------------
     print("\nConvergence by regime")
