@@ -125,6 +125,16 @@ def main():
     # --- 8. convergence harness flags a budget that is too small ------------
     import convergence
     assert "explicit" in convergence.REGIMES and "explicit+gradient-am" in convergence.REGIMES
+    # The plateau test must read the TAIL SLOPE. Adam keeps its best-so-far, so a
+    # healthy monotone run always ends on its best iterate and an argmax-based
+    # flag would fire on every single one -- useless as a diagnostic.
+    src = Path(ROOT, "convergence.py").read_text()
+    assert "tail_frac" in src and 'base["tail"] > args.tail_tol' in src, (
+        "convergence.py no longer flags plateaus by tail slope")
+    assert "hist = list(r.history or [])[:-1]" in src, (
+        "convergence.py is including _build_result's trailing `retained` in the "
+        "history it takes an argmax over -- that entry is a different quantity "
+        "on a different scale")
 
     # --- 9. the figures render for both checks ------------------------------
     import tempfile
@@ -133,7 +143,7 @@ def main():
         conv = [dict(layer_type="q", depth=0, chi=2, ansatz="a", regime=r,
                      gap=g, converged=int(g <= 0.01), still_improving=si,
                      err_base=0.9, err_double=0.9, best_at=5, n_hist=10,
-                     sweeps_run=3, seconds=1.0)
+                     tail=0.2 * si, metric="frob", sweeps_run=3, seconds=1.0)
                 for r, g, si in (("explicit", 0.001, 0), ("gradient", 0.03, 1))]
         lr = [dict(layer_type="q", depth=0, chi=2, ansatz="a", regime="gradient",
                    lr=l, err=e) for l, e in ((0.01, 0.9), (0.05, 0.8), (0.2, 0.85))]

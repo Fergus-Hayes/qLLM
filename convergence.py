@@ -60,12 +60,29 @@ def run(W, chi, ansatz, regime, sweeps, gd_steps, lr, cov=None, seed=0):
     approx, _ = hybrid_weight(r, chi)
     err = (float(relative_error(W, approx)) if cov is None
            else output_relative_error(W, approx, cov))
-    hist = list(r.history or [])
-    # history holds 1 - loss for the Adam path and the sweep score for the explicit
-    # one; either way the best iterate is its argmax.
+    # history is NOT one homogeneous series. _build_result appends the achieved
+    # retained weight as a final element, which is a different quantity from the
+    # per-iteration entries (1 - loss for Adam, the sweep score for the explicit
+    # path) and lives on its own scale -- taking an argmax over the whole list
+    # compares the two and lands on the last element for arbitrary reasons. Drop
+    # it, and for a warm-started run look only at the gradient segment, since
+    # "was it still improving when cut off" is a question about Adam.
+    hist = list(r.history or [])[:-1]
+    if r.optimizer == "explicit+gradient":
+        hist = hist[int(r.sweeps_run):]
     best_at = (max(range(len(hist)), key=lambda i: hist[i]) + 1) if hist else 0
+    # "Best iterate is the last step" is NOT a useful plateau test: Adam keeps its
+    # best-so-far, so a healthy monotone run always ends on its best and the flag
+    # fires every time. What separates plateaued from cut-off is the TAIL SLOPE --
+    # what fraction of the whole run's improvement arrived in its last tenth.
+    tail_frac = 0.0
+    if len(hist) >= 10:
+        total = hist[-1] - hist[0]
+        cut = hist[int(len(hist) * 0.9) - 1]
+        if abs(total) > 1e-12:
+            tail_frac = max(0.0, (hist[-1] - cut) / total)
     return dict(err=err, sweeps_run=int(r.sweeps_run), n_hist=len(hist),
-                best_at=best_at, seconds=round(r.seconds, 2))
+                best_at=best_at, tail=tail_frac, seconds=round(r.seconds, 2))
 
 
 def main():
@@ -91,6 +108,9 @@ def main():
                     help="learning rates for the sensitivity check")
     ap.add_argument("--tol", type=float, default=0.01,
                     help="a doubling gap above this means NOT converged")
+    ap.add_argument("--tail-tol", type=float, default=0.10,
+                    help="flag a run whose last tenth of budget delivered more "
+                         "than this fraction of its total improvement")
     ap.add_argument("--out", default="convergence.csv")
     ap.add_argument("--figs", default="figs",
                     help="directory for the figures (--figs '' to skip plotting)")
@@ -105,9 +125,15 @@ def main():
 
     rows = []
     print("Budget doubling: err at the stage budget vs twice it "
-          f"(not converged if the gap exceeds {args.tol:.1%})\n")
-    print(f"{'layer':>16}{'chi':>5}{'ansatz':>18}{'regime':>22}"
-          f"{'err(B)':>10}{'err(2B)':>10}{'gap':>9}{'best@':>9}{'ok':>4}")
+          f"(not converged if the gap exceeds {args.tol:.1%})")
+    print("'tail' is the share of the run's total improvement that arrived in its "
+          "last tenth;\nlarge means it was cut off mid-descent, not left on a "
+          "plateau.")
+    print("Each regime is scored in ITS OWN objective's metric -- 'act' rows are "
+          "the H-weighted\nerror, 'frob' rows the Frobenius one. Compare down a "
+          "column only within a metric.\n")
+    print(f"{'layer':>16}{'chi':>5}{'ansatz':>18}{'regime':>22}{'metric':>7}"
+          f"{'err(B)':>10}{'err(2B)':>10}{'gap':>9}{'tail':>8}{'ok':>4}")
     for pname, lt, dep, W in layers:
         H = cov.get(pname)
         for chi in args.chis:
@@ -124,25 +150,27 @@ def main():
                     gap = ((base["err"] - dbl["err"]) / base["err"]
                            if base["err"] > 0 else 0.0)
                     ok = gap <= args.tol
-                    # For the Adam path, "best iterate is the last step" is an
-                    # independent warning: the run was still improving when it
-                    # was cut off, whatever the doubling gap says.
-                    tail = (base["best_at"] >= base["n_hist"] > 1
-                            and regime != "explicit")
+                    # Independent of the doubling gap: if a tenth of the budget
+                    # is still delivering a tenth of the total gain, the run was
+                    # cut off mid-descent rather than left on a plateau.
+                    tail = base["tail"] > args.tail_tol
                     rows.append(dict(layer_type=lt, depth=dep, chi=chi,
                                      ansatz=ansatz, regime=regime,
                                      err_base=round(base["err"], 6),
                                      err_double=round(dbl["err"], 6),
                                      gap=round(gap, 5), converged=int(ok),
                                      best_at=base["best_at"], n_hist=base["n_hist"],
+                                     tail=round(base["tail"], 5),
                                      sweeps_run=base["sweeps_run"],
+                                     metric=("act" if needs_h else "frob"),
                                      still_improving=int(tail),
                                      seconds=base["seconds"]))
                     flag = "ok" if ok else "NO"
                     print(f"{lt[-12:]:>16}{chi:>5}{ansatz:>18}{regime:>22}"
+                          f"{('act' if needs_h else 'frob'):>7}"
                           f"{base['err']:>10.5f}{dbl['err']:>10.5f}{gap:>8.2%}"
-                          f"{str(base['best_at']) + '/' + str(base['n_hist']):>9}"
-                          f"{flag:>4}" + ("  <- still improving" if tail else ""),
+                          f"{base['tail']:>7.1%}{flag:>4}"
+                          + ("  <- still improving" if tail else ""),
                           flush=True)
 
     # ---- learning-rate sensitivity (gradient regimes only) ------------------

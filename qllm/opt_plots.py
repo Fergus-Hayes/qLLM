@@ -101,7 +101,7 @@ def plot_convergence(rows, tol, out_dir):
     ax.set_ylim(-0.6, len(regimes) - 0.4)
     ax.set_xlabel("error removed by doubling the budget  (%)")
     ax.set_title("Does the stage budget converge?  one dot per configuration\n"
-                 "open dot = best iterate was the last step (still improving)",
+                 "open dot = last tenth of the budget still delivering gain",
                  fontsize=11, color=INK, loc="left")
     _style(ax)
     _save(fig, out_dir, "convergence_doubling.png")
