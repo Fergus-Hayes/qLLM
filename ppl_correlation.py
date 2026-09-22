@@ -39,6 +39,7 @@ from qllm.activation_stats import input_covariance, output_relative_error
 from qllm.compactifai import log_spaced_ints, relative_error
 from qllm.disentangler import classical_param_count, disentangle, hybrid_weight
 from qllm.layer_analysis import quick_perplexity
+from qllm.opt_plots import plot_ppl_rho, plot_ppl_scatter
 from qllm.qubit_mpo import make_plan, plan_compress
 from stages import ANSATZE
 
@@ -100,6 +101,8 @@ def main():
     ap.add_argument("--window", type=int, default=512)
     ap.add_argument("--batch-size", type=int, default=2)
     ap.add_argument("--out", default="ppl_correlation.csv")
+    ap.add_argument("--figs", default="figs",
+                    help="directory for the figures (--figs '' to skip plotting)")
     args = ap.parse_args()
 
     from transformers import AutoModelForCausalLM
@@ -200,7 +203,7 @@ def main():
           "(rho = Spearman on ppl; r = Pearson on log-log)")
     print(f"{'layer':<18}{'depth':>6}{'family':>9}{'rho act':>10}{'rho frob':>10}"
           f"{'r act':>9}{'r frob':>9}{'n':>5}{'n>0':>5}")
-    pooled = {}
+    pooled, per_layer_rho = {}, []
     for family in ("mpo", "hybrid"):
         for lt, dep in dict.fromkeys((r["layer_type"], r["depth"]) for r in rows):
             sel = [r for r in rows if r["family"] == family
@@ -209,9 +212,16 @@ def main():
             if not c:
                 continue
             pooled.setdefault(family, []).append(c)
+            per_layer_rho.append((lt, dep, family, c))
             print(f"{lt:<18}{dep:>6}{family:>9}{c['rho_act']:>10.3f}"
                   f"{c['rho_frob']:>10.3f}{c['r_act']:>9.3f}{c['r_frob']:>9.3f}"
                   f"{len(sel):>5}{c['n_act']:>5}")
+
+    if args.figs:
+        allc = corr(rows) or {}
+        plot_ppl_scatter(rows, args.figs,
+                         {"act": allc.get("rho_act"), "frob": allc.get("rho_frob")})
+        plot_ppl_rho(per_layer_rho, args.figs)
 
     print("\nPooled")
     verdict = {}

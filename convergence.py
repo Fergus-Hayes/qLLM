@@ -37,6 +37,7 @@ from safetensors.torch import load_file
 from qllm.activation_stats import output_relative_error
 from qllm.compactifai import relative_error
 from qllm.disentangler import disentangle, hybrid_weight
+from qllm.opt_plots import plot_convergence, plot_lr
 from stages import ANSATZE, load_layers
 
 # (label, kwargs). Mirrors the regimes stages 2-3 actually run.
@@ -87,6 +88,8 @@ def main():
     ap.add_argument("--tol", type=float, default=0.01,
                     help="a doubling gap above this means NOT converged")
     ap.add_argument("--out", default="convergence.csv")
+    ap.add_argument("--figs", default="figs",
+                    help="directory for the figures (--figs '' to skip plotting)")
     args = ap.parse_args()
 
     cov = {}
@@ -173,6 +176,9 @@ def main():
             w.writeheader(); w.writerows(lr_rows)
         print(f"\nWrote {len(lr_rows)} lr rows to {p2.resolve()}")
     print(f"Wrote {len(rows)} rows to {Path(args.out).resolve()}")
+    if args.figs:
+        plot_convergence(rows, args.tol, args.figs)
+        plot_lr(lr_rows, args.gd_lr, args.figs)
 
     # ---- verdict -------------------------------------------------------------
     print("\nConvergence by regime")

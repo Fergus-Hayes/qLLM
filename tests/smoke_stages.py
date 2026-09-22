@@ -17,6 +17,7 @@ Covers the three new capabilities and the guards the stage verdicts rest on:
 """
 import os
 import sys
+from pathlib import Path
 
 import torch
 
@@ -125,6 +126,31 @@ def main():
     import convergence
     assert "explicit" in convergence.REGIMES and "explicit+gradient-am" in convergence.REGIMES
 
+    # --- 9. the figures render for both checks ------------------------------
+    import tempfile
+    from qllm import opt_plots
+    if opt_plots._plt() is not None:
+        conv = [dict(layer_type="q", depth=0, chi=2, ansatz="a", regime=r,
+                     gap=g, converged=int(g <= 0.01), still_improving=si,
+                     err_base=0.9, err_double=0.9, best_at=5, n_hist=10,
+                     sweeps_run=3, seconds=1.0)
+                for r, g, si in (("explicit", 0.001, 0), ("gradient", 0.03, 1))]
+        lr = [dict(layer_type="q", depth=0, chi=2, ansatz="a", regime="gradient",
+                   lr=l, err=e) for l, e in ((0.01, 0.9), (0.05, 0.8), (0.2, 0.85))]
+        pc = [dict(layer_type="q", depth=0, family=f, chi=c, c=1, q=0, total=1,
+                   frob=0.1 * c, act=0.1 * c, ppl=10 + c, dppl=float(c))
+              for f in ("mpo", "hybrid") for c in (1, 2, 3, 4)]
+        rho = [("q", 0, "mpo", dict(rho_act=0.9, rho_frob=0.7)),
+               ("q", 0, "hybrid", dict(rho_act=-0.3, rho_frob=-0.4))]
+        with tempfile.TemporaryDirectory() as td:
+            opt_plots.plot_convergence(conv, 0.01, td)
+            opt_plots.plot_lr(lr, 0.05, td)
+            opt_plots.plot_ppl_scatter(pc, td, {"act": 0.9, "frob": 0.7})
+            opt_plots.plot_ppl_rho(rho, td)
+            made = sorted(p.name for p in Path(td).glob("*.png"))
+        assert made == ["convergence_doubling.png", "convergence_lr.png",
+                        "ppl_rho.png", "ppl_scatter.png"], made
+
     print(f"  constrained gates: {n} angles, orthogonal to 1e-12, "
           f"off-block mass exactly 0, differentiable")
     print(f"  activation objective {e_a:.5f} beats Frobenius {e_f:.5f} on the "
@@ -133,6 +159,7 @@ def main():
     print("  hybrid family contains the classical MPO exactly at chi=1,2,4")
     print("  ansatz ranking ignores the chi'=1 corner")
     print("  Spearman is signed (+1 / -1 / ties) and the ppl verdict reads the sign")
+    print("  all four figures render")
     print("\nSTAGES SMOKE PASSED")
 
 
