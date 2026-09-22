@@ -28,6 +28,7 @@ Two things decide whether the answer is trustworthy:
 import argparse
 import csv
 import math
+import statistics as st
 from pathlib import Path
 
 import torch
@@ -166,6 +167,25 @@ def main():
                         wins.append((lt, dep, t, n, gain))
                     line += f"{c:>11,} {gain:>4.2f}x" if gain == gain else f"{c:>17,}"
             print(line)
+
+    # The max ratio is set by the chi'=1 corner, where the errors are ~0.999 and
+    # the parameter counts are tens. Banding by the hybrid point's own error is the
+    # only reading that says whether the saving survives to a usable accuracy.
+    print("\nSaving by the accuracy of the hybrid point (mean over layers)")
+    bands = [(0.99, 1.01), (0.95, 0.99), (0.80, 0.95), (0.0, 0.80)]
+    print(f"{'err band':>16}" + "".join(f"{n:>17}" for n in args.ansatze))
+    for lo, hi in bands:
+        cells = []
+        for n in args.ansatze:
+            v = []
+            for (lt, dep), by in per_point.items():
+                cc2 = per_layer[(lt, dep)]["classical"]
+                for ratio, _chi, e in (by.get(n) or []):
+                    if lo <= e < hi:
+                        v.append(ratio)
+            cells.append(st.mean(v) if v else float("nan"))
+        print(f"  [{lo:.2f},{hi:.2f})".rjust(16) + "".join(
+            ("              n/a" if c != c else f"{c:>16.3f}x") for c in cells))
 
     print("\nBest parameter saving of a circuit over the MPO alone, at matched error")
     print(f"{'layer':<18}{'depth':>6}" + "".join(f"{n:>17}" for n in args.ansatze))
