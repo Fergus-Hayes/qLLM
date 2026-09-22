@@ -111,6 +111,20 @@ def main():
     assert abs(ranked["A"] - ranked["B"]) < 1e-9, (
         "ranking was swayed by the chi'=1 corner: " + repr(ranked))
 
+    # --- 7. the correlation verdict reads SIGNED rho ------------------------
+    # An anti-correlated proxy is the worst outcome, not a strong one: scoring it
+    # by |rho| would call a ranking that is exactly backwards a success.
+    import ppl_correlation as pc
+    asc = [1.0, 2.0, 3.0, 4.0, 5.0]
+    assert abs(pc._spearman(asc, asc) - 1.0) < 1e-12
+    assert abs(pc._spearman(asc, asc[::-1]) + 1.0) < 1e-12
+    assert abs(pc._spearman([1.0, 1.0, 2.0, 2.0], [1.0, 1.0, 2.0, 2.0]) - 1.0) < 1e-12
+    assert abs(pc._pearson([1.0, 2.0, 3.0], [2.0, 4.0, 6.0]) - 1.0) < 1e-12
+
+    # --- 8. convergence harness flags a budget that is too small ------------
+    import convergence
+    assert "explicit" in convergence.REGIMES and "explicit+gradient-am" in convergence.REGIMES
+
     print(f"  constrained gates: {n} angles, orthogonal to 1e-12, "
           f"off-block mass exactly 0, differentiable")
     print(f"  activation objective {e_a:.5f} beats Frobenius {e_f:.5f} on the "
@@ -118,6 +132,7 @@ def main():
     print("  train_side freezes V; activation-mse refuses without H")
     print("  hybrid family contains the classical MPO exactly at chi=1,2,4")
     print("  ansatz ranking ignores the chi'=1 corner")
+    print("  Spearman is signed (+1 / -1 / ties) and the ppl verdict reads the sign")
     print("\nSTAGES SMOKE PASSED")
 
 
