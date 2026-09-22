@@ -103,10 +103,35 @@ class Gate:
 
     Realized as a ``qml.QubitUnitary`` on :attr:`wires`; ``matrix`` is the current
     unitary, the trainable parameter the environment-SVD sweep updates in place.
+
+    ``groups`` optionally constrains the gate to be **block diagonal**: a partition
+    of ``range(2^k)`` into index sets, with the matrix orthogonal inside each set
+    and zero between them (indices in no group stay on the identity). ``ties``
+    labels the groups, and groups sharing a label share one matrix. That is exactly
+    a uniformly-controlled (multiplexed) rotation, and it is how an ansatz built
+    from a known index pairing -- RoPE's ``(i, i + d_head/2)`` -- is expressed
+    without inventing a new gate type: the structure lives in the matrix, so
+    application, the register unitary and the sweep all work unchanged.
     """
     start: int
     k: int
     matrix: torch.Tensor
+    groups: tuple[tuple[int, ...], ...] | None = None
+    ties: tuple[int, ...] | None = None
+
+    def param_count(self, counting: str = "manifold") -> int:
+        """Variational parameters this gate actually carries, structure included."""
+        if self.groups is None:
+            return gate_param_count(self.k, counting)
+        seen, total = set(), 0
+        for gi, grp in enumerate(self.groups):
+            lab = self.ties[gi] if self.ties is not None else gi
+            if lab in seen:
+                continue                      # a tied group is not a new parameter
+            seen.add(lab)
+            n = len(grp)
+            total += n * n if counting == "entries" else n * (n - 1) // 2
+        return total
 
     @property
     def wires(self) -> list[int]:
@@ -119,7 +144,9 @@ class Gate:
             wires=self.wires, unitary_check=False)
 
 
-ANSATZE = ("brickwall", "head-block")
+ANSATZE = ("brickwall", "head-block", "rope-pair",
+           "adjacent-pair", "random-pair")
+PAIR_ANSATZE = ("rope-pair", "adjacent-pair", "random-pair")
 
 
 def head_block_positions(n_qubits: int, head_dim: int, gate_size: int,
@@ -155,6 +182,80 @@ def head_block_positions(n_qubits: int, head_dim: int, gate_size: int,
         for s, k in gate_positions(within, gate_size, depth):
             positions.append((s + head_bits, k))
     return positions
+
+
+def rope_pair_groups(n_qubits: int, head_dim: int, share_heads: bool = True,
+                     pairing: str = "rope", seed: int = 0):
+    """Index groups of the RoPE pairing: ``(i, i + head_dim/2)`` inside each head.
+
+    RoPE is the one place in these weights where the index ordering means something
+    rather than being an artefact of writing a row number in binary. It rotates
+    coordinate ``i`` of a head against coordinate ``i + head_dim/2``, with an angle
+    that depends on ``i`` and -- importantly -- is the *same for every head*. So the
+    faithful ansatz is one ``SO(2)`` per frequency, shared across heads
+    (``share_heads``), which costs ``head_dim/2`` parameters for the whole register
+    no matter how wide it is. ``share_heads=False`` gives each head its own angles,
+    at ``2^n / 2`` parameters.
+
+    Returns ``(groups, ties)``, or ``(None, None)`` when the register does not
+    factor into heads of this size. The register is padded to a power of two, so the
+    trailing heads are all-zero; they contribute nothing to a tied environment,
+    which is a further reason to prefer sharing.
+    """
+    dim = 1 << n_qubits
+    if head_dim < 2 or head_dim % 2 or n_qubits <= 0 or dim % head_dim:
+        return None, None
+    half = head_dim // 2
+    if pairing == "random":
+        # The matched null. Same number of groups, same group size, same tie
+        # structure -- only WHICH coordinates are paired is destroyed. A gain that
+        # survives this is a gain from a rotation of that shape, not from RoPE.
+        gen = torch.Generator().manual_seed(seed)
+        order = [torch.randperm(head_dim, generator=gen).tolist()
+                 for _ in range(dim // head_dim)]
+    groups, ties = [], []
+    for head in range(dim // head_dim):
+        base = head * head_dim
+        for freq in range(half):
+            if pairing == "rope":
+                a, b = freq, freq + half           # RoPE: i against i + d_head/2
+            elif pairing == "adjacent":
+                a, b = 2 * freq, 2 * freq + 1      # control: neighbouring coords
+            elif pairing == "random":
+                a, b = order[head][2 * freq], order[head][2 * freq + 1]
+            else:                                   # pragma: no cover
+                raise ValueError(f"unknown pairing {pairing!r}")
+            groups.append((base + a, base + b))
+            ties.append(freq if share_heads else head * half + freq)
+    return tuple(groups), tuple(ties)
+
+
+def gate_structures(n_qubits: int, gate_size: int, depth: int,
+                    ansatz: str = "brickwall", head_dim: int = 0,
+                    share_heads: bool = True, side: str = "out",
+                    pair_seed: int = 0):
+    """``(start, k, groups, ties)`` for every gate, in application order.
+
+    The layout view :func:`gate_positions` returns the first two fields; this adds
+    the block structure that a multiplexed ansatz needs.
+
+    ``rope-pair`` puts one register-wide multiplexed rotation first, then the
+    ordinary brickwall (if ``gate_size``/``depth`` ask for one) on top of it.
+    ``side`` matters: RoPE acts on the *output* of q_proj / k_proj, so the pairing
+    is real for ``U`` and meaningless for ``V``, which falls back to the brickwall.
+    """
+    if ansatz not in PAIR_ANSATZE:
+        return [(st, k, None, None) for st, k
+                in gate_positions(n_qubits, gate_size, depth, ansatz, head_dim)]
+    plain = [(st, k, None, None) for st, k
+             in gate_positions(n_qubits, gate_size, depth)]
+    if side not in ("out", "both"):
+        return plain
+    groups, ties = rope_pair_groups(n_qubits, head_dim, share_heads,
+                                    ansatz.split("-")[0], pair_seed)
+    if not groups:
+        return plain
+    return [(0, n_qubits, groups, ties)] + plain
 
 
 def gate_positions(n_qubits: int, gate_size: int, depth: int,
@@ -205,18 +306,33 @@ def gate_param_count(k: int, counting: str = "manifold") -> int:
 
 def circuit_param_count(n_qubits: int, gate_size: int, depth: int,
                         counting: str = "manifold", ansatz: str = "brickwall",
-                        head_dim: int = 0) -> int:
+                        head_dim: int = 0, share_heads: bool = True,
+                        side: str = "out", pair_seed: int = 0) -> int:
     """Total variational parameters of the circuit -- the ``Q(D)`` term."""
-    return sum(gate_param_count(k, counting)
-               for _s, k in gate_positions(n_qubits, gate_size, depth, ansatz, head_dim))
+    return sum(Gate(start=st, k=k, matrix=_EMPTY, groups=gr,
+                    ties=ti).param_count(counting)
+               for st, k, gr, ti in gate_structures(n_qubits, gate_size, depth,
+                                                    ansatz, head_dim, share_heads,
+                                                    side, pair_seed))
 
 
 def quantum_param_count(n_out_qubits: int, n_in_qubits: int, gate_size: int,
                         depth: int, counting: str = "manifold",
-                        ansatz: str = "brickwall", head_dim: int = 0) -> int:
-    """``Q(D)``: parameters of both disentangling circuits ``U`` and ``V``."""
-    return (circuit_param_count(n_out_qubits, gate_size, depth, counting, ansatz, head_dim)
-            + circuit_param_count(n_in_qubits, gate_size, depth, counting, ansatz, head_dim))
+                        ansatz: str = "brickwall", head_dim: int = 0,
+                        share_heads: bool = True, rope_side: str = "out") -> int:
+    """``Q(D)``: parameters of both disentangling circuits ``U`` and ``V``.
+
+    ``U`` and ``V`` are counted on their own sides, because ``rope-pair`` is a
+    statement about the output index and does not apply to the input one.
+    """
+    return (circuit_param_count(n_out_qubits, gate_size, depth, counting, ansatz,
+                                head_dim, share_heads, "out")
+            + circuit_param_count(n_in_qubits, gate_size, depth, counting, ansatz,
+                                  head_dim, share_heads,
+                                  "out" if rope_side == "both" else "in"))
+
+
+_EMPTY = torch.zeros(0)          # placeholder for count-only Gate objects
 
 
 def _identity_gate(k: int) -> torch.Tensor:
@@ -229,9 +345,38 @@ def _random_gate(k: int, generator: torch.Generator | None) -> torch.Tensor:
     return q * torch.sign(torch.diagonal(r)).unsqueeze(0)   # Haar on O(2^k)
 
 
+def _scatter_blocks(k: int, groups, ties, block_by_tie) -> torch.Tensor:
+    """Assemble a block-diagonal orthogonal from one matrix per tie label.
+
+    Indices covered by no group keep the identity, so the result is orthogonal
+    whatever partition is handed in.
+    """
+    out = torch.eye(1 << k, dtype=torch.float32)
+    for gi, grp in enumerate(groups):
+        lab = ties[gi] if ties is not None else gi
+        idx = torch.as_tensor(grp, dtype=torch.long)
+        out[idx.unsqueeze(1), idx.unsqueeze(0)] = block_by_tie[lab].to(out.dtype)
+    return out
+
+
+def _structured_random(k: int, groups, ties,
+                       generator: torch.Generator | None) -> torch.Tensor:
+    blocks = {}
+    for gi, grp in enumerate(groups):
+        lab = ties[gi] if ties is not None else gi
+        if lab not in blocks:
+            n = len(grp)
+            a = torch.randn(n, n, dtype=torch.float32, generator=generator)
+            q, r = torch.linalg.qr(a)
+            blocks[lab] = q * torch.sign(torch.diagonal(r)).unsqueeze(0)
+    return _scatter_blocks(k, groups, ties, blocks)
+
+
 def build_circuit(n_qubits: int, gate_size: int, depth: int, init: str = "identity",
                   generator: torch.Generator | None = None,
-                  ansatz: str = "brickwall", head_dim: int = 0) -> list[Gate]:
+                  ansatz: str = "brickwall", head_dim: int = 0,
+                  share_heads: bool = True, side: str = "out",
+                  pair_seed: int = 0) -> list[Gate]:
     """Brickwall of real orthogonal gates, initialised to identity or Haar-random.
 
     ``identity`` makes the circuit a no-op, so the hybrid layer starts exactly at
@@ -239,9 +384,15 @@ def build_circuit(n_qubits: int, gate_size: int, depth: int, init: str = "identi
     paper's "the hybrid model departs from the classical baseline".
     """
     gates = []
-    for start, k in gate_positions(n_qubits, gate_size, depth, ansatz, head_dim):
-        mat = _identity_gate(k) if init == "identity" else _random_gate(k, generator)
-        gates.append(Gate(start=start, k=k, matrix=mat))
+    for start, k, groups, ties in gate_structures(n_qubits, gate_size, depth,
+                                                  ansatz, head_dim, share_heads,
+                                                  side, pair_seed):
+        if groups is None:
+            mat = _identity_gate(k) if init == "identity" else _random_gate(k, generator)
+        else:
+            mat = (_identity_gate(k) if init == "identity"
+                   else _structured_random(k, groups, ties, generator))
+        gates.append(Gate(start=start, k=k, matrix=mat, groups=groups, ties=ties))
     return gates
 
 
@@ -388,6 +539,26 @@ def _polar(matrix: torch.Tensor) -> torch.Tensor:
     return p @ q
 
 
+def _polar_structured(env: torch.Tensor, groups, ties) -> torch.Tensor:
+    """Polar update restricted to a block-diagonal (and optionally tied) gate.
+
+    Still closed form, and still *exact*. With the off-block entries of ``g`` pinned
+    to zero, ``<g, E>`` = ``sum_G tr(g_G^T E[G,G])``, so the groups decouple; tying
+    a set of groups to one matrix ``R`` turns their terms into
+    ``tr(R^T sum_G E[G,G])``. Each tie class is therefore maximised by the polar
+    factor of its *summed* diagonal sub-block -- one small SVD per class, no
+    iteration and no projection step that could lose optimality.
+    """
+    acc: dict[int, torch.Tensor] = {}
+    for gi, grp in enumerate(groups):
+        lab = ties[gi] if ties is not None else gi
+        idx = torch.as_tensor(grp, dtype=torch.long)
+        sub = env[idx.unsqueeze(1), idx.unsqueeze(0)]
+        acc[lab] = sub if lab not in acc else acc[lab] + sub
+    k = int(round(math.log2(env.shape[0])))
+    return _scatter_blocks(k, groups, ties, {c: _polar(m) for c, m in acc.items()})
+
+
 def sweep_circuit(gates: list[Gate], target: torch.Tensor, source: torch.Tensor,
                   n_qubits: int) -> float:
     """One environment sweep maximizing ``<target, C source>`` over the gates.
@@ -405,7 +576,8 @@ def sweep_circuit(gates: list[Gate], target: torch.Tensor, source: torch.Tensor,
         old = gate.matrix
         right = apply_gate(right, old.T, gate.start, gate.k, n_qubits)
         env = _environment(left, right, gate.start, gate.k)
-        gate.matrix = _polar(env)
+        gate.matrix = (_polar(env) if gate.groups is None
+                       else _polar_structured(env, gate.groups, gate.ties))
         left = apply_gate(left, gate.matrix.T, gate.start, gate.k, n_qubits)
     return float((left * source).sum())               # <C^T target, source>
 
@@ -610,6 +782,13 @@ def _train_gradient(padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
     path is several times faster per step and much lighter on memory for wide
     registers. The default keeps the PennyLane path (``qml.matrix``).
     """
+    if ansatz in PAIR_ANSATZE:
+        raise ValueError(
+            f"the {ansatz!r} ansatz is only implemented for optimizer='explicit'. "
+            "Its gates are block diagonal, which the environment-SVD sweep solves "
+            "exactly per block; the Adam path parameterises a gate as "
+            "expm(skew(theta)) over the whole register, which would drop the "
+            "constraint and train 523776 angles where the ansatz has 32.")
     pos_u = gate_positions(n_out, gate_size, depth, ansatz, head_dim)
     pos_v = gate_positions(n_in, gate_size, depth, ansatz, head_dim)
     gen = torch.Generator().manual_seed(seed)
@@ -725,7 +904,7 @@ def _build_result(weight, padded, u_gates, v_gates, n_out, n_in, gate_size, dept
         padded_shape=(1 << n_out, 1 << n_in), plan=plan, operator=current,
         # Counted from the gates that were actually built, not re-derived from
         # (gate_size, depth) -- so it stays correct for any ansatz layout.
-        quantum_params=sum(gate_param_count(g.k, param_counting)
+        quantum_params=sum(g.param_count(param_counting)
                            for g in list(u_gates) + list(v_gates)),
         target_chi=target_chi, accuracy=accuracy,
         entropy=plan_bond_entropy(current, plan), retained=retained,
@@ -745,6 +924,8 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
                       fast_gradient: bool = False,
                       gradient_objective: str = "disentangle-loss",
                       ansatz: str = "brickwall", head_dim: int = 0,
+                      share_heads: bool = True, rope_side: str = "out",
+                      pair_seed: int = 0,
                       log: bool = False) -> DisentangleResult:
     """Disentangle ``W`` into ``U MPO_new V^T`` with brickwall circuits of depth ``D``.
 
@@ -809,8 +990,11 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
 
     # --- explicit environment / SVD sweep (paper Appendix A) ---
     generator = torch.Generator().manual_seed(seed)
-    u_gates = build_circuit(n_out, gate_size, depth, init, generator, ansatz, head_dim)
-    v_gates = build_circuit(n_in, gate_size, depth, init, generator, ansatz, head_dim)
+    u_gates = build_circuit(n_out, gate_size, depth, init, generator, ansatz,
+                            head_dim, share_heads, "out", pair_seed)
+    v_gates = build_circuit(n_in, gate_size, depth, init, generator, ansatz,
+                            head_dim, share_heads,
+                            "out" if rope_side == "both" else "in", pair_seed)
 
     current = padded                             # U^T W V, starts at W (identity gates)
     history: list[float] = []
@@ -898,6 +1082,8 @@ def disentangle(weight: torch.Tensor, gate_size: int, depth: int,
                 restarts: int = 1, fast_gradient: bool = False,
                 gradient_objective: str = "disentangle-loss",
                 ansatz: str = "brickwall", head_dim: int = 0,
+                share_heads: bool = True, rope_side: str = "out",
+                pair_seed: int = 0,
                 log: bool = False) -> DisentangleResult:
     """Disentangle ``W``, keeping the best of ``restarts`` initializations.
 
@@ -920,7 +1106,7 @@ def disentangle(weight: torch.Tensor, gate_size: int, depth: int,
             weight, gate_size, depth, target_chi, n_sites, sweeps, tol, this_init,
             this_seed, param_counting, target_mode, tensorization, qubit_align,
             optimizer, gd_steps, gd_lr, fast_gradient, gradient_objective,
-            ansatz, head_dim, log)
+            ansatz, head_dim, share_heads, rope_side, pair_seed, log)
 
     best = _run(init, seed)
     for extra in range(1, max(1, restarts)):
