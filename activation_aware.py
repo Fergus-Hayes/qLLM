@@ -141,9 +141,27 @@ def cmd_capture(args):
         if i % max(1, n // 10) == 0 or i == n:
             print(f"  {i}/{n} batches", flush=True)
 
-    cov, counts = input_covariance(model, names, batches, device=device, progress=prog)
+    # A held-out H. The activation objective is fitted against an H estimated from
+    # finite calibration tokens, so a second H from DIFFERENT tokens is the only
+    # way to ask whether a long optimisation is chasing sampling noise. Splitting
+    # by batch keeps the two disjoint in tokens, not merely in index.
+    splits = {"": batches}
+    if args.holdout:
+        cut = max(1, int(len(batches) * (1.0 - args.holdout)))
+        if cut >= len(batches):
+            raise SystemExit("--holdout leaves no validation batches; raise "
+                             "--calib-tokens or lower --holdout.")
+        splits = {"": batches[:cut], "_val": batches[cut:]}
+        print(f"  holdout: {cut} train batch(es), {len(batches) - cut} validation")
 
-    out = Path(args.out)
+    from safetensors.torch import save_file
+    for suffix, bs in splits.items():
+        cov, counts = input_covariance(model, names, bs, device=device,
+                                       progress=prog if not suffix else None)
+        _write_cov(cov, counts, Path(str(args.out) + suffix))
+
+
+def _write_cov(cov, counts, out):
     out.mkdir(parents=True, exist_ok=True)
     from safetensors.torch import save_file
     man = []
@@ -161,7 +179,7 @@ def cmd_capture(args):
         w = csv.DictWriter(fh, fieldnames=list(man[0].keys()))
         w.writeheader()
         w.writerows(man)
-    print(f"\nSaved {len(man)} covariance matrices to {out.resolve()}")
+    print(f"Saved {len(man)} covariance matrices to {out.resolve()}")
 
 
 # --------------------------------------------------------------------------- #
@@ -824,6 +842,10 @@ def main():
     c.add_argument("--calib-tokens", type=int, default=65536)
     c.add_argument("--window", type=int, default=512)
     c.add_argument("--batch-size", type=int, default=2)
+    c.add_argument("--holdout", type=float, default=0.0,
+                   help="fraction of calibration batches held out into a second "
+                        "directory <out>_val, for scoring activation-MSE runs "
+                        "against an H built from tokens they were not fitted to")
     c.set_defaults(func=cmd_capture)
 
     s = sub.add_parser("score", help="score compressions under both metrics")

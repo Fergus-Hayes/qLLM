@@ -55,11 +55,11 @@ REGIMES = {
 
 
 def run(W, chi, ansatz, regime, sweeps, gd_steps, lr, cov=None, seed=0,
-        writer=None, key=None):
+        writer=None, key=None, patience=0, min_delta=0.0, cov_val=None):
     kw = dict(ANSATZE[ansatz]); kw.update(REGIMES[regime])
     r = disentangle(W, target_chi=chi, n_sites=2, sweeps=sweeps, tensorization="qubit",
                     gd_steps=gd_steps, gd_lr=lr, fast_gradient=True, seed=seed,
-                    cov=cov, **kw)
+                    cov=cov, patience=patience, min_delta=min_delta, **kw)
     approx, _ = hybrid_weight(r, chi)
     err = (float(relative_error(W, approx)) if cov is None
            else output_relative_error(W, approx, cov))
@@ -86,8 +86,18 @@ def run(W, chi, ansatz, regime, sweeps, gd_steps, lr, cov=None, seed=0,
         cut = hist[int(len(hist) * 0.9) - 1]
         if abs(total) > 1e-12:
             tail_frac = max(0.0, (hist[-1] - cut) / total)
-    return dict(err=err, sweeps_run=int(r.sweeps_run), n_hist=len(hist),
-                best_at=best_at, tail=tail_frac, seconds=round(r.seconds, 2))
+    # Held-out H: the ONE place an overfitting worry is real. The activation
+    # objective is fitted against an H estimated from finite calibration tokens,
+    # so scoring the trained circuit against an H from DIFFERENT tokens turns
+    # "are we over-optimising a noisy target" from a worry into a number.
+    err_val = float("nan")
+    if cov_val is not None:
+        err_val = output_relative_error(W, approx, cov_val)
+    return dict(err=err, err_val=err_val, sweeps_run=int(r.sweeps_run),
+                n_hist=len(hist), best_at=best_at, tail=tail_frac,
+                stopped_early=int(r.trace[-1].get("stopped_early", 0))
+                if r.trace else 0,
+                seconds=round(r.seconds, 2))
 
 
 def main():
@@ -113,6 +123,18 @@ def main():
                     help="learning rates for the sensitivity check")
     ap.add_argument("--tol", type=float, default=0.01,
                     help="a doubling gap above this means NOT converged")
+    ap.add_argument("--patience", type=int, default=25,
+                    help="stop a gradient run after this many steps with no "
+                         "relative improvement. This buys COMPUTE: the objective "
+                         "is the exact quantity being minimised on one fixed "
+                         "matrix, so there is no generalisation gap and more "
+                         "steps can only lower or flatten the loss. 0 disables it")
+    ap.add_argument("--min-delta", type=float, default=1e-4,
+                    help="relative improvement that counts as progress")
+    ap.add_argument("--cov-val", default=None,
+                    help="a SECOND H, captured from different calibration tokens. "
+                         "Activation-MSE runs are scored against it as well, which "
+                         "is the only honest test of over-fitting a noisy H")
     ap.add_argument("--tail-tol", type=float, default=0.10,
                     help="flag a run whose last tenth of budget delivered more "
                          "than this fraction of its total improvement")
@@ -129,6 +151,11 @@ def main():
                     help="directory for the figures (--figs '' to skip plotting)")
     args = ap.parse_args()
 
+    cov_val = {}
+    if args.cov_val:
+        for r in csv.DictReader(open(Path(args.cov_val) / "manifest.csv")):
+            cov_val[r["param_name"]] = next(
+                iter(load_file(Path(args.cov_val) / r["file"]).values())).float()
     cov = {}
     if args.cov:
         for r in csv.DictReader(open(Path(args.cov) / "manifest.csv")):
@@ -137,7 +164,8 @@ def main():
     layers = load_layers(args)
 
     cfg = dict(sweeps=args.sweeps, gd_steps=args.gd_steps, gd_lr=args.gd_lr,
-               tol=args.tol, layers_dir=args.layers_dir, cov=args.cov)
+               tol=args.tol, layers_dir=args.layers_dir, cov=args.cov,
+               patience=args.patience, min_delta=args.min_delta)
     ck = ResumableCSV(args.out, ("layer_type", "depth", "chi", "ansatz", "regime"),
                       cfg, resume=not args.no_resume,
                       numeric=("gap", "err_base", "err_double", "tail"))
@@ -166,12 +194,19 @@ def main():
                                regime=regime):
                         continue          # already measured by an earlier run
                     base = run(W, chi, ansatz, regime, args.sweeps, args.gd_steps,
-                               args.gd_lr, c, writer=tracer,
+                               args.gd_lr, c, patience=args.patience,
+                               min_delta=args.min_delta,
+                               cov_val=cov_val.get(pname) if needs_h else None,
+                               writer=tracer,
                                key=dict(layer_type=lt, depth=dep, chi=chi,
                                         ansatz=ansatz, regime=regime,
                                         lr=args.gd_lr, budget="1x"))
+                    # The control runs UNCONSTRAINED. If it early-stopped too it
+                    # would halt at the same place and the gap would be a vacuous
+                    # 0.00%; running it to the full doubled budget makes the test
+                    # ask the right question -- does early stopping cost anything.
                     dbl = run(W, chi, ansatz, regime, args.sweeps * 2,
-                              args.gd_steps * 2, args.gd_lr, c)
+                              args.gd_steps * 2, args.gd_lr, c, patience=0)
                     gap = ((base["err"] - dbl["err"]) / base["err"]
                            if base["err"] > 0 else 0.0)
                     # A run that recorded no iterations never trained: the
@@ -192,6 +227,10 @@ def main():
                                      gap=round(gap, 5), converged=int(ok),
                                      best_at=base["best_at"], n_hist=base["n_hist"],
                                      tail=round(base["tail"], 5),
+                                     stopped_early=base["stopped_early"],
+                                     err_val=(round(base["err_val"], 6)
+                                              if base["err_val"] == base["err_val"]
+                                              else ""),
                                      sweeps_run=base["sweeps_run"],
                                      metric=("act" if needs_h else "frob"),
                                      never_trained=int(dead),
@@ -251,6 +290,32 @@ def main():
     print("\nConvergence by regime")
     print(f"{'regime':>22}{'converged':>12}{'median gap':>13}{'worst gap':>12}"
           f"{'still improving':>18}{'never trained':>16}")
+    # Held-out H: is a long optimisation chasing sampling noise in H?
+    vr = [r for r in rows if str(r.get("err_val", "")) not in ("", "nan")]
+    if vr:
+        print("\nActivation-MSE runs scored against a held-out H "
+              "(captured from different tokens)")
+        print(f"{'ansatz':>18}{'n':>4}{'train H':>11}{'held-out H':>13}"
+              f"{'gap':>9}{'early-stopped':>15}")
+        for a in dict.fromkeys(r["ansatz"] for r in vr):
+            sel = [r for r in vr if r["ansatz"] == a]
+            tr = st.mean([float(r["err_base"]) for r in sel])
+            va = st.mean([float(r["err_val"]) for r in sel])
+            es = sum(int(r.get("stopped_early", 0)) for r in sel)
+            print(f"{a:>18}{len(sel):>4}{tr:>11.5f}{va:>13.5f}"
+                  f"{(va - tr) / tr:>8.2%}{f'{es}/{len(sel)}':>15}")
+        worst = max((float(r["err_val"]) - float(r["err_base"]))
+                    / max(float(r["err_base"]), 1e-12) for r in vr)
+        print("  (a large positive gap means the circuit is fitting THIS H's "
+              "sampling noise;\n   that is the only sense in which these runs can "
+              f"over-fit. Worst here: {worst:+.2%}.)")
+
+    es_rows = [r for r in rows if int(r.get("stopped_early", 0))]
+    if es_rows:
+        print(f"\n{len(es_rows)}/{len(rows)} gradient run(s) stopped early on a "
+              f"plateau. The doubling control runs\n  UNCONSTRAINED, so the gap "
+              f"above already answers whether that cost anything.")
+
     dead_rows = [r for r in rows if int(r.get("never_trained", 0))]
     if dead_rows:
         print(f"\n{len(dead_rows)} run(s) NEVER TRAINED -- zero iterations "

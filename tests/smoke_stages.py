@@ -241,6 +241,22 @@ def main():
         assert len(d.rows) == 1, f"torn line was not dropped: {d.rows}"
         d.close()
 
+    # --- 12. early stopping is a compute saver, not an overfitting guard ----
+    W2 = torch.randn(64, 64)
+    kw2 = dict(gate_size=2, depth=2, target_chi=2, sweeps=2, tensorization="qubit",
+               optimizer="gradient", gd_steps=80, gradient_objective="relative-error",
+               fast_gradient=True)
+    long = disentangle(W2, patience=0, **kw2)
+    short = disentangle(W2, patience=8, min_delta=1e-4, **kw2)
+    assert len(short.trace) < len(long.trace), (
+        f"patience did not stop early: {len(short.trace)} vs {len(long.trace)}")
+    assert short.trace[-1]["stopped_early"] == 1 and long.trace[-1]["stopped_early"] == 0
+    # Stopping on a plateau must not cost real accuracy -- if it does, the
+    # patience is too tight and the saving is not free.
+    e_long = output_relative_error(W2, hybrid_weight(long, 2)[0], H)
+    e_short = output_relative_error(W2, hybrid_weight(short, 2)[0], H)
+    assert e_short <= e_long * 1.02, f"early stop cost {e_short / e_long - 1:.2%}"
+
     print(f"  constrained gates: {n} angles, orthogonal to 1e-12, "
           f"off-block mass exactly 0, differentiable")
     print(f"  activation objective {e_a:.5f} beats Frobenius {e_f:.5f} on the "
@@ -253,6 +269,8 @@ def main():
     print("  traces: phases separated, iters 1-based per phase, thinning keeps "
           "endpoints")
     print("  checkpoint: resumes, refuses a changed config, drops a torn line")
+    print(f"  early stop: {len(short.trace)} steps vs {len(long.trace)}, "
+          f"error within 2%")
     print("\nSTAGES SMOKE PASSED")
 
 

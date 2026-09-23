@@ -863,7 +863,7 @@ def _train_gradient(padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
                     fast=False, objective="disentangle-loss",
                     ansatz="brickwall", head_dim=0, share_heads=True,
                     rope_side="out", pair_seed=0, cov=None, weight=None,
-                    train_side="both"):
+                    train_side="both", patience=0, min_delta=0.0):
     """Optimize the gate angles by Adam to minimize the chosen ``objective``.
 
     Returns ``(u_gates, v_gates, steps_run, history)`` with the trained gates as
@@ -952,6 +952,8 @@ def _train_gradient(padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
     # monotone-safe: it can only improve on the start (the explicit gates, for
     # explicit+gradient), never diverge into NaNs.
     best_loss = math.inf
+    best_step = 0
+    stopped_early = 0
     best_u = [t.detach().clone() for t in theta_u]
     best_v = [t.detach().clone() for t in theta_v]
     for step in range(max(1, steps)):
@@ -992,14 +994,25 @@ def _train_gradient(padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
             lval = float(loss.detach())
             if not math.isfinite(lval):
                 break
-            improved = lval < best_loss
+            improved = lval < best_loss * (1.0 - min_delta) - 1e-15
             trace.append(dict(phase="gradient", iter=step + 1,
                               objective=objective, loss=lval,
                               score=float("nan"), best=int(improved)))
             if improved:                             # snapshot the best-so-far
                 best_loss = lval
+                best_step = step + 1
                 best_u = [t.detach().clone() for t in theta_u]
                 best_v = [t.detach().clone() for t in theta_v]
+            # Early stop on a PLATEAU, not on a validation curve: the objective is
+            # the exact quantity being minimised on one fixed matrix, so there is
+            # no generalisation gap to guard against and more steps can only lower
+            # or flatten the loss. This buys compute, nothing else -- which is why
+            # it is expressed as "no relative improvement for `patience` steps"
+            # rather than as a early-stopping-for-overfitting rule.
+            if patience and step + 1 - best_step >= patience:
+                stopped_early = 1
+                history.append(1.0 - lval)
+                break
             loss.backward()
         except RuntimeError:                         # SVD non-convergence -> keep best
             break
@@ -1022,6 +1035,8 @@ def _train_gradient(padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
                    for g in _gates_from_angles(theta_u, pos_u, bases_u, sgr_u)]
         v_gates = [Gate(g.start, g.k, g.matrix.detach(), g.groups, g.ties)
                    for g in _gates_from_angles(theta_v, pos_v, bases_v, sgr_v)]
+    for t in trace:                    # so a reader can see where it stopped
+        t["stopped_early"] = stopped_early
     return u_gates, v_gates, max(1, steps), history, trace
 
 
@@ -1068,6 +1083,7 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
                       ansatz: str = "brickwall", head_dim: int = 0,
                       share_heads: bool = True, rope_side: str = "out",
                       pair_seed: int = 0, cov=None, train_side: str = "both",
+                      patience: int = 0, min_delta: float = 0.0,
                       log: bool = False) -> DisentangleResult:
     """Disentangle ``W`` into ``U MPO_new V^T`` with brickwall circuits of depth ``D``.
 
@@ -1126,7 +1142,8 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
             gd_steps, gd_lr, init, seed, log, fast=fast_gradient,
             objective=gradient_objective, ansatz=ansatz, head_dim=head_dim,
             share_heads=share_heads, rope_side=rope_side, pair_seed=pair_seed,
-            cov=cov, weight=weight, train_side=train_side)
+            cov=cov, weight=weight, train_side=train_side,
+            patience=patience, min_delta=min_delta)
         return _build_result(
             weight, padded, u_gates, v_gates, n_out, n_in, gate_size, depth,
             target_chi, _plan, param_counting, retained_classical, target_ref,
@@ -1194,7 +1211,7 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
             fast=fast_gradient, objective=gradient_objective,
             ansatz=ansatz, head_dim=head_dim, share_heads=share_heads,
             rope_side=rope_side, pair_seed=pair_seed, cov=cov, weight=weight,
-            train_side=train_side)
+            train_side=train_side, patience=patience, min_delta=min_delta)
         history = history + gd_hist
         trace = trace + gd_trace
         label = "explicit+gradient"
@@ -1238,6 +1255,7 @@ def disentangle(weight: torch.Tensor, gate_size: int, depth: int,
                 ansatz: str = "brickwall", head_dim: int = 0,
                 share_heads: bool = True, rope_side: str = "out",
                 pair_seed: int = 0, cov=None, train_side: str = "both",
+                patience: int = 0, min_delta: float = 0.0,
                 log: bool = False) -> DisentangleResult:
     """Disentangle ``W``, keeping the best of ``restarts`` initializations.
 
@@ -1261,7 +1279,7 @@ def disentangle(weight: torch.Tensor, gate_size: int, depth: int,
             this_seed, param_counting, target_mode, tensorization, qubit_align,
             optimizer, gd_steps, gd_lr, fast_gradient, gradient_objective,
             ansatz, head_dim, share_heads, rope_side, pair_seed, cov,
-            train_side, log)
+            train_side, patience, min_delta, log)
 
     best = _run(init, seed)
     for extra in range(1, max(1, restarts)):

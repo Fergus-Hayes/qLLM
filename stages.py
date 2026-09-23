@@ -51,7 +51,7 @@ from qllm.trace_log import TraceWriter
 # what separated the configurations in the pilot: k4D2 (Q=960) beat k2D8 (Q=432).
 ANSATZE: dict[str, dict] = {}
 for _k in (2, 3, 4, 5):
-    for _d in (1, 2, 4, 8):
+    for _d in (1, 2, 4, 8, 16, 32, 64, 128):
         ANSATZE[f"brickwall-k{_k}D{_d}"] = dict(gate_size=_k, depth=_d,
                                                 ansatz="brickwall")
 for _name, _kw in (
