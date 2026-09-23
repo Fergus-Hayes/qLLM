@@ -29,6 +29,47 @@ import qllm.hybrid_sweep as H  # noqa: E402
 SCRATCH = os.environ.get("QLLM_SMOKE_DIR", "/tmp/qllm-smoke-parallel")
 
 
+def _blas_env(job):
+    """Module-level so forkserver can import it: report the child's BLAS caps."""
+    from qllm.parallel import apply_threads
+    apply_threads(job)
+    return {v: os.environ.get(v) for v in
+            ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS")}
+
+
+def _check_thread_caps():
+    """Workers must inherit a BLAS thread cap, not just a torch one.
+
+    ``torch.set_num_threads`` governs torch's OpenMP pool and nothing else, while
+    OpenBLAS sizes its own pool from the environment AT IMPORT. Set it only inside
+    the worker and it is already too late, so ``--jobs 8`` on 8 cores would give
+    64 threads on 8 cores -- the oversubscription behind OpenBLAS's "Detect OpenMP
+    Loop and this application may hang".
+    """
+    from qllm.parallel import _THREAD_VARS, _limit_env, run_jobs
+    saved = {v: os.environ.get(v) for v in _THREAD_VARS}
+    try:
+        for v in _THREAD_VARS:
+            os.environ.pop(v, None)
+        got = run_jobs(_blas_env, [{"i": i} for i in range(4)], 2, "blas-probe",
+                       log=lambda _m: None)
+        assert got, "no results from the probe pool"
+        for g in got:
+            assert g["OMP_NUM_THREADS"] and int(g["OMP_NUM_THREADS"]) >= 1, g
+            assert g["OPENBLAS_NUM_THREADS"] == g["OMP_NUM_THREADS"], g
+        # An explicit setting is the user's, and must survive untouched.
+        os.environ["OPENBLAS_NUM_THREADS"] = "7"
+        _limit_env(1)
+        assert os.environ["OPENBLAS_NUM_THREADS"] == "7", "clobbered a user setting"
+        return got[0]
+    finally:
+        for v, val in saved.items():
+            if val is None:
+                os.environ.pop(v, None)
+            else:
+                os.environ[v] = val
+
+
 def _run(njobs, tag):
     shutil.rmtree(SCRATCH + tag, ignore_errors=True)
     cfg = H.HybridConfig(
@@ -56,6 +97,9 @@ def main():
     for _ in range(3):
         a = torch.randn(256, 256)
         torch.linalg.svd(a @ a)
+
+    caps = _check_thread_caps()
+    print(f"  worker BLAS caps inherited: {caps}")
 
     seq = _run(1, "-seq")
     par = _run(2, "-par")

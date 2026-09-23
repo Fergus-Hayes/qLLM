@@ -77,6 +77,7 @@ def run_jobs(fn, jobs, n_jobs=1, desc="job", on_result=None, log=print):
     while pending:
         n = max(1, min(workers, len(pending)))
         threads = max(1, (os.cpu_count() or 1) // n)
+        _limit_env(threads)          # before any worker is forked, not inside it
         kw = {"max_workers": n, "mp_context": ctx}
         try:                       # bound peak memory: recycle workers regularly
             ProcessPoolExecutor(max_workers=1, max_tasks_per_child=1)
@@ -99,7 +100,7 @@ def run_jobs(fn, jobs, n_jobs=1, desc="job", on_result=None, log=print):
                     return out
                 first = False
             log(f"  running {len(pending)} {desc}(s) across {n} process(es), "
-                f"{threads} torch thread(s) each ({method})")
+                f"{threads} thread(s) each ({method})")
             futs = {ex.submit(fn, _with_threads(jobs[i], threads)): i
                     for i in pending}
             for fut in as_completed(futs):
@@ -138,9 +139,35 @@ def _with_threads(job, threads):
     return job
 
 
+_THREAD_VARS = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS")
+
+
+def _limit_env(threads):
+    """Cap every BLAS runtime's thread pool, for children that inherit this env.
+
+    ``torch.set_num_threads`` governs torch's own OpenMP pool and nothing else.
+    OpenBLAS -- which numpy and some torch builds sit on -- sizes its pool from
+    these variables when the library loads, so setting them after the import has
+    no effect. The pool therefore sets them in the PARENT, before any worker is
+    forked, so each child picks them up as it imports.
+
+    Without this, ``--jobs 8`` on an 8-core box gives each of 8 workers a torch
+    budget of one thread and an OpenBLAS pool of eight: 64 threads competing for
+    8 cores. That is the state in which an OpenBLAS built against pthreads inside
+    an OpenMP application prints "Detect OpenMP Loop and this application may
+    hang" -- and occasionally does.
+
+    An explicit setting from the environment is left alone: the user meant it.
+    """
+    for var in _THREAD_VARS:
+        os.environ.setdefault(var, str(max(1, int(threads))))
+
+
 def apply_threads(job):
     """Called at the top of a worker: honour the thread budget the pool set."""
     n = (job or {}).get("_threads") if isinstance(job, dict) else None
     if n:
         import torch
         torch.set_num_threads(max(1, int(n)))
+        _limit_env(n)

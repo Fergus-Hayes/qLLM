@@ -1263,6 +1263,21 @@ study exists to avoid, not a result.
 Resumable (`--out` doubles as the checkpoint; `--no-resume` to start over) and
 figures land in `--figs`.
 
+If OpenBLAS prints `Detect OpenMP Loop and this application may hang`, it has
+noticed that it was built against pthreads while the process is inside an OpenMP
+region (torch's). It is usually only noise, but the hang it warns about is real
+and the oversubscription behind it is not free. Cap the pools before the import:
+
+```bash
+OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4 \
+    python proxy_study.py ...
+```
+
+The value has to be in the environment, not set from inside Python -- OpenBLAS
+sizes its pool when the library loads. The parallel scripts (`stages.py`,
+`convergence.py`) now cap these themselves per worker; a value you set explicitly
+is always left alone.
+
 ## Use as a library
 
 ```python
