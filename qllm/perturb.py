@@ -29,6 +29,21 @@ def _ranks(W, n):
     return sorted(set(log_spaced_ints(1, min(W.shape), n)))
 
 
+def _spread(errs, k):
+    """``k`` values spanning ``errs``, evenly by quantile, duplicates dropped.
+
+    Quantiles rather than a linear span so the control follows where the
+    structured errors actually pile up instead of oversampling an empty gap.
+    """
+    e = sorted(x for x in errs if x > 1e-6)
+    if not e or k < 1:
+        return []
+    if k == 1:
+        return [e[len(e) // 2]]
+    picked = [e[round(i * (len(e) - 1) / (k - 1))] for i in range(k)]
+    return sorted({round(x, 4) for x in picked})
+
+
 def perturbations(W, cov=None, n_per_family=6, seed=0, hybrid=None, progress=None):
     """Yield ``(family, knob, W')`` over every family the library covers.
 
@@ -38,40 +53,55 @@ def perturbations(W, cov=None, n_per_family=6, seed=0, hybrid=None, progress=Non
     W = W.detach().float()
     m, n = W.shape
     gen = torch.Generator().manual_seed(seed)
+    seen = []                      # Frobenius errors the structured families hit
+
+    def _emit(fam, knob, Wp):
+        seen.append(float(relative_error(W, Wp)))
+        return (fam, knob, Wp)
 
     plan = make_plan(W, "qubit", 0)
     for chi in sorted(set(log_spaced_ints(1, plan.max_chi, n_per_family))):
-        yield "mpo", chi, plan_compress(W, plan, chi)[0]
+        yield _emit("mpo", chi, plan_compress(W, plan, chi)[0])
 
     for r in _ranks(W, n_per_family):
-        yield "low-rank", r, low_rank_frobenius(W, r).float()
+        yield _emit("low-rank", r, low_rank_frobenius(W, r).float())
         if cov is not None:
-            yield "low-rank-whitened", r, low_rank_whitened(W, cov, r).float()
+            yield _emit("low-rank-whitened", r, low_rank_whitened(W, cov, r).float())
 
     if cov is not None:
         for k in sorted(set(log_spaced_ints(1, max(2, n // 2), n_per_family))):
-            yield "sparse", k, sparse_lowrank_whitened(W, cov, 0, k)[0].float()
+            yield _emit("sparse", k, sparse_lowrank_whitened(W, cov, 0, k)[0].float())
         for r in _ranks(W, max(2, n_per_family // 2)):
             for k in (1, max(2, n // 16)):
-                yield ("sparse+low-rank", f"r{r}k{k}",
-                       sparse_lowrank_whitened(W, cov, r, k)[0].float())
+                yield _emit("sparse+low-rank", f"r{r}k{k}",
+                            sparse_lowrank_whitened(W, cov, r, k)[0].float())
 
-    # The structureless control: same Frobenius error, no structure whatsoever.
-    # Its job is to break any metric that only sees error magnitude.
-    nrm = float(torch.linalg.norm(W))
-    for target in (0.05, 0.1, 0.2, 0.4, 0.6, 0.8)[:n_per_family]:
-        N = torch.randn(m, n, generator=gen)
-        N = N / float(torch.linalg.norm(N)) * nrm * target
-        yield "random", round(target, 3), (W + N)
 
     if hybrid is not None:
         from .disentangler import disentangle, hybrid_weight
         name, kw = hybrid
         for chi in sorted(set(log_spaced_ints(1, plan.max_chi, n_per_family))):
             r = disentangle(W, target_chi=chi, n_sites=2, tensorization="qubit", **kw)
-            yield f"hybrid:{name}", chi, hybrid_weight(r, chi)[0].float()
+            yield _emit(f"hybrid:{name}", chi, hybrid_weight(r, chi)[0].float())
             if progress:
                 progress(name, chi)
+
+    # The structureless control, at the SAME Frobenius errors the structured
+    # families actually reached. A fixed ladder (0.05 .. 0.8) was the obvious
+    # thing and it was useless: real compressions of a real layer land between
+    # 0.32 and 1.0, so no control was ever within matching distance of one and the
+    # blindness test -- the only test that can catch a metric reading nothing but
+    # error magnitude -- silently printed nothing at all. Worse, a control cluster
+    # sitting at low error next to structured rows at high error is a second
+    # population, and pooling the two inflates the rank correlation of whichever
+    # metric best separates the clusters, which is Frobenius by construction.
+    # Matching the errors removes both problems at once.
+    nrm = float(torch.linalg.norm(W))
+    targets = _spread(seen, n_per_family) or [0.05, 0.1, 0.2, 0.4, 0.6, 0.8][:n_per_family]
+    for target in targets:
+        N = torch.randn(m, n, generator=gen)
+        N = N / float(torch.linalg.norm(N)) * nrm * target
+        yield "random", round(target, 4), (W + N)
 
 
 # --------------------------------------------------------------------------- #

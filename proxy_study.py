@@ -186,6 +186,7 @@ def report(rows, base_ppl, args):
     print(f"{'layer':<18}{'depth':>6}" + "".join(f"{c:>16}" for c in CANDIDATES)
           + f"{'n':>5}")
     pooled = {c: [] for c in CANDIDATES}
+    struct_only = {c: [] for c in CANDIDATES}
     for lt, dep in keys:
         sel = [r for r in rows if r["layer_type"] == lt and r["depth"] == dep]
         if len(sel) < 5:
@@ -196,9 +197,25 @@ def report(rows, base_ppl, args):
             pooled[c].append(rho)
             line += f"{rho:>16.3f}"
         print(line + f"{len(sel):>5}")
+        # The same correlation over the rows that are actually compression
+        # CHOICES: no control, no exact reconstruction. This is the number that
+        # answers "which metric should rank my candidates", and it can differ a
+        # lot -- the control is a separate population, and pooling populations
+        # flatters whichever metric best separates them.
+        real = [r for r in sel if r["family"] != "random" and r["frobenius"] > 1e-9]
+        if len(real) >= 5:
+            for c in CANDIDATES:
+                struct_only[c].append(
+                    _spearman([r[c] for r in real], [r["ppl"] for r in real]))
     print(f"{'MEAN':<18}{'':>6}" + "".join(
         f"{st.mean(pooled[c]):>16.3f}" if pooled[c] else f"{'n/a':>16}"
         for c in CANDIDATES))
+    if any(struct_only.values()):
+        print(f"{'MEAN, real options':<18}{'':>6}" + "".join(
+            f"{st.mean(struct_only[c]):>16.3f}" if struct_only[c] else f"{'n/a':>16}"
+            for c in CANDIDATES))
+        print("  (second row drops the control and the exact rows -- rank your "
+              "candidates by it)")
 
     # Is the experiment resolvable at all? Some families reach zero error exactly
     # (a full-rank "low-rank" factorisation reproduces the weight), and those rows
@@ -260,6 +277,21 @@ def report(rows, base_ppl, args):
 
     # Calibration: pred_dnll is a PREDICTION, so check it against the measurement.
     print("\nCALIBRATION of the first-order prediction  (d(ppl) ~ ppl_0 * d(NLL))")
+    # Sign agreement FIRST, over every row. The magnitude check below conditions
+    # on both being positive, which is exactly the subset where they agree, so
+    # quoting its correlation alone would be selection dressed up as a result.
+    # Near a trained minimum the first-order term is small and of either sign
+    # while the damage is second order and always positive, so a coin-flip here
+    # is the expected outcome, not a bug -- and it means pred_dnll cannot be used
+    # as a signed predictor for perturbations of this size.
+    nz = [r for r in rows if r["dppl"] != 0 and r["pred_dnll"] != 0]
+    if nz:
+        agree = sum(1 for r in nz if r["dppl"] * r["pred_dnll"] > 0)
+        print(f"  sign agrees on {agree}/{len(nz)} rows ({agree / len(nz):.0%})"
+              + ("  -- no better than chance; the first-order term is not "
+                 "predictive\n  at these perturbation sizes, and the fit below is "
+                 "conditioned on agreement."
+                 if agree < 0.7 * len(nz) else ""))
     pts = [(base_ppl * r["pred_dnll"], r["dppl"]) for r in rows
            if r["pred_dnll"] > 0 and r["dppl"] > 0]
     if len(pts) >= 5:
@@ -267,7 +299,8 @@ def report(rows, base_ppl, args):
         ly = [math.log(b) for _a, b in pts]
         rr = _pearson(lx, ly)
         sx = st.mean([b - a for a, b in zip(lx, ly)])
-        print(f"  {len(pts)} points with both positive;  log-log Pearson r = {rr:+.3f}")
+        print(f"  of the {len(pts)}/{len(rows)} rows where both are positive: "
+              f"log-log Pearson r = {rr:+.3f}")
         print(f"  mean log ratio (measured / predicted) = {sx:+.3f}  "
               f"-> measured is {math.exp(sx):.2f}x the prediction")
         print("  (r near 1 with a ratio near 1 would mean the first-order term "
@@ -284,8 +317,11 @@ def report(rows, base_ppl, args):
         print("\nVERDICT: no layer carried >= 5 perturbations, so no correlation "
               "was computed.")
         return
-    best = max(CANDIDATES, key=lambda c: st.mean(pooled[c]) if pooled[c] else -9)
-    bv = st.mean(pooled[best])
+    # Judge on the real options when there are enough of them: that is the number
+    # the ranking is actually for.
+    score = struct_only if any(struct_only.values()) else pooled
+    best = max(CANDIDATES, key=lambda c: st.mean(score[c]) if score[c] else -9)
+    bv = st.mean(score[best])
     if not (bv >= 0.9):
         print(f"\nVERDICT: no metric reaches rho 0.9 (best {best} at {bv:.3f}). "
               f"Ranking\n  compressions by a per-layer proxy is unsound at this "

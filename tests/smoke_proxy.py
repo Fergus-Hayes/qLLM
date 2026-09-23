@@ -147,6 +147,20 @@ def main():
         assert METRICS["activation"](Wm, Wp2, cov=cov) != \
             METRICS["frobenius"](Wm, Wp2)
 
+    # ...and every control must sit within matching distance of a STRUCTURED row,
+    # or the blindness test has nothing to compare and prints nothing at all. A
+    # fixed error ladder failed this on a real layer while passing every other
+    # check here, which is exactly why it is asserted rather than assumed.
+    s_err = sorted(METRICS["frobenius"](Wm, Wp2) for f, _k, Wp2 in got
+                   if f != "random" and METRICS["frobenius"](Wm, Wp2) > 1e-9)
+    r_err = [METRICS["frobenius"](Wm, Wp2) for f, _k, Wp2 in got if f == "random"]
+    assert s_err and r_err
+    for e in r_err:
+        near = min(s_err, key=lambda x: abs(x - e))
+        assert abs(near - e) <= 0.15 * max(near, e), (
+            f"control at frob {e:.3f} has no structured row within 15% "
+            f"(nearest {near:.3f}); the blindness test would print nothing")
+
     # -- the figures render, including the rows a log axis would have dropped -- #
     import tempfile
 
@@ -171,7 +185,7 @@ def main():
     print("  grad_weighted is positive, sign-free and exactly zero at zero error")
     print(f"  library spans {len(fams)} families, {len(got)} unique keys, "
           f"{len(exact)} exact row(s)")
-    print("  control hits its target Frobenius error and reads differently under H")
+    print(f"  control hits its target Frobenius error, reads differently under H,\n    and all {len(r_err)} match a structured row within 15%")
     print("  both figures render, with a negative dppl row present")
     print("\nPROXY SMOKE PASSED")
 
