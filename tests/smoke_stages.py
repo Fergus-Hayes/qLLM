@@ -278,6 +278,35 @@ def main():
     assert sorted(hard) == [0, 1, 4, 9], hard
     apply_threads({"_threads": 1})            # must not raise
 
+    # --- 14. sequential depth growth ----------------------------------------
+    from qllm.disentangler import disentangle_grown, extend_circuit
+    Wg = torch.randn(64, 64)
+    gkw = dict(target_chi=2, n_sites=2, sweeps=6, tensorization="qubit",
+               optimizer="explicit")
+    r_small = disentangle(Wg, gate_size=2, depth=2, **gkw)
+    # Extending a circuit with identity layers cannot change what it computes.
+    ext = extend_circuit(r_small.u_gates, r_small.n_out_qubits, 2, 8)
+    assert len(ext) > len(r_small.u_gates)
+    for a, b in zip(r_small.u_gates, ext):
+        assert (a.start, a.k) == (b.start, b.k), "layout is not a prefix"
+        assert float((a.matrix - b.matrix).abs().max()) == 0.0, "gate not carried"
+    for g in ext[len(r_small.u_gates):]:
+        assert float((g.matrix - torch.eye(g.matrix.shape[0])).abs().max()) == 0.0
+
+    # A layout that is NOT a prefix must be refused, not silently mis-wired.
+    try:
+        extend_circuit(r_small.u_gates, r_small.n_out_qubits, 4, 8)
+    except ValueError as exc:
+        assert "prefix" in str(exc)
+    else:
+        raise AssertionError("extend_circuit accepted a non-prefix layout")
+
+    _res, st = disentangle_grown(Wg, [2, 4, 8], gate_size=2, **gkw)
+    errs = [x["err"] for x in st]
+    assert all(b <= a + 1e-12 for a, b in zip(errs, errs[1:])), (
+        f"growth was not monotone: {errs}")
+    assert all("regressed" in x for x in st)
+
     print(f"  constrained gates: {n} angles, orthogonal to 1e-12, "
           f"off-block mass exactly 0, differentiable")
     print(f"  activation objective {e_a:.5f} beats Frobenius {e_f:.5f} on the "
@@ -293,6 +322,8 @@ def main():
     print(f"  early stop: {len(short.trace)} steps vs {len(long.trace)}, "
           f"error within 2%")
     print("  process pool: sequential and pooled agree, dead workers retried")
+    print(f"  depth growth: monotone {[round(e, 5) for e in errs]}, "
+          f"non-prefix layouts refused")
     print("\nSTAGES SMOKE PASSED")
 
 

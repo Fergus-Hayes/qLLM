@@ -1084,6 +1084,7 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
                       share_heads: bool = True, rope_side: str = "out",
                       pair_seed: int = 0, cov=None, train_side: str = "both",
                       patience: int = 0, min_delta: float = 0.0,
+                      init_gates=None,
                       log: bool = False) -> DisentangleResult:
     """Disentangle ``W`` into ``U MPO_new V^T`` with brickwall circuits of depth ``D``.
 
@@ -1137,9 +1138,14 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
     ref_norm = float(torch.linalg.norm(target_ref))
 
     if optimizer == "gradient":
+        bu = [Gate(g.start, g.k, g.matrix.clone(), g.groups, g.ties)
+              for g in init_gates[0]] if init_gates is not None else None
+        bv = [Gate(g.start, g.k, g.matrix.clone(), g.groups, g.ties)
+              for g in init_gates[1]] if init_gates is not None else None
         u_gates, v_gates, steps_run, history, trace = _train_gradient(
             padded, n_out, n_in, gate_size, depth, plan_pad, target_chi,
-            gd_steps, gd_lr, init, seed, log, fast=fast_gradient,
+            gd_steps, gd_lr, init, seed, log, base_u=bu, base_v=bv,
+            fast=fast_gradient,
             objective=gradient_objective, ansatz=ansatz, head_dim=head_dim,
             share_heads=share_heads, rope_side=rope_side, pair_seed=pair_seed,
             cov=cov, weight=weight, train_side=train_side,
@@ -1151,19 +1157,29 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
 
     # --- explicit environment / SVD sweep (paper Appendix A) ---
     generator = torch.Generator().manual_seed(seed)
-    u_gates = build_circuit(n_out, gate_size, depth, init, generator, ansatz,
-                            head_dim, share_heads, "out", pair_seed)
-    v_gates = build_circuit(n_in, gate_size, depth, init, generator, ansatz,
-                            head_dim, share_heads,
-                            "out" if rope_side == "both" else "in", pair_seed)
+    if init_gates is not None:
+        # Start from a supplied circuit (a shallower solution, grown). Copied so
+        # the sweep's in-place updates cannot reach back into the caller's gates.
+        u_gates = [Gate(g.start, g.k, g.matrix.clone(), g.groups, g.ties)
+                   for g in init_gates[0]]
+        v_gates = [Gate(g.start, g.k, g.matrix.clone(), g.groups, g.ties)
+                   for g in init_gates[1]]
+    else:
+        u_gates = build_circuit(n_out, gate_size, depth, init, generator, ansatz,
+                                head_dim, share_heads, "out", pair_seed)
+        v_gates = build_circuit(n_in, gate_size, depth, init, generator, ansatz,
+                                head_dim, share_heads,
+                                "out" if rope_side == "both" else "in", pair_seed)
 
     current = padded                             # U^T W V, starts at W (identity gates)
     history: list[float] = []
     trace: list[dict] = []
     best_retained = -math.inf
+    best_u = [g.matrix.clone() for g in u_gates]
+    best_v = [g.matrix.clone() for g in v_gates]
     score = -math.inf
     sweeps_run = 0
-    for sweep in range(max(1, sweeps)):
+    for sweep in range(max(0, sweeps)):
         # Where the circuits stand now: the weight the truncation keeps.
         plan = _plan(current)
         truncated, _ = plan_compress(current, plan, target_chi)
@@ -1173,7 +1189,17 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
         trace.append(dict(phase="explicit", iter=sweep + 1,
                           objective="retained-weight", loss=1.0 - retained,
                           score=retained, best=int(retained > best_retained)))
-        best_retained = max(best_retained, retained)
+        # Keep the best iterate, as the Adam path does. The sweep is a fixed-point
+        # iteration that maximises <target, C source> against a target which is
+        # RE-TRUNCATED each pass, not a descent on the retained weight it is
+        # judged by -- so a pass can leave the circuit worse than it found it, and
+        # without this the returned circuit is simply whatever the last pass gave.
+        # It also makes warm-started depth growth monotone: a deeper stage starts
+        # where the shallower one finished and can no longer end below it.
+        if retained > best_retained:
+            best_retained = retained
+            best_u = [g.matrix.clone() for g in u_gates]
+            best_v = [g.matrix.clone() for g in v_gates]
         if not u_gates and not v_gates:
             break                                # depth 0: nothing to optimize
         # The paper's Eq. (4) freezes the target at the ORIGINAL operator's
@@ -1197,6 +1223,22 @@ def _disentangle_once(weight: torch.Tensor, gate_size: int, depth: int,
         if new_score - score < tol * max(1.0, abs(score)):
             break                                # the gate sweeps have converged
         score = new_score
+
+    # The final pass's state was never scored inside the loop; score it, then keep
+    # whichever iterate was actually best.
+    if u_gates or v_gates:
+        _t, _c = plan_compress(current, _plan(current), target_chi)
+        final_retained = float(torch.linalg.norm(_t)) / norm if norm else 0.0
+        if final_retained > best_retained:
+            best_retained = final_retained
+        else:
+            for g, m in zip(u_gates, best_u):
+                g.matrix = m
+            for g, m in zip(v_gates, best_v):
+                g.matrix = m
+            current = apply_right(v_gates,
+                                  apply_circuit(u_gates, padded, n_out, transpose=True),
+                                  n_in, transpose=True)
 
     label = "explicit"
     # Optional implicit (gradient) polish, warm-started from the explicit gates:
@@ -1255,7 +1297,7 @@ def disentangle(weight: torch.Tensor, gate_size: int, depth: int,
                 ansatz: str = "brickwall", head_dim: int = 0,
                 share_heads: bool = True, rope_side: str = "out",
                 pair_seed: int = 0, cov=None, train_side: str = "both",
-                patience: int = 0, min_delta: float = 0.0,
+                patience: int = 0, min_delta: float = 0.0, init_gates=None,
                 log: bool = False) -> DisentangleResult:
     """Disentangle ``W``, keeping the best of ``restarts`` initializations.
 
@@ -1279,7 +1321,7 @@ def disentangle(weight: torch.Tensor, gate_size: int, depth: int,
             this_seed, param_counting, target_mode, tensorization, qubit_align,
             optimizer, gd_steps, gd_lr, fast_gradient, gradient_objective,
             ansatz, head_dim, share_heads, rope_side, pair_seed, cov,
-            train_side, patience, min_delta, log)
+            train_side, patience, min_delta, init_gates, log)
 
     best = _run(init, seed)
     for extra in range(1, max(1, restarts)):
@@ -1287,3 +1329,117 @@ def disentangle(weight: torch.Tensor, gate_size: int, depth: int,
         if candidate.retained > best.retained:
             best = candidate
     return best
+
+
+# --------------------------------------------------------------------------- #
+# Sequential depth growth
+# --------------------------------------------------------------------------- #
+def extend_circuit(gates: list[Gate], n_qubits: int, gate_size: int,
+                   new_depth: int, ansatz: str = "brickwall", head_dim: int = 0,
+                   share_heads: bool = True, side: str = "out",
+                   pair_seed: int = 0) -> list[Gate]:
+    """The same circuit at ``new_depth``: its gates kept, the added ones identity.
+
+    A brickwall lays its layers down in order, so a deeper layout's gate positions
+    begin with the shallower one's. That prefix property is *asserted*, not assumed
+    -- it is what makes the extension exact, and an ansatz that broke it would
+    otherwise fail silently by pairing a trained gate with the wrong wires.
+
+    Appending identity gates cannot change what the circuit computes, so the
+    extended circuit reproduces the original's error exactly.
+    """
+    layout = gate_structures(n_qubits, gate_size, new_depth, ansatz, head_dim,
+                             share_heads, side, pair_seed)
+    if len(layout) < len(gates):
+        raise ValueError(f"new depth {new_depth} has {len(layout)} gates, fewer "
+                         f"than the {len(gates)} being extended")
+    for g, (st, k, _gr, _ti) in zip(gates, layout):
+        if (g.start, g.k) != (st, k):
+            raise ValueError(
+                f"layout is not a prefix of the deeper one at gate "
+                f"({g.start},{g.k}) vs ({st},{k}); extending would attach trained "
+                f"gates to the wrong wires")
+    out = []
+    for i, (st, k, gr, ti) in enumerate(layout):
+        if i < len(gates):
+            out.append(Gate(st, k, gates[i].matrix.clone(), gr, ti))
+        else:
+            out.append(Gate(st, k, _identity_gate(k), gr, ti))
+    return out
+
+
+def disentangle_grown(weight: torch.Tensor, depth_schedule, gate_size: int,
+                      **kw) -> tuple[DisentangleResult, list[dict]]:
+    """Optimise at increasing depth, each stage warm-started from the last.
+
+    The nesting argument -- a deeper circuit contains a shallower one, so its
+    optimum is at least as good -- constrains the OPTIMUM, not what a local
+    optimiser finds. Run from identity at full depth, both the environment sweep
+    and Adam land in whatever basin that trajectory leads to, and measurement
+    shows that basin can be worse than the one a shallow circuit reaches: on
+    q_proj the sweep at depth 16, 32 and 128 returns a bit-identical error that is
+    worse than depth 4's, even though depth 4's solution provably sits inside the
+    deeper family.
+
+    Growing the depth repairs it by construction. Each stage starts exactly where
+    the previous one finished (the added layers are identity, which changes
+    nothing), so stage zero of every stage reproduces the previous stage's error,
+    and an optimiser that keeps its best iterate can only improve on it. The error
+    is therefore monotone non-increasing in depth *by the procedure*, not by
+    assumption -- and that is asserted at each stage.
+
+    Returns ``(final_result, stages)``.
+    """
+    from .compactifai import relative_error
+    schedule = sorted({int(d) for d in depth_schedule if int(d) > 0})
+    if not schedule:
+        raise ValueError("depth_schedule is empty")
+    target_chi = kw.get("target_chi", 1)
+    ansatz = kw.get("ansatz", "brickwall")
+    head_dim = kw.get("head_dim", 0)
+    share_heads = kw.get("share_heads", True)
+    rope_side = kw.get("rope_side", "out")
+    pair_seed = kw.get("pair_seed", 0)
+
+    prev, stages, result = None, [], None
+    # `stages[-1]` is read as "the previous stage" inside the loop.
+    for depth in schedule:
+        init_gates = None
+        if prev is not None:
+            n_out, n_in = prev.n_out_qubits, prev.n_in_qubits
+            init_gates = (
+                extend_circuit(prev.u_gates, n_out, gate_size, depth, ansatz,
+                               head_dim, share_heads, "out", pair_seed),
+                extend_circuit(prev.v_gates, n_in, gate_size, depth, ansatz,
+                               head_dim, share_heads,
+                               "out" if rope_side == "both" else "in", pair_seed))
+        result = disentangle(weight, gate_size, depth, init_gates=init_gates, **kw)
+        approx, _c = hybrid_weight(result, target_chi)
+        err = float(relative_error(weight, approx))
+
+        # Monotonicity is enforced here, not hoped for. Neither optimiser descends
+        # the reported error directly -- the sweep is a fixed-point iteration on a
+        # re-truncated target, and both are judged on the CROPPED error while the
+        # sweep tracks a padded-domain quantity -- so a stage can still come out
+        # above the one it started from. When it does, the extended previous
+        # circuit is kept instead. That is exactly what the nesting argument
+        # promises and nothing more: the deeper circuit is at least as good,
+        # because in that case it IS the shallower one plus identity layers.
+        regressed = 0
+        if prev is not None and err > stages[-1]["err"] + 1e-12:
+            regressed = 1
+            result = disentangle(weight, gate_size, depth, init_gates=init_gates,
+                                 **{**kw, "sweeps": 0, "gd_steps": 0,
+                                    "optimizer": "explicit"})
+            approx, _c = hybrid_weight(result, target_chi)
+            err = float(relative_error(weight, approx))
+            if err > stages[-1]["err"] + 1e-9:
+                raise AssertionError(
+                    f"extending depth {stages[-1]['depth']} -> {depth} changed the "
+                    f"error ({stages[-1]['err']:.10f} -> {err:.10f}) although the "
+                    f"added layers are identity. extend_circuit is wrong.")
+        stages.append(dict(depth=depth, err=err, quantum_params=result.quantum_params,
+                           gates=len(result.u_gates) + len(result.v_gates),
+                           regressed=regressed, seconds=result.seconds))
+        prev = result
+    return result, stages
