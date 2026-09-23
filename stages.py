@@ -44,6 +44,7 @@ from qllm.activation_stats import output_relative_error
 from qllm.disentangler import classical_param_count, disentangle, hybrid_weight
 from qllm.qubit_mpo import make_plan, plan_compress
 from qllm.checkpoint import ResumableCSV
+from qllm.parallel import apply_threads, run_jobs
 from qllm.trace_log import TraceWriter
 
 # --------------------------------------------------------------------------- #
@@ -116,7 +117,8 @@ def assert_identity_is_classical(W, chi, cov=None):
                          f"not nested and no ratio from this run is meaningful.")
 
 
-def run_point(W, chi, name, sweeps, cov=None, writer=None, key=None, **extra):
+def run_point(W, chi, name, sweeps, cov=None, writer=None, key=None,
+              keep_trace=False, **extra):
     """One trained configuration, scored at the chi' it was trained at."""
     kw = dict(ANSATZE[name]); kw.update(extra)
     t0 = time.time()
@@ -129,6 +131,7 @@ def run_point(W, chi, name, sweeps, cov=None, writer=None, key=None, **extra):
            else output_relative_error(W, approx, cov))
     return dict(chi=chi, c=int(classical_param_count(r, chi)),
                 q=int(r.quantum_params), err=round(err, 6),
+                trace=(list(r.trace) if keep_trace else None),
                 seconds=round(time.time() - t0, 2))
 
 
@@ -170,6 +173,42 @@ def print_bands(rows, curves, group_key, groups):
 
 
 # --------------------------------------------------------------------------- #
+def _emit(ck, tracer, cc_by, stage, job, p):
+    """Write one finished point: trace first (parent-only), then the CSV row."""
+    k = job["key"]
+    if p.get("trace"):
+        tracer.add_rows(p["trace"], **k)
+    row = {x: v for x, v in p.items() if x != "trace"}
+    ck.add(dict(stage=stage, family="hybrid", **k_no_chi(k), **row))
+    cc = cc_by[(k["layer_type"], k["depth"])]
+    a = cheapest(cc, p["err"])
+    return (a / (p["c"] + p["q"])) if a else None
+
+
+def k_no_chi(k):
+    return {x: v for x, v in k.items() if x != "chi"}
+
+
+def _pooled(jobs, args, ck, tracer, cc_by, stage, label):
+    """Run enumerated jobs (pooled when --jobs > 1) and record each as it lands."""
+    got = {}
+
+    def _on(job, p):
+        r = _emit(ck, tracer, cc_by, stage, job, p)
+        if r is not None:
+            got.setdefault(job["group"], []).append(r)
+
+    run_jobs(_stage_job, jobs, getattr(args, "jobs", 1), desc=label, on_result=_on)
+    return got
+
+
+def _stage_job(job):
+    """One trained point, in a worker. Must be importable from a child process."""
+    apply_threads(job)
+    return run_point(job["W"], job["chi"], job["ansatz"], job["sweeps"],
+                     cov=job["cov"], keep_trace=job["keep_trace"], **job["kw"])
+
+
 def _ratio(ck, cc, lt, dep, ansatz, regime, objective, seed, chi):
     """C_alone/(C+Q) for a row already in the checkpoint, so a resumed run's
     progress lines report the same numbers a fresh one would."""
@@ -201,6 +240,7 @@ def cmd_stage1(args):
     rows, curves = [], {}
     ck = _checkpoint(args, 1)
     tracer = TraceWriter(args.trace, args.trace_every, append=bool(ck.n_resumed))
+    jobs, done = [], {}
     for pname, lt, dep, W in layers:
         curves[(lt, dep)] = cc = classical_curve(W)
         assert_identity_is_classical(W, min(8, cc[-1][0]))
@@ -208,27 +248,24 @@ def cmd_stage1(args):
         print(f"\n{lt} d{dep} {tuple(W.shape)}: chi=1..{cc[-1][0]}, "
               f"{len(grid)} chi' x {len(names)} ansatze", flush=True)
         for name in names:
-            got = []
             for chi in grid:
-                if ck.done(layer_type=lt, depth=dep, family="hybrid",
-                           ansatz=name, regime="explicit",
-                           objective="frobenius", seed=0, chi=chi):
-                    got.append(_ratio(ck, cc, lt, dep, name, "explicit",
-                                      "frobenius", 0, chi))
+                key = dict(layer_type=lt, depth=dep, chi=chi, ansatz=name,
+                           regime="explicit", objective="frobenius", seed=0)
+                if ck.done(family="hybrid", **key):
+                    r = _ratio(ck, cc, lt, dep, name, "explicit", "frobenius",
+                               0, chi)
+                    if r == r:
+                        done.setdefault(name, []).append(r)
                     continue              # already measured by an earlier run
-                p = run_point(W, chi, name, args.sweeps, writer=tracer,
-                              key=dict(layer_type=lt, depth=dep, chi=chi,
-                                       ansatz=name, regime="explicit",
-                                       objective="frobenius", seed=0))
-                ck.add(dict(stage=1, layer_type=lt, depth=dep, family="hybrid",
-                            ansatz=name, regime="explicit",
-                            objective="frobenius", seed=0, **p))
-                a = cheapest(cc, p["err"])
-                if a:
-                    got.append(a / (p["c"] + p["q"]))
-            print(f"  {name:<22} Q={ck.rows[-1]['q'] if ck.rows else 0:<7} "
-                  f"median ratio {st.median(got) if got else float('nan'):.3f}x "
-                  f"({sum(1 for g in got if g > 1)}/{len(got)} win)", flush=True)
+                jobs.append(dict(W=W, chi=chi, ansatz=name, sweeps=args.sweeps,
+                                 cov=None, keep_trace=bool(args.trace),
+                                 kw={}, key=key, group=name))
+    got = _pooled(jobs, args, ck, tracer, curves, 1, "stage-1 point")
+    for name in names:
+        g = done.get(name, []) + got.get(name, [])
+        print(f"  {name:<22} median ratio "
+              f"{st.median(g) if g else float('nan'):.3f}x "
+              f"({sum(1 for x in g if x > 1)}/{len(g)} win)", flush=True)
     tracer.close()
     rows = ck.rows
     ck.close()
@@ -254,6 +291,7 @@ def cmd_stage2(args):
     rows, curves = [], {}
     ck = _checkpoint(args, 2)
     tracer = TraceWriter(args.trace, args.trace_every, append=bool(ck.n_resumed))
+    jobs, done = [], {}
     for pname, lt, dep, W in layers:
         curves[(lt, dep)] = cc = classical_curve(W)
         assert_identity_is_classical(W, min(8, cc[-1][0]))
@@ -262,33 +300,34 @@ def cmd_stage2(args):
               f"{len(regimes)} regimes x {args.seeds} seed(s)", flush=True)
         for name in names:
             for rname, rkw in regimes:
-                got = []
                 # The sweep from identity is deterministic, so seeds only buy
                 # anything where Adam's initialisation actually varies.
                 seeds = [0] if rname == "explicit" else range(args.seeds)
                 for seed in seeds:
                     for chi in grid:
-                        if ck.done(layer_type=lt, depth=dep, family="hybrid",
+                        key = dict(layer_type=lt, depth=dep, chi=chi,
                                    ansatz=name, regime=rname,
-                                   objective="frobenius", seed=seed, chi=chi):
-                            got.append(_ratio(ck, cc, lt, dep, name, rname,
-                                              "frobenius", seed, chi))
+                                   objective="frobenius", seed=seed)
+                        if ck.done(family="hybrid", **key):
+                            r = _ratio(ck, cc, lt, dep, name, rname,
+                                       "frobenius", seed, chi)
+                            if r == r:
+                                done.setdefault((name, rname), []).append(r)
                             continue
-                        p = run_point(W, chi, name, args.sweeps, seed=seed,
-                                      gd_steps=args.gd_steps, gd_lr=args.gd_lr,
-                                      fast_gradient=True, writer=tracer,
-                                      key=dict(layer_type=lt, depth=dep, chi=chi,
-                                               ansatz=name, regime=rname,
-                                               objective="frobenius", seed=seed),
-                                      **rkw)
-                        ck.add(dict(stage=2, layer_type=lt, depth=dep,
-                                    family="hybrid", ansatz=name, regime=rname,
-                                    objective="frobenius", seed=seed, **p))
-                        a = cheapest(cc, p["err"])
-                        if a:
-                            got.append(a / (p["c"] + p["q"]))
-                print(f"  {name:<20} {rname:<22} median "
-                      f"{st.median(got) if got else float('nan'):.3f}x", flush=True)
+                        jobs.append(dict(
+                            W=W, chi=chi, ansatz=name, sweeps=args.sweeps,
+                            cov=None, keep_trace=bool(args.trace),
+                            kw=dict(seed=seed, gd_steps=args.gd_steps,
+                                    gd_lr=args.gd_lr, fast_gradient=True,
+                                    patience=args.patience,
+                                    min_delta=args.min_delta, **rkw),
+                            key=key, group=(name, rname)))
+    got = _pooled(jobs, args, ck, tracer, curves, 2, "stage-2 point")
+    for name in names:
+        for rname, _rkw in regimes:
+            g = done.get((name, rname), []) + got.get((name, rname), [])
+            print(f"  {name:<20} {rname:<22} median "
+                  f"{st.median(g) if g else float('nan'):.3f}x", flush=True)
     tracer.close()
     rows = ck.rows
     ck.close()
@@ -317,8 +356,9 @@ def cmd_stage3(args):
               ("activation/V-only", dict(gradient_objective="activation-mse",
                                          train_side="v"))]
     rows, curves = [], {}
-    ck = _checkpoint(args, 1)
+    ck = _checkpoint(args, 3)
     tracer = TraceWriter(args.trace, args.trace_every, append=bool(ck.n_resumed))
+    jobs, done = [], {}
     for pname, lt, dep, W in layers:
         H = cov[pname]
         curves[(lt, dep)] = cc = classical_curve(W, H)
@@ -327,34 +367,31 @@ def cmd_stage3(args):
               f"{len(setups)} objectives (scored under H)", flush=True)
         for name in names:
             for sname, skw in setups:
-                got = []
                 for seed in range(args.seeds):
                     for chi in grid:
-                        if ck.done(layer_type=lt, depth=dep, family="hybrid",
+                        key = dict(layer_type=lt, depth=dep, chi=chi,
                                    ansatz=name, regime="explicit+gradient",
-                                   objective=sname, seed=seed, chi=chi):
-                            got.append(_ratio(ck, cc, lt, dep, name,
-                                              "explicit+gradient", sname,
-                                              seed, chi))
+                                   objective=sname, seed=seed)
+                        if ck.done(family="hybrid", **key):
+                            r = _ratio(ck, cc, lt, dep, name,
+                                       "explicit+gradient", sname, seed, chi)
+                            if r == r:
+                                done.setdefault((name, sname), []).append(r)
                             continue
-                        p = run_point(W, chi, name, args.sweeps, cov=H, seed=seed,
-                                      optimizer="explicit+gradient",
-                                      gd_steps=args.gd_steps, gd_lr=args.gd_lr,
-                                      fast_gradient=True, writer=tracer,
-                                      key=dict(layer_type=lt, depth=dep, chi=chi,
-                                               ansatz=name,
-                                               regime="explicit+gradient",
-                                               objective=sname, seed=seed),
-                                      **skw)
-                        ck.add(dict(stage=3, layer_type=lt, depth=dep,
-                                    family="hybrid", ansatz=name,
-                                    regime="explicit+gradient",
-                                    objective=sname, seed=seed, **p))
-                        a = cheapest(cc, p["err"])
-                        if a:
-                            got.append(a / (p["c"] + p["q"]))
-                print(f"  {name:<20} {sname:<20} median "
-                      f"{st.median(got) if got else float('nan'):.3f}x", flush=True)
+                        jobs.append(dict(
+                            W=W, chi=chi, ansatz=name, sweeps=args.sweeps,
+                            cov=H, keep_trace=bool(args.trace),
+                            kw=dict(seed=seed, optimizer="explicit+gradient",
+                                    gd_steps=args.gd_steps, gd_lr=args.gd_lr,
+                                    fast_gradient=True, patience=args.patience,
+                                    min_delta=args.min_delta, **skw),
+                            key=key, group=(name, sname)))
+    got = _pooled(jobs, args, ck, tracer, curves, 3, "stage-3 point")
+    for name in names:
+        for sname, _skw in setups:
+            g = done.get((name, sname), []) + got.get((name, sname), [])
+            print(f"  {name:<20} {sname:<20} median "
+                  f"{st.median(g) if g else float('nan'):.3f}x", flush=True)
     tracer.close()
     rows = ck.rows
     ck.close()
@@ -383,10 +420,21 @@ def main():
                             "this CSV (one tidy long-format file)")
         p.add_argument("--trace-every", type=int, default=5,
                        help="keep every Nth Adam step (endpoints always kept)")
+        p.add_argument("--jobs", type=int, default=1,
+                       help="parallel worker processes (0 = all cores); each "
+                            "point is independent")
         if nm != "stage1":
             p.add_argument("--seeds", type=int, default=2)
             p.add_argument("--gd-steps", type=int, default=150)
             p.add_argument("--gd-lr", type=float, default=0.05)
+            p.add_argument("--patience", type=int, default=25,
+                           help="stop a gradient run after this many steps with "
+                                "no relative improvement (0 disables). Buys "
+                                "compute: the objective is the exact quantity "
+                                "being minimised, so there is no generalisation "
+                                "gap to guard against")
+            p.add_argument("--min-delta", type=float, default=1e-4,
+                           help="relative improvement that counts as progress")
         if nm == "stage1":
             p.add_argument("--top", type=int, default=4)
         if nm == "stage3":
