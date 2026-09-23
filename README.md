@@ -1209,6 +1209,60 @@ magnitudes need the real trained layer (a random matrix has little to
 disentangle, and perplexity needs a model). `--optimizer gradient` runs the same
 sweep with the gradient-trained circuits.
 
+## Which per-layer metric stands in for perplexity? (`proxy_study.py`)
+
+Every sweep in this repository ranks compressions by a **per-layer** error, then
+assumes the ranking carries over to perplexity. That assumption is load-bearing
+and was never tested. `proxy_study.py` tests it directly: perturb one layer many
+different ways, score each candidate metric on the result, swap the layer into the
+model, and read the perplexity it actually costs.
+
+```bash
+python proxy_study.py models/SmolLM2-135M --local-files-only \
+    --token-ids ids.pt --types q_proj v_proj --depths 4 12 20 \
+    --per-family 6 --hybrid-ansatz brickwall-k4D2 --out proxy.csv
+```
+
+Four candidates are scored, all against the same perturbations:
+
+| metric | what it weights | blind to |
+| --- | --- | --- |
+| `frobenius` | nothing | which directions the model uses at all |
+| `activation` | inputs, by `H = E[x x^T]` on the calibration batches | which *output* directions matter |
+| `activation_val` | the same, but `H` from **held-out** batches | (the control for overfitting `H`) |
+| `grad_weighted` | inputs *and* outputs, via `g = dL/dy` per token | second-order effects |
+
+Two design points make the answer mean something.
+
+**The perturbations must arrive by different mechanisms.** Sweep one family's one
+knob and a metric can look excellent merely because both it and perplexity move
+with that knob -- the study would be measuring the knob. So the library spans MPO,
+hybrid, plain and whitened low-rank, row-sparse, sparse-plus-low-rank, and a
+**structureless random control** at matched Frobenius error. A metric that ranks a
+structured and a random perturbation of equal magnitude the same, while their
+damage differs, is blind to what matters; the `STRUCTURE BLINDNESS` section of the
+report is the only place that shows up.
+
+**One number is a prediction, not a correlate.** `pred_dnll` is the first-order
+change in mean NLL, `mean_t g_t . ((W' - W) x_t)`, in the units of the thing being
+measured. Since `d(ppl) ~ ppl_0 * d(NLL)` it is checked against the measured
+change on a calibration line rather than merely correlated with it -- a far
+stronger test, because a metric can rank perfectly and still be useless for
+choosing a threshold. `tests/smoke_proxy.py` verifies the predictor against a
+measurement: right sign, within 5%, and with a residual that falls as the square
+of the step.
+
+The report prints, in this order: the Spearman table per layer, a **resolution**
+line, the structure-blindness comparison, the calibration check, and a verdict.
+Read the resolution line first -- it uses the zero-error rows (a full-rank
+factorisation reproduces the weight, so those rows *must* cost nothing) to measure
+the perplexity noise floor, and it can invalidate everything below it. A clean-
+looking rank correlation over damage smaller than the noise floor is the trap this
+study exists to avoid, not a result.
+
+Resumable (`--out` doubles as the checkpoint; `--no-resume` to start over) and
+figures land in `--figs`.
+
 ## Use as a library
 
 ```python
@@ -1258,6 +1312,12 @@ qllm/
   budget_frontier.py   # N*, M*, M*/N*, break-even price, Pareto front
   budget_plots.py      # figures for the budget comparison
   budget_cli.py        # budget-analysis CLI
+  activation_stats.py  # H = E[x x^T]; whitened low-rank, sparse+low-rank fits
+  perturb.py           # Phase A: the perturbation library, metrics, (x, g) capture
+  checkpoint.py        # resumable CSV with a configuration fingerprint
+  trace_log.py         # per-step optimisation traces, thinned, endpoints kept
+  parallel.py          # process pool with preflight ping and thread budgeting
+  opt_plots.py         # figures for the convergence, ppl and proxy studies
   __main__.py          # enables `python -m qllm`
 benchmark_llm.py       # thin entry point for the benchmark CLI
 analyze_layers.py      # thin entry point for the layer-analysis CLI
@@ -1266,6 +1326,11 @@ hybridize.py           # thin entry point for the hybrid PQC+TN sweep
 disentangle_scaling.py # thin entry point for the Fig. 3 accuracy-vs-layers sweep
 analyze_budget.py      # thin entry point for the budget comparison
 analyze_compressibility.py  # thin entry point for the metrics correlation
+stages.py              # C-vs-Q stages 1-3: ansatz, regime and budget sweeps
+convergence.py         # do all configurations converge at the stage budget?
+ppl_correlation.py     # does the per-layer error track perplexity?
+preflight.py           # runs convergence then ppl_correlation back to back
+proxy_study.py         # Phase A: which per-layer metric stands in for perplexity
 tests/                 # offline smoke tests (real torch, stubbed network I/O)
 models.txt             # example model list for --models-file
 ```

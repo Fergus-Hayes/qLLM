@@ -1,9 +1,11 @@
-"""Figures for the two pre-stage optimisation checks.
+"""Figures for the pre-stage optimisation checks and the Phase A proxy study.
 
 ``convergence_doubling.png``  did every configuration converge at the stage budget
 ``convergence_lr.png``        is the default learning rate on a plateau or a cliff
 ``ppl_scatter.png``           does per-layer error predict perplexity
 ``ppl_rho.png``               does the activation-weighted error predict it better
+``proxy_scatter.png``         every candidate metric against the damage it cost
+``proxy_rho.png``             which candidate ranks perplexity best, per layer
 
 Colour is assigned by the job it does, not by rank: the regime (or the family) is
 an *identity*, so it gets categorical slots in a fixed order, and a filtered-out
@@ -296,4 +298,195 @@ def plot_traces(traces, out_dir, name="convergence_traces.png", max_curves=400):
                  fontsize=11, color=INK, x=0.02, ha="left")
     fig.tight_layout(rect=(0, 0, 1, 0.92))
     _save(fig, out_dir, name)
+    plt.close(fig)
+
+
+# --------------------------------------------------------------------------- #
+# Phase A: which per-layer metric is the proxy?                                #
+# --------------------------------------------------------------------------- #
+
+# Seven-odd perturbation families outrun the five validated colour slots, so
+# family identity is carried by marker shape as well as hue, and spelled out in
+# the legend. The control family is drawn hollow so it reads as the control at a
+# glance rather than as one more series.
+MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*"]
+
+
+def _mean(vals):
+    """Mean over the finite entries; NaN when a correlation was undefined."""
+    vals = [v for v in vals if v == v]
+    return sum(vals) / len(vals) if vals else float("nan")
+
+
+def _rank_corr(x, y):
+    """Spearman rho, local so this module imports nothing that imports it back."""
+    n = len(x)
+    if n < 3:
+        return float("nan")
+
+    def rank(v):
+        order = sorted(range(n), key=lambda i: v[i])
+        r = [0.0] * n
+        i = 0
+        while i < n:
+            j = i
+            while j + 1 < n and v[order[j + 1]] == v[order[i]]:
+                j += 1
+            avg = (i + j) / 2.0 + 1.0
+            for k in range(i, j + 1):
+                r[order[k]] = avg
+            i = j + 1
+        return r
+
+    rx, ry = rank(x), rank(y)
+    mx, my = sum(rx) / n, sum(ry) / n
+    num = sum((a - mx) * (b - my) for a, b in zip(rx, ry))
+    den = math.sqrt(sum((a - mx) ** 2 for a in rx)
+                    * sum((b - my) ** 2 for b in ry))
+    return num / den if den else float("nan")
+
+
+def _family_style(fams):
+    """Stable (colour, marker, hollow) per family, control last and hollow."""
+    ordered = [f for f in fams if f != "random"] + \
+              (["random"] if "random" in fams else [])
+    style = {}
+    for i, fam in enumerate(ordered):
+        if fam == "random":
+            style[fam] = (INK_2, "X", True)
+        else:
+            style[fam] = (SERIES[i % len(SERIES)],
+                          MARKERS[i % len(MARKERS)], False)
+    return ordered, style
+
+
+def plot_proxy_scatter(rows, candidates, out_dir):
+    """Every candidate metric against the perplexity its perturbation cost.
+
+    One panel per metric on a shared y axis, log-log, because a proxy is only
+    useful over orders of magnitude of damage. The panels share the y axis and
+    nothing else: each metric keeps its own x scale, since forcing them onto a
+    common axis would invent an agreement none of them has earned.
+
+    The spread *within* a family at fixed x is the honest failure mode to look
+    for -- a vertical smear means the metric is reading a number that perplexity
+    does not follow. The hollow control markers are the sharper test: if they sit
+    on the same line as the structured families, the metric is blind to structure.
+    """
+    plt = _plt()
+    if plt is None or not rows:
+        return
+    fams, style = _family_style(list(dict.fromkeys(r["family"] for r in rows)))
+
+    # A perturbation that makes perplexity go DOWN is the most informative row in
+    # the study -- it is the proxy pointing the wrong way -- so the y axis is
+    # symlog rather than log. A log axis would drop exactly those rows, and drop
+    # them silently, leaving a cleaner-looking figure than the data supports.
+    # The linear band is placed at the bottom decile of the observed damage and
+    # never more than three decades below the largest, so most points land in the
+    # log region. Put it at the median instead and the bulk of the data is crushed
+    # into an unlabelled linear smear.
+    pos = sorted(abs(r["dppl"]) for r in rows if r["dppl"] != 0)
+    lin = max(pos[len(pos) // 10], pos[-1] / 1e3) if pos else 1e-6
+    fig, axes = plt.subplots(1, len(candidates),
+                             figsize=(3.1 * len(candidates) + 0.8, 4.0),
+                             sharey=True, squeeze=False)
+    for j, metric in enumerate(candidates):
+        ax = axes[0][j]
+        for fam in fams:
+            colour, marker, hollow = style[fam]
+            pts = [(r[metric], r["dppl"]) for r in rows
+                   if r["family"] == fam and r[metric] > 0]
+            if not pts:
+                continue
+            ax.plot([p[0] for p in pts], [p[1] for p in pts], linestyle="none",
+                    marker=marker, markersize=6, alpha=0.85,
+                    markerfacecolor=("none" if hollow else colour),
+                    markeredgecolor=(colour if hollow else "#fcfcfb"),
+                    markeredgewidth=(1.3 if hollow else 0.8))
+        good = [(r[metric], r["ppl"]) for r in rows if r[metric] > 0]
+        rho = _rank_corr([g[0] for g in good], [g[1] for g in good]) \
+            if len(good) >= 3 else float("nan")
+        ax.set_title(f"{metric}\npooled rho = {rho:+.2f}", fontsize=9.5,
+                     color=INK, loc="left")
+        ax.set_xscale("log")
+        ax.set_yscale("symlog", linthresh=max(lin, 1e-12), linscale=0.4)
+        ax.axhline(0.0, color=INK_2, linewidth=1.0)
+        ax.set_xlabel("metric value")
+        if j == 0:
+            ax.set_ylabel("perplexity change from baseline\n(symlog; zero drawn)")
+        _style(ax)
+    handles = [plt.Line2D([], [], linestyle="none", marker=style[f][1],
+                          markersize=6,
+                          markerfacecolor=("none" if style[f][2] else style[f][0]),
+                          markeredgecolor=style[f][0],
+                          markeredgewidth=(1.3 if style[f][2] else 0.8),
+                          label=f + (" (control)" if f == "random" else ""))
+               for f in fams]
+    fig.suptitle("Does the per-layer metric predict the perplexity it costs?",
+                 fontsize=11, color=INK, x=0.02, ha="left")
+    fig.legend(handles=handles, frameon=False, fontsize=9, labelcolor=INK_2,
+               ncol=min(len(fams), 4), loc="lower center",
+               bbox_to_anchor=(0.5, -0.07))
+    fig.tight_layout(rect=(0, 0.03, 1, 0.9))
+    _save(fig, out_dir, "proxy_scatter.png")
+    plt.close(fig)
+
+
+def plot_proxy_rho(rows, candidates, keys, out_dir):
+    """Rank correlation with perplexity, per layer, one bar per candidate metric.
+
+    Signed with zero drawn, for the same reason as ``plot_ppl_rho``: a metric
+    that ranks backwards is worse than no metric, and an absolute-value axis
+    would draw it as a success. The 0.9 line is the threshold the verdict uses,
+    so the figure and the printed verdict cannot disagree.
+    """
+    plt = _plt()
+    if plt is None or not rows or not keys:
+        return
+    groups, labels = [], []
+    for lt, dep in keys:
+        sel = [r for r in rows if r["layer_type"] == lt and r["depth"] == dep]
+        if len(sel) < 5:
+            continue
+        groups.append([_rank_corr([r[c] for r in sel], [r["ppl"] for r in sel])
+                       for c in candidates])
+        labels.append(f"{lt} d{dep}  (n={len(sel)})")
+    if not groups:
+        print("  (no layer has >= 5 perturbations; skipping proxy_rho)")
+        return
+    means = [_mean([g[i] for g in groups]) for i in range(len(candidates))]
+    groups.append(means)
+    labels.append("MEAN over layers")
+
+    fig, ax = plt.subplots(
+        figsize=(8.4, 0.26 * len(labels) * len(candidates) + 1.5))
+    y = range(len(labels))
+    h = 0.8 / len(candidates)
+    for i, cand in enumerate(candidates):
+        off = (i - (len(candidates) - 1) / 2.0) * h
+        ax.barh([v + off for v in y], [g[i] for g in groups], height=h * 0.9,
+                color=SERIES[i % len(SERIES)], edgecolor="#fcfcfb",
+                linewidth=0.9, label=cand)
+    ax.axvline(0.0, color=INK_2, linewidth=1.2)
+    ax.axvline(0.9, color=MUTED, linewidth=1.0, linestyle="--")
+    # Inside the axes, not above them: at two groups the axes box is short and an
+    # annotation hung off the top edge lands in the title.
+    ax.annotate("verdict threshold 0.9", xy=(0.9, 0.0),
+                xycoords=("data", "axes fraction"), xytext=(-5, 5),
+                textcoords="offset points", fontsize=8.5, color=INK_2,
+                ha="right", va="bottom")
+    ax.set_yticks(list(y))
+    ax.set_yticklabels(labels, fontsize=9, color=INK)
+    lo = min(v for g in groups for v in g if v == v)
+    ax.set_xlim(min(-1.05, lo - 0.05), 1.05)
+    ax.set_xlabel("Spearman rho with perplexity   (negative = ranks backwards)")
+    ax.set_title("Which per-layer metric is the better proxy?", fontsize=11,
+                 color=INK, loc="left")
+    _style(ax)
+    fig.legend(frameon=False, fontsize=9, labelcolor=INK_2,
+               ncol=min(len(candidates), 4), loc="lower center",
+               bbox_to_anchor=(0.5, -0.02))
+    fig.tight_layout(rect=(0, 0.06, 1, 1))
+    _save(fig, out_dir, "proxy_rho.png")
     plt.close(fig)
