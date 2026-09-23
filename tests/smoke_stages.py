@@ -32,6 +32,13 @@ from qllm.disentangler import (  # noqa: E402
 from qllm.qubit_mpo import make_plan, plan_compress  # noqa: E402
 
 
+def _square(job):
+    """Module-level so a worker process can import it (a closure cannot pickle)."""
+    from qllm.parallel import apply_threads as _at
+    _at(job)
+    return job["v"] ** 2
+
+
 def main():
     torch.manual_seed(0)
 
@@ -257,6 +264,20 @@ def main():
     e_short = output_relative_error(W2, hybrid_weight(short, 2)[0], H)
     assert e_short <= e_long * 1.02, f"early stop cost {e_short / e_long - 1:.2%}"
 
+    # --- 13. the process pool ------------------------------------------------
+    from qllm.parallel import apply_threads, run_jobs
+    seen = []
+    res = run_jobs(_square, [dict(v=i) for i in range(6)], n_jobs=1,
+                   on_result=lambda j, r: seen.append(r))
+    assert res == [0, 1, 4, 9, 16, 25] and seen == res, (res, seen)
+    # n_jobs > 1 must produce the same SET of results; order is completion order
+    par = run_jobs(_square, [dict(v=i) for i in range(6)], n_jobs=3)
+    assert sorted(par) == [0, 1, 4, 9, 16, 25], par
+    # a worker that dies is retried, not lost
+    hard = run_jobs(_square, [dict(v=i) for i in range(4)], n_jobs=8)
+    assert sorted(hard) == [0, 1, 4, 9], hard
+    apply_threads({"_threads": 1})            # must not raise
+
     print(f"  constrained gates: {n} angles, orthogonal to 1e-12, "
           f"off-block mass exactly 0, differentiable")
     print(f"  activation objective {e_a:.5f} beats Frobenius {e_f:.5f} on the "
@@ -271,6 +292,7 @@ def main():
     print("  checkpoint: resumes, refuses a changed config, drops a torn line")
     print(f"  early stop: {len(short.trace)} steps vs {len(long.trace)}, "
           f"error within 2%")
+    print("  process pool: sequential and pooled agree, dead workers retried")
     print("\nSTAGES SMOKE PASSED")
 
 

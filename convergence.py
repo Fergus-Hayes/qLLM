@@ -39,6 +39,7 @@ from qllm.compactifai import relative_error
 from qllm.disentangler import disentangle, hybrid_weight
 from qllm.opt_plots import plot_convergence, plot_lr, plot_traces
 from qllm.checkpoint import ResumableCSV
+from qllm.parallel import apply_threads, run_jobs
 from qllm.trace_log import TraceWriter, read_traces
 from stages import ANSATZE, load_layers
 
@@ -55,7 +56,8 @@ REGIMES = {
 
 
 def run(W, chi, ansatz, regime, sweeps, gd_steps, lr, cov=None, seed=0,
-        writer=None, key=None, patience=0, min_delta=0.0, cov_val=None):
+        writer=None, key=None, patience=0, min_delta=0.0, cov_val=None,
+        keep_trace=False):
     kw = dict(ANSATZE[ansatz]); kw.update(REGIMES[regime])
     r = disentangle(W, target_chi=chi, n_sites=2, sweeps=sweeps, tensorization="qubit",
                     gd_steps=gd_steps, gd_lr=lr, fast_gradient=True, seed=seed,
@@ -94,16 +96,44 @@ def run(W, chi, ansatz, regime, sweeps, gd_steps, lr, cov=None, seed=0,
     if cov_val is not None:
         err_val = output_relative_error(W, approx, cov_val)
     return dict(err=err, err_val=err_val, sweeps_run=int(r.sweeps_run),
+                trace=(list(r.trace) if keep_trace else None),
                 n_hist=len(hist), best_at=best_at, tail=tail_frac,
                 stopped_early=int(r.trace[-1].get("stopped_early", 0))
                 if r.trace else 0,
                 seconds=round(r.seconds, 2))
 
 
+def _doubling_job(job):
+    """One CSV row: the run at budget plus its unconstrained 2x control.
+
+    Both halves live in one job so the pair is always produced by one worker --
+    splitting them would let a killed worker leave a row half-measured.
+    """
+    apply_threads(job)
+    W, c, cv = job["W"], job["cov"], job["cov_val"]
+    a = job["args"]
+    base = run(W, job["chi"], job["ansatz"], job["regime"], a["sweeps"],
+               a["gd_steps"], a["gd_lr"], c, patience=a["patience"],
+               min_delta=a["min_delta"], cov_val=cv,
+               keep_trace=a.get("keep_trace", False))
+    dbl = run(W, job["chi"], job["ansatz"], job["regime"], a["sweeps"] * 2,
+              a["gd_steps"] * 2, a["gd_lr"], c, patience=0)
+    return base, dbl
+
+
+def _lr_job(job):
+    """One learning rate for one configuration."""
+    apply_threads(job)
+    a = job["args"]
+    return run(job["W"], job["chi"], job["ansatz"], job["regime"], a["sweeps"],
+               a["gd_steps"], job["lr"], job["cov"], patience=a["patience"],
+               min_delta=a["min_delta"])
+
+
 def _plan(args, layers, cov):
     """What this invocation would run, counted the way the loops actually run it."""
     from qllm.disentangler import quantum_param_count
-    grad = [r for r in args.regimes if r != "explicit"]
+    grad = [] if args.skip_lr else [r for r in args.regimes if r != "explicit"]
     per_layer_regimes = {}
     for pname, lt, dep, _W in layers:
         keep = [r for r in args.regimes
@@ -111,9 +141,10 @@ def _plan(args, layers, cov):
         per_layer_regimes[(lt, dep)] = keep
     n_double = sum(len(args.chis) * len(args.ansatze) * len(v)
                    for v in per_layer_regimes.values())
-    n_lr = sum(len(args.chis) * len(args.ansatze) * len(args.lrs)
-               * len([r for r in v if r != "explicit"])
-               for v in per_layer_regimes.values())
+    n_lr = 0 if args.skip_lr else sum(
+        len(args.chis) * len(args.ansatze) * len(args.lrs)
+        * len([r for r in v if r != "explicit"])
+        for v in per_layer_regimes.values())
     skipped = sum(len(args.regimes) - len(v) for v in per_layer_regimes.values())
 
     print(f"\nPLAN for this invocation\n{'=' * 60}")
@@ -123,8 +154,9 @@ def _plan(args, layers, cov):
     print(f"  chi values      {len(args.chis)}: {args.chis}")
     print(f"  ansatze         {len(args.ansatze)}: {', '.join(args.ansatze)}")
     print(f"  regimes         {len(args.regimes)}: {', '.join(args.regimes)}")
-    print(f"  learning rates  {len(args.lrs)}: {args.lrs} "
-          f"(gradient regimes only: {len(grad)})")
+    print(f"  learning rates  " + ("SKIPPED (--skip-lr)" if args.skip_lr else
+          f"{len(args.lrs)}: {args.lrs} (gradient regimes only: {len(grad)})"))
+    print(f"  workers         {args.jobs if args.jobs > 0 else 'all cores'}")
     if skipped:
         print(f"  NOTE: {skipped} (layer, regime) pair(s) skipped -- an "
               f"activation-MSE regime\n        with no H for that layer in --cov")
@@ -203,6 +235,14 @@ def main():
                          "kept); the sweep phase is never thinned")
     ap.add_argument("--no-resume", action="store_true",
                     help="discard any existing output and start over")
+    ap.add_argument("--jobs", type=int, default=1,
+                    help="parallel worker processes (0 = all cores). Each point "
+                         "is independent; workers killed by the OOM reaper are "
+                         "retried with the pool halved, down to this process")
+    ap.add_argument("--skip-lr", action="store_true",
+                    help="skip the learning-rate phase entirely (it is the "
+                         "larger half of the grid, and the answer transfers "
+                         "from a cheaper depth)")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the plan -- how many optimisations, of what -- "
                          "and exit without running any")
@@ -243,6 +283,10 @@ def main():
           "column only within a metric.\n")
     print(f"{'layer':>16}{'chi':>5}{'ansatz':>18}{'regime':>22}{'metric':>7}"
           f"{'err(B)':>10}{'err(2B)':>10}{'gap':>9}{'tail':>8}{'ok':>6}")
+    # Enumerate first, then run: the jobs are independent, so with --jobs > 1 they
+    # go to a process pool. The checkpoint is written HERE, in the parent, as each
+    # result lands -- workers never share a file handle.
+    jobs = []
     for pname, lt, dep, W in layers:
         H = cov.get(pname)
         for chi in args.chis:
@@ -251,71 +295,67 @@ def main():
                     needs_h = regime.endswith("-am")
                     if needs_h and H is None:
                         continue
-                    c = H if needs_h else None
                     if ck.done(layer_type=lt, depth=dep, chi=chi, ansatz=ansatz,
                                regime=regime):
                         continue          # already measured by an earlier run
-                    base = run(W, chi, ansatz, regime, args.sweeps, args.gd_steps,
-                               args.gd_lr, c, patience=args.patience,
-                               min_delta=args.min_delta,
-                               cov_val=cov_val.get(pname) if needs_h else None,
-                               writer=tracer,
-                               key=dict(layer_type=lt, depth=dep, chi=chi,
-                                        ansatz=ansatz, regime=regime,
-                                        lr=args.gd_lr, budget="1x"))
-                    # The control runs UNCONSTRAINED. If it early-stopped too it
-                    # would halt at the same place and the gap would be a vacuous
-                    # 0.00%; running it to the full doubled budget makes the test
-                    # ask the right question -- does early stopping cost anything.
-                    dbl = run(W, chi, ansatz, regime, args.sweeps * 2,
-                              args.gd_steps * 2, args.gd_lr, c, patience=0)
-                    gap = ((base["err"] - dbl["err"]) / base["err"]
-                           if base["err"] > 0 else 0.0)
-                    # A run that recorded no iterations never trained: the
-                    # optimiser's finite-gradient guard aborted at step 0 and the
-                    # circuit stayed at identity. Both the B and 2B runs fail the
-                    # same way, so the gap is a clean 0.00% and it would otherwise
-                    # be counted as the best-converged row in the table.
-                    dead = (regime != "explicit" and base["n_hist"] == 0)
-                    ok = (gap <= args.tol) and not dead
-                    # Independent of the doubling gap: if a tenth of the budget
-                    # is still delivering a tenth of the total gain, the run was
-                    # cut off mid-descent rather than left on a plateau.
-                    tail = base["tail"] > args.tail_tol
-                    ck.add(dict(layer_type=lt, depth=dep, chi=chi,
-                                     ansatz=ansatz, regime=regime,
-                                     err_base=round(base["err"], 6),
-                                     err_double=round(dbl["err"], 6),
-                                     gap=round(gap, 5), converged=int(ok),
-                                     best_at=base["best_at"], n_hist=base["n_hist"],
-                                     tail=round(base["tail"], 5),
-                                     stopped_early=base["stopped_early"],
-                                     err_val=(round(base["err_val"], 6)
-                                              if base["err_val"] == base["err_val"]
-                                              else ""),
-                                     sweeps_run=base["sweeps_run"],
-                                     metric=("act" if needs_h else "frob"),
-                                     never_trained=int(dead),
-                                     still_improving=int(tail),
-                                     seconds=base["seconds"]))
-                    rows = ck.rows
-                    flag = "DEAD" if dead else ("ok" if ok else "NO")
-                    print(f"{lt[-12:]:>16}{chi:>5}{ansatz:>18}{regime:>22}"
-                          f"{('act' if needs_h else 'frob'):>7}"
-                          f"{base['err']:>10.5f}{dbl['err']:>10.5f}{gap:>8.2%}"
-                          f"{base['tail']:>7.1%}{flag:>6}"
-                          + ("  <- NEVER TRAINED (0 iterations recorded)" if dead
-                             else "  <- still improving" if tail else ""),
-                          flush=True)
+                    jobs.append(dict(
+                        W=W, chi=chi, ansatz=ansatz, regime=regime,
+                        layer_type=lt, depth=dep, needs_h=needs_h,
+                        cov=H if needs_h else None,
+                        cov_val=cov_val.get(pname) if needs_h else None,
+                        args=dict(sweeps=args.sweeps, gd_steps=args.gd_steps,
+                                  gd_lr=args.gd_lr, patience=args.patience,
+                                  min_delta=args.min_delta,
+                                  keep_trace=bool(args.trace))))
+
+    def _record(job, result):
+        base, dbl = result
+        if base.get("trace"):
+            tracer.add_rows(base["trace"], layer_type=job["layer_type"],
+                            depth=job["depth"], chi=job["chi"],
+                            ansatz=job["ansatz"], regime=job["regime"],
+                            lr=args.gd_lr, budget="1x")
+        lt, dep, chi = job["layer_type"], job["depth"], job["chi"]
+        ansatz, regime, needs_h = job["ansatz"], job["regime"], job["needs_h"]
+        gap = ((base["err"] - dbl["err"]) / base["err"]
+               if base["err"] > 0 else 0.0)
+        # A run that recorded no iterations never trained: the optimiser's
+        # finite-gradient guard aborted at step 0 and the circuit stayed at
+        # identity. Both the B and 2B runs fail the same way, so the gap is a
+        # clean 0.00% and it would otherwise be counted as the best row here.
+        dead = (regime != "explicit" and base["n_hist"] == 0)
+        ok = (gap <= args.tol) and not dead
+        tail = base["tail"] > args.tail_tol
+        ck.add(dict(layer_type=lt, depth=dep, chi=chi, ansatz=ansatz,
+                    regime=regime, err_base=round(base["err"], 6),
+                    err_double=round(dbl["err"], 6), gap=round(gap, 5),
+                    converged=int(ok), best_at=base["best_at"],
+                    n_hist=base["n_hist"], tail=round(base["tail"], 5),
+                    stopped_early=base["stopped_early"],
+                    err_val=(round(base["err_val"], 6)
+                             if base["err_val"] == base["err_val"] else ""),
+                    sweeps_run=base["sweeps_run"],
+                    metric=("act" if needs_h else "frob"),
+                    never_trained=int(dead), still_improving=int(tail),
+                    seconds=base["seconds"]))
+        flag = "DEAD" if dead else ("ok" if ok else "NO")
+        print(f"{lt[-12:]:>16}{chi:>5}{ansatz:>18}{regime:>22}"
+              f"{('act' if needs_h else 'frob'):>7}"
+              f"{base['err']:>10.5f}{dbl['err']:>10.5f}{gap:>8.2%}"
+              f"{base['tail']:>7.1%}{flag:>6}"
+              + ("  <- NEVER TRAINED (0 iterations recorded)" if dead
+                 else "  <- still improving" if tail else ""), flush=True)
+
+    run_jobs(_doubling_job, jobs, args.jobs, desc="doubling pair",
+             on_result=_record)
+    rows = ck.rows
 
     # ---- learning-rate sensitivity (gradient regimes only) ------------------
     lr_rows = []
-    grad = [r for r in args.regimes if r != "explicit"]
+    grad = [] if args.skip_lr else [r for r in args.regimes if r != "explicit"]
     if grad and args.lrs:
-        print(f"\nLearning-rate sensitivity at the stage budget "
-              f"(err; lower is better)")
-        print(f"{'layer':>16}{'chi':>5}{'ansatz':>18}{'regime':>22}"
-              + "".join(f"{'lr=' + str(l):>11}" for l in args.lrs))
+        print(f"\nLearning-rate sensitivity at the stage budget (err; lower is better)")
+        lr_jobs = []
         for pname, lt, dep, W in layers:
             H = cov.get(pname)
             for chi in args.chis:
@@ -323,15 +363,27 @@ def main():
                     for regime in grad:
                         if regime.endswith("-am") and H is None:
                             continue
-                        c = H if regime.endswith("-am") else None
-                        errs = [run(W, chi, ansatz, regime, args.sweeps,
-                                    args.gd_steps, l, c)["err"] for l in args.lrs]
-                        for l, e in zip(args.lrs, errs):
-                            lr_rows.append(dict(layer_type=lt, depth=dep, chi=chi,
-                                                ansatz=ansatz, regime=regime,
-                                                lr=l, err=round(e, 6)))
-                        print(f"{lt[-12:]:>16}{chi:>5}{ansatz:>18}{regime:>22}"
-                              + "".join(f"{e:>11.5f}" for e in errs), flush=True)
+                        for lr in args.lrs:
+                            lr_jobs.append(dict(
+                                W=W, chi=chi, ansatz=ansatz, regime=regime,
+                                layer_type=lt, depth=dep, lr=lr,
+                                cov=H if regime.endswith("-am") else None,
+                                args=dict(sweeps=args.sweeps,
+                                          gd_steps=args.gd_steps,
+                                          patience=args.patience,
+                                          min_delta=args.min_delta)))
+
+        def _record_lr(job, res):
+            lr_rows.append(dict(layer_type=job["layer_type"], depth=job["depth"],
+                                chi=job["chi"], ansatz=job["ansatz"],
+                                regime=job["regime"], lr=job["lr"],
+                                err=round(res["err"], 6)))
+            print(f"  {job['layer_type'][-12:]:>14} chi={job['chi']:<3} "
+                  f"{job['ansatz']:>18} {job['regime']:>22} lr={job['lr']:<6} "
+                  f"{res['err']:.5f}", flush=True)
+
+        run_jobs(_lr_job, lr_jobs, args.jobs, desc="lr point",
+                 on_result=_record_lr)
 
     rows = ck.rows
     ck.close()

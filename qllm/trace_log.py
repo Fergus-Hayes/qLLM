@@ -47,6 +47,10 @@ class TraceWriter:
         return self.path is not None
 
     def add(self, result, **key):
+        """Record a :class:`DisentangleResult`'s trace (see :meth:`add_rows`)."""
+        return self.add_rows(getattr(result, "trace", None), **key)
+
+    def add_rows(self, trace, **key):
         """Record one :class:`DisentangleResult`'s trace under a configuration key.
 
         ``every`` thins the GRADIENT phase only -- a 150-step Adam run is the bulk
@@ -54,11 +58,11 @@ class TraceWriter:
         The first and last iteration of a phase are always kept so the endpoints
         of every curve survive thinning.
         """
-        if self.path is None or not getattr(result, "trace", None):
+        if self.path is None or not trace:
             return
         rows = []
         by_phase = {}
-        for t in result.trace:
+        for t in trace:
             by_phase.setdefault(t["phase"], []).append(t)
         for phase, items in by_phase.items():
             last = len(items)
