@@ -201,6 +201,46 @@ def main():
     quiet.close()
     assert quiet.n_rows == 0
 
+    # --- 11. checkpointing: a killed run resumes without changing the answer --
+    from qllm.checkpoint import ResumableCSV
+    with _tf.TemporaryDirectory() as td:
+        path = Path(td) / "ck.csv"
+        cfg = {"sweeps": 12, "gd_steps": 150}
+        a = ResumableCSV(path, ("layer", "chi"), cfg, numeric=("err",))
+        for i in range(3):
+            a.add(dict(layer="q", chi=i, err=0.5 + i))
+        a.close()
+        b = ResumableCSV(path, ("layer", "chi"), cfg, numeric=("err",))
+        assert b.n_resumed == 3, b.n_resumed
+        assert b.done(layer="q", chi=1) and not b.done(layer="q", chi=9)
+        b.add(dict(layer="q", chi=9, err=9.5))
+        b.close()
+        # the union of resumed and new rows is what the analysis reads, and the
+        # resumed values come back as numbers, not strings
+        assert len(b.rows) == 4 and isinstance(b.rows[0]["err"], float)
+
+        # a configuration change must REFUSE to resume rather than blend
+        # incompatible measurements into one table
+        try:
+            ResumableCSV(path, ("layer", "chi"), {"sweeps": 99, "gd_steps": 150})
+        except SystemExit as exc:
+            assert "different configuration" in str(exc)
+        else:
+            raise AssertionError("resumed into a file from another configuration")
+
+        # --no-resume starts over
+        c = ResumableCSV(path, ("layer", "chi"), cfg, resume=False)
+        assert c.n_resumed == 0 and not c.done(layer="q", chi=1)
+        c.close()
+
+    # a half-written final line (process killed mid-flush) is dropped, not parsed
+    with _tf.TemporaryDirectory() as td:
+        path = Path(td) / "torn.csv"
+        path.write_text("layer,chi,err\nq,1,0.5\nq,2\n")
+        d = ResumableCSV(path, ("layer", "chi"), {}, numeric=("err",))
+        assert len(d.rows) == 1, f"torn line was not dropped: {d.rows}"
+        d.close()
+
     print(f"  constrained gates: {n} angles, orthogonal to 1e-12, "
           f"off-block mass exactly 0, differentiable")
     print(f"  activation objective {e_a:.5f} beats Frobenius {e_f:.5f} on the "
@@ -212,6 +252,7 @@ def main():
     print("  all four figures render")
     print("  traces: phases separated, iters 1-based per phase, thinning keeps "
           "endpoints")
+    print("  checkpoint: resumes, refuses a changed config, drops a torn line")
     print("\nSTAGES SMOKE PASSED")
 
 

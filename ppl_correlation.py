@@ -38,6 +38,7 @@ import torch
 from qllm.activation_stats import input_covariance, output_relative_error
 from qllm.compactifai import log_spaced_ints, relative_error
 from qllm.disentangler import classical_param_count, disentangle, hybrid_weight
+from qllm.checkpoint import ResumableCSV
 from qllm.layer_analysis import quick_perplexity
 from qllm.opt_plots import plot_ppl_rho, plot_ppl_scatter
 from qllm.qubit_mpo import make_plan, plan_compress
@@ -100,6 +101,8 @@ def main():
     ap.add_argument("--ppl-tokens", type=int, default=16384)
     ap.add_argument("--window", type=int, default=512)
     ap.add_argument("--batch-size", type=int, default=2)
+    ap.add_argument("--no-resume", action="store_true",
+                    help="discard any existing output and start over")
     ap.add_argument("--out", default="ppl_correlation.csv")
     ap.add_argument("--figs", default="figs",
                     help="directory for the figures (--figs '' to skip plotting)")
@@ -145,7 +148,13 @@ def main():
     print(f"baseline perplexity {base_ppl:.4f}\n")
 
     params = dict(model.named_parameters())
-    rows = []
+    ck = ResumableCSV(args.out, ("layer_type", "depth", "family", "chi"),
+                      dict(model=args.model, ansatz=args.ansatz,
+                           points=args.points, sweeps=args.sweeps,
+                           ppl_tokens=args.ppl_tokens, window=args.window),
+                      resume=not args.no_resume,
+                      numeric=("chi", "c", "q", "total", "frob", "act", "ppl",
+                               "dppl", "depth"))
     for name, lt, dep in targets:
         p = params[name]
         W = p.detach().clone().float()
@@ -156,6 +165,8 @@ def main():
               flush=True)
         for chi in grid:
             for family in ("mpo", "hybrid"):
+                if ck.done(layer_type=lt, depth=dep, family=family, chi=chi):
+                    continue              # already measured by an earlier run
                 if family == "mpo":
                     approx, c, q = *plan_compress(W, plan, chi), 0
                 else:
@@ -169,20 +180,20 @@ def main():
                     ppl = quick_perplexity(model, ppl_ids, args.device,
                                            args.window, args.batch_size)
                     p.copy_(W.to(dtype=p.dtype, device=p.device))
-                rows.append(dict(
+                ck.add(dict(
                     layer_type=lt, depth=dep, family=family, chi=chi,
                     c=int(c), q=int(q), total=int(c) + int(q),
                     frob=round(float(relative_error(W, approx)), 6),
                     act=round(output_relative_error(W, approx, H), 6),
                     ppl=round(float(ppl), 5),
                     dppl=round(float(ppl) - base_ppl, 5)))
-                print(f"  chi={chi:<4} {family:<7} frob {rows[-1]['frob']:.4f}  "
-                      f"act {rows[-1]['act']:.4f}  ppl {ppl:.4f}", flush=True)
+                print(f"  chi={chi:<4} {family:<7} frob {ck.rows[-1]['frob']:.4f}"
+                      f"  act {ck.rows[-1]['act']:.4f}  ppl {ppl:.4f}", flush=True)
 
-    with open(args.out, "w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=list(rows[0]))
-        w.writeheader(); w.writerows(rows)
-    print(f"\nWrote {len(rows)} rows to {Path(args.out).resolve()}")
+    rows = ck.rows
+    ck.close()
+    if not rows:
+        raise SystemExit("No rows measured or resumed.")
 
     # ---- correlations --------------------------------------------------------
     def corr(sel):

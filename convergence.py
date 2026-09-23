@@ -38,6 +38,7 @@ from qllm.activation_stats import output_relative_error
 from qllm.compactifai import relative_error
 from qllm.disentangler import disentangle, hybrid_weight
 from qllm.opt_plots import plot_convergence, plot_lr, plot_traces
+from qllm.checkpoint import ResumableCSV
 from qllm.trace_log import TraceWriter, read_traces
 from stages import ANSATZE, load_layers
 
@@ -121,6 +122,8 @@ def main():
     ap.add_argument("--trace-every", type=int, default=1,
                     help="keep every Nth Adam step in the trace (endpoints always "
                          "kept); the sweep phase is never thinned")
+    ap.add_argument("--no-resume", action="store_true",
+                    help="discard any existing output and start over")
     ap.add_argument("--out", default="convergence.csv")
     ap.add_argument("--figs", default="figs",
                     help="directory for the figures (--figs '' to skip plotting)")
@@ -133,8 +136,13 @@ def main():
                 iter(load_file(Path(args.cov) / r["file"]).values())).float()
     layers = load_layers(args)
 
-    rows = []
-    tracer = TraceWriter(args.trace, args.trace_every)
+    cfg = dict(sweeps=args.sweeps, gd_steps=args.gd_steps, gd_lr=args.gd_lr,
+               tol=args.tol, layers_dir=args.layers_dir, cov=args.cov)
+    ck = ResumableCSV(args.out, ("layer_type", "depth", "chi", "ansatz", "regime"),
+                      cfg, resume=not args.no_resume,
+                      numeric=("gap", "err_base", "err_double", "tail"))
+    tracer = TraceWriter(args.trace, args.trace_every,
+                         append=bool(ck.n_resumed))
     print("Budget doubling: err at the stage budget vs twice it "
           f"(not converged if the gap exceeds {args.tol:.1%})")
     print("'tail' is the share of the run's total improvement that arrived in its "
@@ -154,6 +162,9 @@ def main():
                     if needs_h and H is None:
                         continue
                     c = H if needs_h else None
+                    if ck.done(layer_type=lt, depth=dep, chi=chi, ansatz=ansatz,
+                               regime=regime):
+                        continue          # already measured by an earlier run
                     base = run(W, chi, ansatz, regime, args.sweeps, args.gd_steps,
                                args.gd_lr, c, writer=tracer,
                                key=dict(layer_type=lt, depth=dep, chi=chi,
@@ -168,7 +179,7 @@ def main():
                     # is still delivering a tenth of the total gain, the run was
                     # cut off mid-descent rather than left on a plateau.
                     tail = base["tail"] > args.tail_tol
-                    rows.append(dict(layer_type=lt, depth=dep, chi=chi,
+                    ck.add(dict(layer_type=lt, depth=dep, chi=chi,
                                      ansatz=ansatz, regime=regime,
                                      err_base=round(base["err"], 6),
                                      err_double=round(dbl["err"], 6),
@@ -179,6 +190,7 @@ def main():
                                      metric=("act" if needs_h else "frob"),
                                      still_improving=int(tail),
                                      seconds=base["seconds"]))
+                    rows = ck.rows
                     flag = "ok" if ok else "NO"
                     print(f"{lt[-12:]:>16}{chi:>5}{ansatz:>18}{regime:>22}"
                           f"{('act' if needs_h else 'frob'):>7}"
@@ -212,16 +224,14 @@ def main():
                         print(f"{lt[-12:]:>16}{chi:>5}{ansatz:>18}{regime:>22}"
                               + "".join(f"{e:>11.5f}" for e in errs), flush=True)
 
-    with open(args.out, "w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=list(rows[0]))
-        w.writeheader(); w.writerows(rows)
+    rows = ck.rows
+    ck.close()
     if lr_rows:
         p2 = Path(args.out).with_name(Path(args.out).stem + "_lr.csv")
         with open(p2, "w", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=list(lr_rows[0]))
             w.writeheader(); w.writerows(lr_rows)
         print(f"\nWrote {len(lr_rows)} lr rows to {p2.resolve()}")
-    print(f"Wrote {len(rows)} rows to {Path(args.out).resolve()}")
     tracer.close()
     if args.figs:
         plot_convergence(rows, args.tol, args.figs)

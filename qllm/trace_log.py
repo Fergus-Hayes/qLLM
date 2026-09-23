@@ -34,9 +34,10 @@ class TraceWriter:
     empty file behind.
     """
 
-    def __init__(self, path, every: int = 1):
+    def __init__(self, path, every: int = 1, append: bool = False):
         self.path = Path(path) if path else None
         self.every = max(1, int(every))
+        self.append = bool(append)
         self._fh = None
         self._writer = None
         self.n_rows = 0
@@ -72,13 +73,19 @@ class TraceWriter:
         run_id = "|".join(f"{v}" for v in key.values())
         if self._writer is None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self._fh = open(self.path, "w", newline="")
+            # Append when the surrounding run is resuming, so the traces of the
+            # work already done are not thrown away by the run that finishes it.
+            fresh = not (self.append and self.path.exists()
+                         and self.path.stat().st_size)
+            self._fh = open(self.path, "w" if fresh else "a", newline="")
             self._writer = csv.DictWriter(
                 self._fh, fieldnames=["run_id", *key.keys(), *FIELDS])
-            self._writer.writeheader()
+            if fresh:
+                self._writer.writeheader()
         for t in rows:
             self._writer.writerow({"run_id": run_id, **key,
                                    **{f: t[f] for f in FIELDS}})
+        self._fh.flush()          # a crash keeps every trace written before it
         self.n_rows += len(rows)
         self.n_runs += 1
 

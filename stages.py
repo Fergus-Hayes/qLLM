@@ -43,6 +43,7 @@ from qllm.compactifai import log_spaced_ints, relative_error
 from qllm.activation_stats import output_relative_error
 from qllm.disentangler import classical_param_count, disentangle, hybrid_weight
 from qllm.qubit_mpo import make_plan, plan_compress
+from qllm.checkpoint import ResumableCSV
 from qllm.trace_log import TraceWriter
 
 # --------------------------------------------------------------------------- #
@@ -169,12 +170,37 @@ def print_bands(rows, curves, group_key, groups):
 
 
 # --------------------------------------------------------------------------- #
+def _ratio(ck, cc, lt, dep, ansatz, regime, objective, seed, chi):
+    """C_alone/(C+Q) for a row already in the checkpoint, so a resumed run's
+    progress lines report the same numbers a fresh one would."""
+    for r in ck.rows:
+        if (r["layer_type"] == lt and int(r["depth"]) == dep
+                and r["ansatz"] == ansatz and r["regime"] == regime
+                and r["objective"] == objective and int(r["seed"]) == seed
+                and int(r["chi"]) == chi):
+            alone = cheapest(cc, float(r["err"]))
+            tot = int(r["c"]) + int(r["q"])
+            return alone / tot if alone and tot else float("nan")
+    return float("nan")
+
+
+def _checkpoint(args, stage):
+    """One resumable table per stage, keyed by everything that identifies a point."""
+    cfg = {k: getattr(args, k, None) for k in
+           ("layers_dir", "types", "depths", "points", "sweeps", "ansatze",
+            "seeds", "gd_steps", "gd_lr", "cov")}
+    cfg["stage"] = stage
+    return ResumableCSV(args.out, ("layer_type", "depth", "family", "ansatz", "regime", "objective", "seed", "chi"), cfg,
+                        resume=not args.no_resume, numeric=("chi", "c", "q", "total", "err", "depth", "seed"))
+
+
 def cmd_stage1(args):
     """Ansatz screening: which circuit shape buys the most bond per parameter."""
     layers = load_layers(args)
     names = args.ansatze or list(ANSATZE)
     rows, curves = [], {}
-    tracer = TraceWriter(args.trace, args.trace_every)
+    ck = _checkpoint(args, 1)
+    tracer = TraceWriter(args.trace, args.trace_every, append=bool(ck.n_resumed))
     for pname, lt, dep, W in layers:
         curves[(lt, dep)] = cc = classical_curve(W)
         assert_identity_is_classical(W, min(8, cc[-1][0]))
@@ -184,20 +210,28 @@ def cmd_stage1(args):
         for name in names:
             got = []
             for chi in grid:
+                if ck.done(layer_type=lt, depth=dep, family="hybrid",
+                           ansatz=name, regime="explicit",
+                           objective="frobenius", seed=0, chi=chi):
+                    got.append(_ratio(ck, cc, lt, dep, name, "explicit",
+                                      "frobenius", 0, chi))
+                    continue              # already measured by an earlier run
                 p = run_point(W, chi, name, args.sweeps, writer=tracer,
                               key=dict(layer_type=lt, depth=dep, chi=chi,
                                        ansatz=name, regime="explicit",
                                        objective="frobenius", seed=0))
-                rows.append(dict(stage=1, layer_type=lt, depth=dep, ansatz=name,
-                                 regime="explicit", objective="frobenius", seed=0, **p))
+                ck.add(dict(stage=1, layer_type=lt, depth=dep, family="hybrid",
+                            ansatz=name, regime="explicit",
+                            objective="frobenius", seed=0, **p))
                 a = cheapest(cc, p["err"])
                 if a:
                     got.append(a / (p["c"] + p["q"]))
-            print(f"  {name:<22} Q={rows[-1]['q']:<7} "
+            print(f"  {name:<22} Q={ck.rows[-1]['q'] if ck.rows else 0:<7} "
                   f"median ratio {st.median(got) if got else float('nan'):.3f}x "
                   f"({sum(1 for g in got if g > 1)}/{len(got)} win)", flush=True)
     tracer.close()
-    write(rows, args.out)
+    rows = ck.rows
+    ck.close()
     order = print_bands(rows, curves, "ansatz", names)
     top = sorted(order, key=lambda k: -order[k])[:args.top]
     print(f"\nTop {args.top} ansatze by mean ratio below err 0.99 "
@@ -218,7 +252,8 @@ def cmd_stage2(args):
                ("explicit+gradient-re", dict(optimizer="explicit+gradient",
                                              gradient_objective="relative-error"))]
     rows, curves = [], {}
-    tracer = TraceWriter(args.trace, args.trace_every)
+    ck = _checkpoint(args, 2)
+    tracer = TraceWriter(args.trace, args.trace_every, append=bool(ck.n_resumed))
     for pname, lt, dep, W in layers:
         curves[(lt, dep)] = cc = classical_curve(W)
         assert_identity_is_classical(W, min(8, cc[-1][0]))
@@ -233,6 +268,12 @@ def cmd_stage2(args):
                 seeds = [0] if rname == "explicit" else range(args.seeds)
                 for seed in seeds:
                     for chi in grid:
+                        if ck.done(layer_type=lt, depth=dep, family="hybrid",
+                                   ansatz=name, regime=rname,
+                                   objective="frobenius", seed=seed, chi=chi):
+                            got.append(_ratio(ck, cc, lt, dep, name, rname,
+                                              "frobenius", seed, chi))
+                            continue
                         p = run_point(W, chi, name, args.sweeps, seed=seed,
                                       gd_steps=args.gd_steps, gd_lr=args.gd_lr,
                                       fast_gradient=True, writer=tracer,
@@ -240,16 +281,17 @@ def cmd_stage2(args):
                                                ansatz=name, regime=rname,
                                                objective="frobenius", seed=seed),
                                       **rkw)
-                        rows.append(dict(stage=2, layer_type=lt, depth=dep,
-                                         ansatz=name, regime=rname,
-                                         objective="frobenius", seed=seed, **p))
+                        ck.add(dict(stage=2, layer_type=lt, depth=dep,
+                                    family="hybrid", ansatz=name, regime=rname,
+                                    objective="frobenius", seed=seed, **p))
                         a = cheapest(cc, p["err"])
                         if a:
                             got.append(a / (p["c"] + p["q"]))
                 print(f"  {name:<20} {rname:<22} median "
                       f"{st.median(got) if got else float('nan'):.3f}x", flush=True)
     tracer.close()
-    write(rows, args.out)
+    rows = ck.rows
+    ck.close()
     print_bands(rows, curves, "regime", [r for r, _ in regimes])
 
 
@@ -275,7 +317,8 @@ def cmd_stage3(args):
               ("activation/V-only", dict(gradient_objective="activation-mse",
                                          train_side="v"))]
     rows, curves = [], {}
-    tracer = TraceWriter(args.trace, args.trace_every)
+    ck = _checkpoint(args, 1)
+    tracer = TraceWriter(args.trace, args.trace_every, append=bool(ck.n_resumed))
     for pname, lt, dep, W in layers:
         H = cov[pname]
         curves[(lt, dep)] = cc = classical_curve(W, H)
@@ -287,6 +330,13 @@ def cmd_stage3(args):
                 got = []
                 for seed in range(args.seeds):
                     for chi in grid:
+                        if ck.done(layer_type=lt, depth=dep, family="hybrid",
+                                   ansatz=name, regime="explicit+gradient",
+                                   objective=sname, seed=seed, chi=chi):
+                            got.append(_ratio(ck, cc, lt, dep, name,
+                                              "explicit+gradient", sname,
+                                              seed, chi))
+                            continue
                         p = run_point(W, chi, name, args.sweeps, cov=H, seed=seed,
                                       optimizer="explicit+gradient",
                                       gd_steps=args.gd_steps, gd_lr=args.gd_lr,
@@ -296,27 +346,21 @@ def cmd_stage3(args):
                                                regime="explicit+gradient",
                                                objective=sname, seed=seed),
                                       **skw)
-                        rows.append(dict(stage=3, layer_type=lt, depth=dep,
-                                         ansatz=name, regime="explicit+gradient",
-                                         objective=sname, seed=seed, **p))
+                        ck.add(dict(stage=3, layer_type=lt, depth=dep,
+                                    family="hybrid", ansatz=name,
+                                    regime="explicit+gradient",
+                                    objective=sname, seed=seed, **p))
                         a = cheapest(cc, p["err"])
                         if a:
                             got.append(a / (p["c"] + p["q"]))
                 print(f"  {name:<20} {sname:<20} median "
                       f"{st.median(got) if got else float('nan'):.3f}x", flush=True)
     tracer.close()
-    write(rows, args.out)
+    rows = ck.rows
+    ck.close()
     print_bands(rows, curves, "objective", [s for s, _ in setups])
     print("\n(errors and the classical baseline are BOTH under H here, so the "
           "ratio stays\n internal to the tensor-network family.)")
-
-
-def write(rows, out):
-    with open(out, "w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=list(rows[0]))
-        w.writeheader()
-        w.writerows(rows)
-    print(f"\nWrote {len(rows)} rows to {Path(out).resolve()}")
 
 
 def main():
@@ -332,6 +376,8 @@ def main():
         p.add_argument("--points", type=int, default=10, help="chi' grid points")
         p.add_argument("--sweeps", type=int, default=12)
         p.add_argument("--out", default=f"{nm}.csv")
+        p.add_argument("--no-resume", action="store_true",
+                       help="discard any existing output and start over")
         p.add_argument("--trace", default=None,
                        help="write every optimisation's per-iteration trace to "
                             "this CSV (one tidy long-format file)")
