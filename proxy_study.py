@@ -21,9 +21,12 @@ perplexity change on a calibration line of slope 1, which is a far stronger test
 than a rank correlation: a metric can rank perfectly and still be useless for
 choosing a threshold.
 
+Needs the FULL model, not an extracted-layers directory: the whole point is to
+swap a perturbed layer back in and read the perplexity, which a loose weight file
+cannot do.
+
     python proxy_study.py models/SmolLM2-135M --local-files-only \
-        --layers-dir models/SmolLM2-135M/layers --token-ids ids.pt \
-        --types q_proj v_proj --depths 20 --out proxy.csv
+        --token-ids ids.pt --types q_proj v_proj --depths 20 --out proxy.csv
 """
 import argparse
 import csv
@@ -48,7 +51,6 @@ def main():
     ap.add_argument("model")
     ap.add_argument("--types", nargs="+", default=["q_proj", "v_proj"])
     ap.add_argument("--depths", type=int, nargs="+", default=None)
-    ap.add_argument("--layers-dir", default=None)
     ap.add_argument("--per-family", type=int, default=6,
                     help="points per perturbation family")
     ap.add_argument("--hybrid-ansatz", default="brickwall-k4D2",
