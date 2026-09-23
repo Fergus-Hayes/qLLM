@@ -1,0 +1,13 @@
+{
+  "fingerprint": "deb8e75bec7866c8",
+  "config": {
+    "sweeps": 12,
+    "gd_steps": 300,
+    "gd_lr": 0.05,
+    "tol": 0.01,
+    "layers_dir": "models/SmolLM2-135M/layers",
+    "cov": null,
+    "patience": 25,
+    "min_delta": 0.0001
+  }
+}

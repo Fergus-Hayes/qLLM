@@ -1,0 +1,2 @@
+layer_type,depth,chi,ansatz,regime,err_base,err_double,gap,converged,best_at,n_hist,tail,stopped_early,err_val,sweeps_run,metric,never_trained,still_improving,seconds
+self_attn.q_proj,10,4,brickwall-k2D128,explicit,0.998813,0.998813,0.0,1,3,3,0.0,0,,3,frob,0,0,23.97

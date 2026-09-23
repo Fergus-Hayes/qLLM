@@ -100,6 +100,63 @@ def run(W, chi, ansatz, regime, sweeps, gd_steps, lr, cov=None, seed=0,
                 seconds=round(r.seconds, 2))
 
 
+def _plan(args, layers, cov):
+    """What this invocation would run, counted the way the loops actually run it."""
+    from qllm.disentangler import quantum_param_count
+    grad = [r for r in args.regimes if r != "explicit"]
+    per_layer_regimes = {}
+    for pname, lt, dep, _W in layers:
+        keep = [r for r in args.regimes
+                if not (r.endswith("-am") and pname not in cov)]
+        per_layer_regimes[(lt, dep)] = keep
+    n_double = sum(len(args.chis) * len(args.ansatze) * len(v)
+                   for v in per_layer_regimes.values())
+    n_lr = sum(len(args.chis) * len(args.ansatze) * len(args.lrs)
+               * len([r for r in v if r != "explicit"])
+               for v in per_layer_regimes.values())
+    skipped = sum(len(args.regimes) - len(v) for v in per_layer_regimes.values())
+
+    print(f"\nPLAN for this invocation\n{'=' * 60}")
+    print(f"  layers          {len(layers)}: "
+          + ", ".join(f"{lt} d{dep}" for _p, lt, dep, _w in layers[:6])
+          + (" ..." if len(layers) > 6 else ""))
+    print(f"  chi values      {len(args.chis)}: {args.chis}")
+    print(f"  ansatze         {len(args.ansatze)}: {', '.join(args.ansatze)}")
+    print(f"  regimes         {len(args.regimes)}: {', '.join(args.regimes)}")
+    print(f"  learning rates  {len(args.lrs)}: {args.lrs} "
+          f"(gradient regimes only: {len(grad)})")
+    if skipped:
+        print(f"  NOTE: {skipped} (layer, regime) pair(s) skipped -- an "
+              f"activation-MSE regime\n        with no H for that layer in --cov")
+
+    print(f"\n  Q per ansatz on a 10+10 qubit register:")
+    from stages import ANSATZE
+    for a in args.ansatze:
+        kw = ANSATZE.get(a)
+        if kw:
+            q = quantum_param_count(10, 10, kw.get("gate_size", 0),
+                                    kw.get("depth", 0), "manifold",
+                                    kw.get("ansatz", "brickwall"),
+                                    kw.get("head_dim", 0))
+            print(f"    {a:<22}{q:>10,}")
+
+    print(f"\n  doubling phase  {n_double:>6} rows x 2 optimisations "
+          f"= {n_double * 2:>6}")
+    print(f"    (each row: one run at the budget + one UNCONSTRAINED control at 2x)")
+    print(f"  lr phase        {n_lr:>6} rows x 1 optimisation  = {n_lr:>6}")
+    print(f"  {'-' * 52}")
+    print(f"  TOTAL                  {n_double + n_lr:>6} rows, "
+          f"{n_double * 2 + n_lr:>6} optimisations")
+    print(f"\n  Budget per optimisation: {args.sweeps} sweeps, "
+          f"{args.gd_steps} Adam steps (patience {args.patience}); "
+          f"the 2x control gets {args.sweeps * 2} / {args.gd_steps * 2}, "
+          f"no patience.")
+    print("  Runtime is dominated by the deepest ansatz: cost per Adam step "
+          "grows with\n  the gate count, so D=128 dominates a grid that also "
+          "contains D=4.")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -146,6 +203,9 @@ def main():
                          "kept); the sweep phase is never thinned")
     ap.add_argument("--no-resume", action="store_true",
                     help="discard any existing output and start over")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print the plan -- how many optimisations, of what -- "
+                         "and exit without running any")
     ap.add_argument("--out", default="convergence.csv")
     ap.add_argument("--figs", default="figs",
                     help="directory for the figures (--figs '' to skip plotting)")
@@ -162,6 +222,8 @@ def main():
             cov[r["param_name"]] = next(
                 iter(load_file(Path(args.cov) / r["file"]).values())).float()
     layers = load_layers(args)
+    if args.dry_run:
+        return _plan(args, layers, cov)
 
     cfg = dict(sweeps=args.sweeps, gd_steps=args.gd_steps, gd_lr=args.gd_lr,
                tol=args.tol, layers_dir=args.layers_dir, cov=args.cov,
