@@ -784,6 +784,21 @@ def _truncated_dense(current: torch.Tensor, out_dims: list[int], in_dims: list[i
     left-to-right sequential truncated SVD the evaluation path uses, so this
     reproduces ``plan_compress(current, plan, chi)`` exactly while keeping the
     autograd graph back to ``current`` (and thence the gate angles).
+
+    **The truncation basis is detached; the data path is not.** Differentiating
+    through ``U`` and ``V`` of an SVD is undefined when singular values collide --
+    the backward carries ``1/(s_i^2 - s_j^2)`` -- and a weight matrix at a bond
+    dimension of any size has near-ties right at the truncation boundary. Taking
+    the gradient through the vectors produced a non-finite gradient at the FIRST
+    Adam step for every chi >= 16 measured, which the optimiser's own guard then
+    caught, leaving the circuit at identity and the run silently reporting the
+    classical MPO error as if it had trained.
+
+    So the basis ``U_r`` is read off a no-grad SVD and the projection
+    ``U_r^T M`` carries the gradient. The value is unchanged (``U_r^T M`` equals
+    ``S_r V_r^T`` exactly), and the gradient is the fixed-projector one: correct
+    to first order wherever the projector is optimal, which is everywhere the
+    truncation is, and finite everywhere.
     """
     tensor = current.reshape(*out_dims, *in_dims).permute(*_interleave_perm(n_sites))
     tensor = tensor.contiguous()
@@ -791,10 +806,12 @@ def _truncated_dense(current: torch.Tensor, out_dims: list[int], in_dims: list[i
     bond_left = 1
     mat = tensor.reshape(out_dims[0] * in_dims[0], -1)
     for k in range(n_sites - 1):
-        u, s, vh = torch.linalg.svd(mat, full_matrices=False)
+        with torch.no_grad():
+            u, s, _vh = torch.linalg.svd(mat.detach(), full_matrices=False)
         r = max(1, min(chi, int(s.numel())))
-        factors.append(u[:, :r].reshape(bond_left, out_dims[k], in_dims[k], r))
-        mat = s[:r].unsqueeze(1) * vh[:r]
+        u_r = u[:, :r]                                   # constant basis
+        factors.append(u_r.reshape(bond_left, out_dims[k], in_dims[k], r))
+        mat = u_r.transpose(-2, -1) @ mat                # == S_r V_r^T, differentiable
         bond_left = r
         if k + 1 < n_sites - 1:
             mat = mat.reshape(bond_left * out_dims[k + 1] * in_dims[k + 1], -1)

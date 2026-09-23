@@ -152,7 +152,7 @@ def main():
           "the H-weighted\nerror, 'frob' rows the Frobenius one. Compare down a "
           "column only within a metric.\n")
     print(f"{'layer':>16}{'chi':>5}{'ansatz':>18}{'regime':>22}{'metric':>7}"
-          f"{'err(B)':>10}{'err(2B)':>10}{'gap':>9}{'tail':>8}{'ok':>4}")
+          f"{'err(B)':>10}{'err(2B)':>10}{'gap':>9}{'tail':>8}{'ok':>6}")
     for pname, lt, dep, W in layers:
         H = cov.get(pname)
         for chi in args.chis:
@@ -174,7 +174,13 @@ def main():
                               args.gd_steps * 2, args.gd_lr, c)
                     gap = ((base["err"] - dbl["err"]) / base["err"]
                            if base["err"] > 0 else 0.0)
-                    ok = gap <= args.tol
+                    # A run that recorded no iterations never trained: the
+                    # optimiser's finite-gradient guard aborted at step 0 and the
+                    # circuit stayed at identity. Both the B and 2B runs fail the
+                    # same way, so the gap is a clean 0.00% and it would otherwise
+                    # be counted as the best-converged row in the table.
+                    dead = (regime != "explicit" and base["n_hist"] == 0)
+                    ok = (gap <= args.tol) and not dead
                     # Independent of the doubling gap: if a tenth of the budget
                     # is still delivering a tenth of the total gain, the run was
                     # cut off mid-descent rather than left on a plateau.
@@ -188,15 +194,17 @@ def main():
                                      tail=round(base["tail"], 5),
                                      sweeps_run=base["sweeps_run"],
                                      metric=("act" if needs_h else "frob"),
+                                     never_trained=int(dead),
                                      still_improving=int(tail),
                                      seconds=base["seconds"]))
                     rows = ck.rows
-                    flag = "ok" if ok else "NO"
+                    flag = "DEAD" if dead else ("ok" if ok else "NO")
                     print(f"{lt[-12:]:>16}{chi:>5}{ansatz:>18}{regime:>22}"
                           f"{('act' if needs_h else 'frob'):>7}"
                           f"{base['err']:>10.5f}{dbl['err']:>10.5f}{gap:>8.2%}"
-                          f"{base['tail']:>7.1%}{flag:>4}"
-                          + ("  <- still improving" if tail else ""),
+                          f"{base['tail']:>7.1%}{flag:>6}"
+                          + ("  <- NEVER TRAINED (0 iterations recorded)" if dead
+                             else "  <- still improving" if tail else ""),
                           flush=True)
 
     # ---- learning-rate sensitivity (gradient regimes only) ------------------
@@ -242,15 +250,25 @@ def main():
     # ---- verdict -------------------------------------------------------------
     print("\nConvergence by regime")
     print(f"{'regime':>22}{'converged':>12}{'median gap':>13}{'worst gap':>12}"
-          f"{'still improving':>18}")
+          f"{'still improving':>18}{'never trained':>16}")
+    dead_rows = [r for r in rows if int(r.get("never_trained", 0))]
+    if dead_rows:
+        print(f"\n{len(dead_rows)} run(s) NEVER TRAINED -- zero iterations "
+              f"recorded, circuit left at identity.\n  These report the classical "
+              f"MPO error and a 0.00% doubling gap, so they would read as the\n"
+              f"  best-converged rows in the table. Affected: "
+              + ", ".join(sorted({f"{r['regime']}@chi={r['chi']}"
+                                  for r in dead_rows})) + ".")
     bad = []
     for regime in dict.fromkeys(r["regime"] for r in rows):
         sel = [r for r in rows if r["regime"] == regime]
         gaps = [r["gap"] for r in sel]
         nconv = sum(r["converged"] for r in sel)
         tail = sum(r["still_improving"] for r in sel)
+        nd = sum(int(r.get("never_trained", 0)) for r in sel)
         print(f"{regime:>22}{f'{nconv}/{len(sel)}':>12}{st.median(gaps):>12.2%}"
-              f"{max(gaps):>12.2%}{f'{tail}/{len(sel)}':>18}")
+              f"{max(gaps):>12.2%}{f'{tail}/{len(sel)}':>18}"
+              f"{f'{nd}/{len(sel)}':>16}")
         if nconv < len(sel):
             bad.append((regime, len(sel) - nconv, max(gaps)))
 
