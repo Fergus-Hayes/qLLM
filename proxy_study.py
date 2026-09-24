@@ -250,6 +250,35 @@ def report(rows, base_ppl, args):
               f"barely moved the model -- the correlations below rank noise. "
               f"Use a\n  trained model and more --ppl-tokens.")
 
+    # Is damage even a FUNCTION of budget? A proxy cannot rank what is not
+    # ordered, so this runs before the blindness test: if a family's damage rises
+    # as you spend more parameters on it, no per-layer metric can predict it, and
+    # a low rho for that layer is the family's fault rather than the metric's.
+    print("\nMONOTONICITY: within a family, does spending MORE parameters do LESS"
+          "\ndamage? (steps that go the wrong way, over every layer)")
+    fams = list(dict.fromkeys(r["family"] for r in rows if r["family"] != "random"))
+    flagged = []
+    for fam in fams:
+        inv = tot = 0
+        for lt, dep in keys:
+            sel = sorted([r for r in rows if r["layer_type"] == lt
+                          and r["depth"] == dep and r["family"] == fam
+                          and r["frobenius"] > 1e-9],
+                         key=lambda r: -r["frobenius"])
+            d = [r["dppl"] for r in sel]
+            inv += sum(1 for a, b in zip(d, d[1:]) if b > a)
+            tot += max(0, len(d) - 1)
+        if not tot:
+            continue
+        mark = "  <-- not ordered by budget" if inv > 0.2 * tot else ""
+        if inv > 0.2 * tot:
+            flagged.append(fam)
+        print(f"  {fam:<26}{inv:>3}/{tot:<4} ({inv / tot:>4.0%}){mark}")
+    if flagged:
+        print(f"  {', '.join(flagged)}: more budget often means more damage, so no\n"
+              f"  per-layer metric can rank these. Treat a low rho on a layer where\n"
+              f"  they dominate as a fact about the family, not about the metric.")
+
     # The control row. A metric that cannot separate structured damage from
     # structureless damage of the same size is not measuring structure.
     print("\nSTRUCTURE BLINDNESS: at matched Frobenius error, does the metric"
